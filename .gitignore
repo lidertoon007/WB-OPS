@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.env
+data/
+node_modules/
+exports/*.inspect.ndjson
+*.pyc
+
+# локальные резервные копии, временные выгрузки и пользовательские отчёты
+backups/
+tmp_reports/
+exports/*
+!exports/.gitkeep
+fbs_reports/*
+!fbs_reports/.gitkeep
+WBOPS_CABINETS/
