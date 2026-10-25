@@ -106,5 +106,22 @@ class BulkTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("r1",dict(self.sent))
         self.assertEqual(self.store.get("r1").text,"Другой оператор исправил ответ")
 
+    async def test_texts_edited_in_review_dialog_are_sent(self):
+        p=self.bulk.preview(BulkPreviewRequest())
+        self.bulk.start(p["token"],{"r2":"  Отредактировано в окне проверки  "})
+        await asyncio.gather(*self.bulk.tasks)
+        self.assertEqual(dict(self.sent)["r2"],"Отредактировано в окне проверки")
+        self.assertEqual(dict(self.sent)["r1"],"Ответ r1")
+        self.assertEqual(self.bulk.get(p["token"])["sent"],3)
+
+    async def test_dialog_edits_validated_before_start(self):
+        p=self.bulk.preview(BulkPreviewRequest())
+        with self.assertRaises(HTTPException):
+            self.bulk.start(p["token"],{"r1":" "})
+        with self.assertRaises(HTTPException):
+            self.bulk.start(p["token"],{"q":"Чужой элемент"})
+        self.assertEqual(self.bulk.get(p["token"])["status"],"preview")
+        self.assertEqual(self.sent,[])
+
 if __name__=="__main__":
     unittest.main()

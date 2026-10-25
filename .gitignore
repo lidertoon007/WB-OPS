@@ -16,3 +16,23 @@ exports/*
 fbs_reports/*
 !fbs_reports/.gitkeep
 WBOPS_CABINETS/
+
+# ОПиУ (папка opiu): ключи API, себестоимость, кэш и отчёты — только локально
+opiu/**/*_accounts.json
+!opiu/**/*_accounts.example.json
+opiu/cost.csv
+opiu/cost_missing*.csv
+opiu/**/cache/
+opiu/*.xlsx
+opiu/*.csv
+!opiu/cost.example.csv
+opiu/**/*_probe_*.json
+app/knowledge/wb_cards.json
+
+# резервные копии файлов (в них могут быть ключи API и себестоимость) и базы данных
+*.bak
+*.sqlite3
+*.sqlite3-*
+*.db
+# черновики и скриншоты
+_wip/

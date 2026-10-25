@@ -57,8 +57,13 @@ class DraftStore:
             if "user_edited" not in columns:
                 # Existing drafts are protected until the safe upgrade classifies them.
                 connection.execute("ALTER TABLE reply_drafts ADD COLUMN user_edited INTEGER NOT NULL DEFAULT 1")
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(reply_drafts)")}
+            if "source" not in columns:
+                connection.execute("ALTER TABLE reply_drafts ADD COLUMN source TEXT NOT NULL DEFAULT ''")
             connection.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             connection.execute("CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, event TEXT NOT NULL, item_id TEXT, details TEXT, created_at TEXT NOT NULL)")
+            if "actor" not in {row[1] for row in connection.execute("PRAGMA table_info(audit_log)")}:
+                connection.execute("ALTER TABLE audit_log ADD COLUMN actor TEXT NOT NULL DEFAULT ''")
             connection.execute("CREATE TABLE IF NOT EXISTS draft_history (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT NOT NULL, text TEXT NOT NULL, action TEXT NOT NULL, created_at TEXT NOT NULL)")
             connection.execute("CREATE TABLE IF NOT EXISTS complaints (item_id TEXT PRIMARY KEY, cabinet_id TEXT NOT NULL, rating INTEGER, status TEXT NOT NULL, reason_code TEXT, reason_title TEXT, evidence TEXT, checklist TEXT NOT NULL, created_at TEXT NOT NULL)")
 
@@ -73,9 +78,9 @@ class DraftStore:
             if row and any(row):
                 return self.get(draft.item_id)
             connection.execute(
-                "INSERT INTO reply_drafts(item_id,text,mode,blocked_reason,confirmed,published,user_edited) VALUES(?,?,?,?,0,0,0) "
-                "ON CONFLICT(item_id) DO UPDATE SET text=excluded.text,mode=excluded.mode,blocked_reason=excluded.blocked_reason",
-                (draft.item_id, draft.text, draft.mode.value, draft.blocked_reason),
+                "INSERT INTO reply_drafts(item_id,text,mode,blocked_reason,confirmed,published,user_edited,source) VALUES(?,?,?,?,0,0,0,?) "
+                "ON CONFLICT(item_id) DO UPDATE SET text=excluded.text,mode=excluded.mode,blocked_reason=excluded.blocked_reason,source=excluded.source",
+                (draft.item_id, draft.text, draft.mode.value, draft.blocked_reason, draft.source or ""),
             )
             from datetime import datetime, timezone
             connection.execute("INSERT INTO draft_history(item_id,text,action,created_at) VALUES(?,?,?,?)", (draft.item_id, draft.text, "generated", datetime.now(timezone.utc).isoformat()))
@@ -139,13 +144,15 @@ class DraftStore:
 
     def audit(self, event: str, item_id: str | None = None, details: str = "") -> None:
         from datetime import datetime, timezone
+        from app.context import current_actor
         with self._connect() as connection:
-            connection.execute("INSERT INTO audit_log(event,item_id,details,created_at) VALUES(?,?,?,?)", (event, item_id, details, datetime.now(timezone.utc).isoformat()))
+            connection.execute("INSERT INTO audit_log(event,item_id,details,created_at,actor) VALUES(?,?,?,?,?)",
+                               (event, item_id, details, datetime.now(timezone.utc).isoformat(), current_actor.get()))
 
     def list_audit(self, limit: int = 100) -> list[dict[str, object]]:
         with self._connect() as connection:
-            rows = connection.execute("SELECT id,event,item_id,details,created_at FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        return [{"id": r[0], "event": r[1], "item_id": r[2], "details": r[3], "created_at": r[4]} for r in rows]
+            rows = connection.execute("SELECT id,event,item_id,details,created_at,actor FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [{"id": r[0], "event": r[1], "item_id": r[2], "details": r[3], "created_at": r[4], "actor": r[5]} for r in rows]
 
     def save_complaint(self, case: ComplaintCase) -> ComplaintCase:
         import json
@@ -193,17 +200,17 @@ class DraftStore:
                 connection.execute("INSERT OR REPLACE INTO inbox_items(id,cabinet_id,item_type,text,rating,product_id,created_at,order_status,author_name,marketplace,product_name,brand,has_photo,has_video,review_topics,review_sentiment) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (item.id, item.cabinet_id, item.item_type.value, item.text, item.rating, item.product_id, item.created_at.isoformat(), item.order_status.value, item.author_name, item.marketplace, item.product_name, item.brand, int(item.has_photo), int(item.has_video), json.dumps(markup.topics if markup else [], ensure_ascii=False), markup.sentiment if markup else "neutral"))
         return len(items)
 
-    def list_inbox(self, item_type: str | None = None, rating: int | None = None, product_id: int | None = None, order_status: str | None = None, search: str | None = None, status: str | None = None, limit: int = 200, offset: int = 0) -> list[InboxItem]:
+    def list_inbox(self, item_type: str | None = None, rating: int | None = None, product_id: int | None = None, order_status: str | None = None, search: str | None = None, status: str | None = None, limit: int = 200, offset: int = 0, cabinet_id: str | None = None) -> list[InboxItem]:
         with self._connect() as connection:
             publication_clause = "COALESCE(d.published,0)=1" if status == "published" else "COALESCE(d.published,0)=0"
             rows = connection.execute(f"SELECT i.id,i.cabinet_id,i.item_type,i.text,i.rating,i.product_id,i.created_at,i.order_status,i.author_name,i.marketplace,i.product_name,i.brand,i.has_photo,i.has_video FROM inbox_items i LEFT JOIN reply_drafts d ON d.item_id=i.id WHERE {publication_clause} ORDER BY i.created_at DESC").fetchall()
         items = [InboxItem(id=r[0], cabinet_id=r[1], item_type=r[2], text=r[3], rating=r[4], product_id=r[5], created_at=r[6], order_status=r[7], author_name=r[8], marketplace=r[9], product_name=r[10], brand=r[11], has_photo=bool(r[12]), has_video=bool(r[13])) for r in rows]
         drafts = {draft.item_id: draft for draft in self.list()}
         query = (search or "").strip().lower()
-        filtered = [item for item in items if (not item_type or item.item_type.value == item_type) and (rating is None or item.rating == rating) and (product_id is None or item.product_id == product_id) and (not order_status or (item.item_type.value == "review" and item.order_status.value == order_status)) and (not query or query in item.text.lower() or query in item.id.lower() or query in str(item.product_id or "").lower()) and (not status or ("published" if drafts.get(item.id, None) and drafts[item.id].published else "draft") == status)]
+        filtered = [item for item in items if (not cabinet_id or item.cabinet_id == cabinet_id) and (not item_type or item.item_type.value == item_type) and (rating is None or item.rating == rating) and (product_id is None or item.product_id == product_id) and (not order_status or (item.item_type.value == "review" and item.order_status.value == order_status)) and (not query or query in item.text.lower() or query in item.id.lower() or query in str(item.product_id or "").lower()) and (not status or ("published" if drafts.get(item.id, None) and drafts[item.id].published else "draft") == status)]
         return filtered[max(offset, 0):max(offset, 0) + min(max(limit, 1), 500)]
 
-    def list_inbox_overview(self, item_type: str | None = None, rating: int | None = None, product_id: int | None = None, order_status: str | None = None, search: str | None = None, status: str | None = None, topic: str | None = None, sentiment: str | None = None, date_from: str | None = None, date_to: str | None = None, sort: str = "desc", limit: int = 25, offset: int = 0) -> list[dict[str, object]]:
+    def list_inbox_overview(self, item_type: str | None = None, rating: int | None = None, product_id: int | None = None, order_status: str | None = None, search: str | None = None, status: str | None = None, topic: str | None = None, sentiment: str | None = None, date_from: str | None = None, date_to: str | None = None, sort: str = "desc", limit: int = 25, offset: int = 0, cabinet_id: str | None = None) -> list[dict[str, object]]:
         import json
         with self._connect() as connection:
             order = "ASC" if sort == "asc" else "DESC"
@@ -212,7 +219,7 @@ class DraftStore:
         result = []
         for r in rows:
             item_type_value, order_value = r[2], r[7]
-            if item_type and item_type_value != item_type or rating is not None and r[4] != rating or product_id is not None and r[5] != product_id or order_status and not (item_type_value == "review" and order_value == order_status):
+            if cabinet_id and r[1] != cabinet_id or item_type and item_type_value != item_type or rating is not None and r[4] != rating or product_id is not None and r[5] != product_id or order_status and not (item_type_value == "review" and order_value == order_status):
                 continue
             if query and query not in (r[0] + " " + r[3] + " " + str(r[5] or "")).lower():
                 continue
@@ -227,7 +234,13 @@ class DraftStore:
                 continue
             delivery_state = self.get_setting(f"reply_delivery:{r[0]}", "")
             current = "published" if r[10] else "error" if delivery_state == "uncertain" else "sending" if delivery_state == "sending" else "ready" if r[9] else "draft" if r[8] is not None else "new"
-            if status and current != status:
+            # WB's unanswered endpoint is the source of truth for "Новые".
+            # A local draft does not mean the review was answered in WB, so
+            # the "new" filter intentionally includes every non-published
+            # item while the response still exposes its precise workflow
+            # state (draft/ready/sending/error).
+            is_unanswered = current != "published"
+            if status and not (status == "new" and is_unanswered) and current != status:
                 continue
             result.append({"id": r[0], "cabinet_id": r[1], "item_type": item_type_value, "text": r[3], "rating": r[4], "product_id": r[5], "created_at": r[6], "order_status": order_value, "draft_text": r[8] or "", "confirmed": bool(r[9]), "published": bool(r[10]), "status": current, "error": delivery_state if current == "error" else "", "topics": topics, "sentiment": r[12], "moderation_status": r[13] or "pending", "moderation_comment": r[14] or "", "author_name": r[15], "marketplace": r[16], "product_name": r[17], "brand": r[18], "has_photo": bool(r[19]), "has_video": bool(r[20])})
         return result[max(offset, 0):max(offset, 0) + min(max(limit, 1), 500)]

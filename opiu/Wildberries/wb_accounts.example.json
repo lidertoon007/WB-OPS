@@ -1,0 +1,19 @@
+{
+  "period": {
+    "from": "2025-09",
+    "to": "2026-09"
+  },
+  "tax_percent": 0,
+  "accounts": [
+    {
+      "name": "Магазин WB 1",
+      "token": "ВАШ_ТОКЕН_WB",
+      "enabled": true
+    },
+    {
+      "name": "Магазин WB 2 (пример)",
+      "token": "ВАШ_ТОКЕН_WB",
+      "enabled": false
+    }
+  ]
+}

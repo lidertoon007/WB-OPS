@@ -27,8 +27,18 @@ from app.models import ComplaintStatus
 
 
 class ComplaintPrepareRequest(BaseModel):
-    text: str = Field(min_length=50, max_length=1000)
+    text: str = Field(default="", max_length=1000)
+    reason: str = Field(default="Другое", min_length=2, max_length=160)
     use_selected: bool = False
+
+
+OTHER = "Другое"
+
+
+def radio_selector(name: str) -> str:
+    """Переключатель причины в форме жалобы WB: name у input совпадает с названием причины."""
+    escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+    return f'input[type=radio][name="{escaped}"]'
 
 
 class ComplaintSubmitRequest(BaseModel):
@@ -164,21 +174,31 @@ class ComplaintBrowser:
             self.state = "installing"
             self.message = "Устанавливается разрешённый Playwright в окружение проекта…"
             self._install_staged()
+            importlib.invalidate_caches()          # сразу открываем браузер, без повторного нажатия
             self.installed_version = version("playwright")
-            self.state = "installed"
-            self.message = "Playwright установлен. Нажмите «Подключить браузер WB», чтобы открыть Chrome."
-            return
         self.installed_version = version("playwright")
         self.state = "opening_browser"
-        self.message = "Открывается отдельный Chrome для Wildberries…"
+        self.message = "Открывается отдельное окно браузера для Wildberries…"
+        if sys.platform == "win32":
+            # Playwright запускает браузер как подпроцесс: в Windows для этого нужен Proactor-цикл
+            policy = asyncio.get_event_loop_policy()
+            if not isinstance(policy, getattr(asyncio, "WindowsProactorEventLoopPolicy", type(None))):
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         from playwright.sync_api import sync_playwright
         self.profile.mkdir(parents=True, exist_ok=True)
         self.driver = sync_playwright().start()
-        self.context = self.driver.chromium.launch_persistent_context(
-            str(self.profile), channel="chrome", headless=False,
-            viewport={"width": 1360, "height": 900},
-            locale="ru-RU", accept_downloads=False,
-        )
+        last_error = None
+        for channel in ("chrome", "msedge", None):   # Chrome, затем Edge (есть в любой Windows), затем Chromium Playwright
+            try:
+                options = {"channel": channel} if channel else {}
+                self.context = self.driver.chromium.launch_persistent_context(
+                    str(self.profile), headless=False, viewport={"width": 1360, "height": 900},
+                    locale="ru-RU", accept_downloads=False, **options)
+                break
+            except Exception as exc:
+                last_error = exc
+        if self.context is None:
+            raise RuntimeError(f"Не найден Chrome или Edge: {last_error}")
         self.context.set_default_timeout(15000)
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         self.page.goto(REVIEWS_URL, wait_until="domcontentloaded", timeout=60000)
@@ -196,9 +216,13 @@ class ComplaintBrowser:
         except HTTPException:
             raise
         except Exception as exc:
-            self.state = "error"
-            self.message = "Браузер закрыт или недоступен. Нажмите подключение заново."
-            self.context = None
+            # Окно закрыли — освобождаем Playwright, чтобы следующее подключение открыло браузер заново
+            try:
+                await asyncio.get_running_loop().run_in_executor(self.executor, self._close)
+            except Exception:
+                self.context = self.driver = self.page = None
+            self.state = "disconnected"
+            self.message = "Окно браузера WB закрыто. Нажмите «Открыть браузер WB» или снова «Заполнить форму в WB» — окно откроется заново."
             raise HTTPException(503, self.message) from exc
 
     async def reviews(self):
@@ -264,10 +288,14 @@ class ComplaintBrowser:
                 )
             except Exception:
                 continue
-            for row in self.page.locator("tr.Table-item").all():
-                text = row.inner_text()
+            rows = [(row, row.inner_text()) for row in self.page.locator("tr.Table-item").all()]
+            for row, text in rows:
                 if str(item.product_id) in text and len(prefix) >= 10 and prefix in normalized(text):
                     candidates.append(row)
+            if not candidates and len(prefix) < 10 and item.author_name:
+                # Отзыв без текста: ищем по товару и имени покупателя; точность потом проверяется по ID отзыва
+                name = normalized(item.author_name)
+                candidates = [row for row, text in rows if str(item.product_id) in text and name in normalized(text)]
             if candidates:
                 break
         self.selected_item = item
@@ -291,18 +319,35 @@ class ComplaintBrowser:
         if any(fragment not in text for fragment in review_fragments(item.text)) or str(item.product_id) not in text:
             raise HTTPException(409, "Текст или товар открытого отзыва изменились. Синхронизируйте данные и проверьте отзыв.")
 
-    def _open_form(self):
-        other = self.page.locator('input[type=radio][name="Другое"]')
-        if other.count() and other.is_visible():
-            other.check()
-            return
-        actions = self.page.locator('[class*="Feedback-actions-buttons-view"] button')
-        if actions.count() != 2:
-            raise HTTPException(409, "WB не показывает кнопку жалобы. Возможно, она уже подана. Проверьте «Мои жалобы».")
-        actions.first.click()
-        other.wait_for(timeout=15000)
-        other.check()
-        self.page.locator('textarea[name="explanation"]').wait_for(timeout=10000)
+    def _form_reasons(self) -> list[str]:
+        """Причины жалобы, которые сейчас показывает форма WB (запоминаются для интерфейса панели)."""
+        names = self.page.locator("input[type=radio]").evaluate_all(
+            "(xs)=>xs.map(x=>x.name||x.value||'').filter(Boolean)")
+        reasons = list(dict.fromkeys(str(n).strip() for n in names if str(n).strip()))
+        if reasons and self.store:
+            self.store.set_setting("wb_complaint_reasons", json.dumps(reasons, ensure_ascii=False))
+        return reasons
+
+    def _open_form(self, reason: str = OTHER):
+        other = self.page.locator(radio_selector(OTHER))
+        if not (other.count() and other.is_visible()):
+            actions = self.page.locator('[class*="Feedback-actions-buttons-view"] button')
+            if actions.count() != 2:
+                raise HTTPException(409, "WB не показывает кнопку жалобы. Возможно, она уже подана. Проверьте «Мои жалобы».")
+            actions.first.click()
+            other.wait_for(timeout=15000)
+        reasons = self._form_reasons()
+        target = self.page.locator(radio_selector(reason))
+        if target.count() != 1:
+            raise HTTPException(409, f"В форме WB нет причины «{reason}». Доступные причины: {', '.join(reasons) or 'не удалось прочитать'}.")
+        target.check()
+        if reason == OTHER:
+            self.page.locator('textarea[name="explanation"]').wait_for(timeout=10000)
+        return reasons
+
+    def _explanation(self):
+        field = self.page.locator('textarea[name="explanation"]')
+        return field if field.count() == 1 and field.is_visible() else None
 
     def _check_eligible(self, item):
         if item.item_type.value != "review" or item.rating not in (1, 2) or not item.product_id:
@@ -319,8 +364,9 @@ class ComplaintBrowser:
         async with self.lock:
             self.pending = None
             self._check_eligible(item)
-            if not 50 <= len(request.text.strip()) <= 1000:
-                raise HTTPException(400, "Текст жалобы должен содержать 50–1000 символов")
+            text = request.text.strip()
+            if request.reason == OTHER and not 50 <= len(text) <= 1000:
+                raise HTTPException(400, "Для причины «Другое» нужен текст жалобы 50–1000 символов")
             if not request.use_selected:
                 opened = await self.open_review(item)
                 if opened.get("selection_status") != "review_open":
@@ -328,7 +374,7 @@ class ComplaintBrowser:
             elif self.context is None:
                 raise HTTPException(409, "Сначала подключите отдельный браузер WB")
             try:
-                return await asyncio.get_running_loop().run_in_executor(self.executor, self._prepare, item, request.text.strip())
+                return await asyncio.get_running_loop().run_in_executor(self.executor, self._prepare, item, text, request.reason)
             except HTTPException:
                 raise
             except Exception as exc:
@@ -340,11 +386,15 @@ class ComplaintBrowser:
             raise HTTPException(409, "Не удалось проверить выбранный кабинет WB")
         return account.inner_text().strip()
 
-    def _prepare(self, item, text):
+    def _prepare(self, item, text, reason=OTHER):
         self._inspect()
         self._verify_identity(item)
-        self._open_form()
-        self.page.locator('textarea[name="explanation"]').fill(text)
+        self._open_form(reason)
+        field = self._explanation()
+        if field is not None:
+            field.fill(text)
+        elif text:
+            text = ""          # для этой причины WB не принимает пояснение — отправляем без текста
         button = self.page.locator('[class*="Complaint-form__buttons"] button').filter(has_text=re.compile("^Отправить$"))
         if button.count() != 1 or not button.is_enabled():
             raise HTTPException(409, "WB не разрешил отправку. Проверьте поля и ограничения в браузере.")
@@ -353,7 +403,7 @@ class ComplaintBrowser:
         data = {"token": uuid4().hex, "item_id": item.id, "product_id": item.product_id,
                 "cabinet_id": item.cabinet_id, "cabinet": self._cabinet(),
                 "destination": "Модерация отзывов Wildberries",
-                "reason": "Другое", "text": text, "review_text": item.text,
+                "reason": reason, "text": text, "review_text": item.text,
                 "created_at": time.time(), "expires_in": 300}
         self.pending = data
         self.automation_ready = True
@@ -390,9 +440,10 @@ class ComplaintBrowser:
         self._verify_identity(item)
         if self._cabinet() != data["cabinet"]:
             raise HTTPException(409, "Кабинет WB изменился. Подготовьте жалобу заново.")
-        other = self.page.locator('input[type=radio][name="Другое"]')
-        field = self.page.locator('textarea[name="explanation"]')
-        if not other.is_checked() or field.input_value() != data["text"]:
+        chosen = self.page.locator(radio_selector(data["reason"]))
+        field = self._explanation()
+        current = field.input_value() if field is not None else ""
+        if chosen.count() != 1 or not chosen.is_checked() or current != data["text"]:
             raise HTTPException(409, "Причина или текст в форме WB изменены. Повторите предпросмотр.")
         if self.page.locator('input[type=file][name="photos"]').evaluate_all("(xs)=>xs.some(x=>x.files?.length>0)"):
             raise HTTPException(409, "Вложения изменились. Отправка отменена.")

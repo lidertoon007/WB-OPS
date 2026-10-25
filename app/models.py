@@ -54,6 +54,8 @@ class ReplyDraft(BaseModel):
     published: bool = False
     moderation_status: str = "pending"
     moderation_comment: str = ""
+    # Как подготовлен черновик: individual (сборщик), ai, templates, knowledge (прошлый ответ); пусто — неизвестно
+    source: str = ""
 
 
 class DraftUpdate(BaseModel):
@@ -107,6 +109,21 @@ class AppModuleSettings(BaseModel):
 class AutoSyncUpdate(BaseModel):
     enabled: bool
     interval_minutes: int = Field(default=15, ge=1, le=1440)
+
+
+class CabinetCreate(BaseModel):
+    """A locally stored WB legal entity/cabinet credential."""
+
+    id: str = Field(default="", max_length=64, pattern=r"^([A-Za-z0-9][A-Za-z0-9_-]+)?$")
+    name: str = Field(min_length=1, max_length=160)
+    token: str = Field(default="", max_length=4000)
+    marketplace: str = Field(default="wildberries", pattern=r"^(wildberries|ozon|yandex)$")
+    legal_name: str = Field(default="", max_length=200)
+    client_id: str = Field(default="", max_length=100)
+    tax_percent: float | None = Field(default=None, ge=0, le=100)
+    enabled: bool = True
+    country: str = Field(default="RU", pattern=r"^[A-Z]{2}$")
+    ads_token: str = Field(default="", max_length=4000)
 
 
 class AutoReplyRule(BaseModel):

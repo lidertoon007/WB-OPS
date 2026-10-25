@@ -1,0 +1,21 @@
+{
+  "period": {
+    "from": "2025-09",
+    "to": "2026-09"
+  },
+  "tax_percent": 0,
+  "accounts": [
+    {
+      "name": "Магазин Ozon 1",
+      "client_id": "ВАШ_CLIENT_ID",
+      "api_key": "ВАШ_API_KEY",
+      "enabled": true
+    },
+    {
+      "name": "Магазин Ozon 2 (пример)",
+      "client_id": "ВАШ_CLIENT_ID",
+      "api_key": "ВАШ_API_KEY",
+      "enabled": false
+    }
+  ]
+}

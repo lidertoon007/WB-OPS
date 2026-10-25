@@ -1,0 +1,27 @@
+{
+  "period": {
+    "from": "2025-09",
+    "to": "2026-09"
+  },
+  "tax_percent": 0,
+  "accounts": [
+    {
+      "name": "Кабинет ЯМ 1",
+      "api_key": "ВАШ_API_KEY",
+      "business_id": null,
+      "campaign_ids": [],
+      "interval_seconds": 121,
+      "enabled": true
+    },
+    {
+      "name": "Кабинет ЯМ 2 (пример)",
+      "api_key": "ВАШ_API_KEY",
+      "business_id": 1234567,
+      "campaign_ids": [
+        12345678
+      ],
+      "interval_seconds": 121,
+      "enabled": false
+    }
+  ]
+}

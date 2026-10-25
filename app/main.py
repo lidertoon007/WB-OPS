@@ -1,22 +1,33 @@
 import asyncio
 import json
+import re
 import shutil
 import subprocess
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from urllib.parse import urlsplit
 
 from app.config import get_settings
-from app.models import AppModuleSettings, AutoReplySettings, AutoReplyRule, AutoSyncUpdate, ChatMessageCreate, ChatSyncRequest, ComplaintCase, ComplaintDetails, ComplaintStatus, ComplaintUpdate, DraftUpdate, GroupActionRequest, InboxItem, ModerationUpdate, OrderStatus, QuestionReplySettings, ReplyDraft, TemplateCreate
-from app.services.cabinets import load_cabinets
+from app.models import AppModuleSettings, AutoReplySettings, AutoReplyRule, AutoSyncUpdate, CabinetCreate, ChatMessageCreate, ChatSyncRequest, ComplaintCase, ComplaintDetails, ComplaintStatus, ComplaintUpdate, DraftUpdate, GroupActionRequest, InboxItem, ModerationUpdate, OrderStatus, QuestionReplySettings, ReplyDraft, TemplateCreate
+from app.services.cabinets import MARKETPLACES as CABINET_MARKETPLACES, Cabinet, dump_cabinets, load_cabinets
+from app.services.team import COOKIE as TEAM_COOKIE, COOKIE_DAYS, Team, lan_ip, port_open
+from app.services.notifier import Notifier
+from app.context import current_actor
+from app.services.review_list import ANSWER_STATUSES, ORDER_STATUSES, TAG_ICONS, ReviewList
+from app.services.wb_images import WBImages
+from app.services.nomenclature import Nomenclature, NomenclatureError
+from app.services.dashboard import Dashboard, DashboardError
+from app.services.analytics import TAGS as ANALYTICS_TAGS
 from app.services.complaints import ComplaintService
 from app.services.replies import ReplyService
 from app.services.publishing import ReplyPublisher
-from app.services.bulk_replies import BulkPreviewRequest, BulkReplySender
+from app.services.bulk_replies import BulkPreviewRequest, BulkReplySender, BulkSendRequest
 from app.services.complaint_browser import ComplaintBrowser, ComplaintPrepareRequest, ComplaintSubmitRequest
 from app.services.reports import ReportImporter
 from app.services.product_knowledge import ProductKnowledge
@@ -24,12 +35,33 @@ from app.services.review_analysis import analyze_review, topic_label
 from app.services.recommendations import RecommendationStore
 from app.services.telegram import send_telegram_message
 from app.services.templates import TemplateStore
+from app.services.review_composer import DEFAULT_PHRASES, PHRASE_TITLES, PhraseStore, ReviewComposer, analyze as analyze_review_facts
+from app.services import ai_writer
+from app.services.product_models import FACT_FIELDS, SIZE_FIELDS, ProductModels
+from app.services.question_composer import QuestionComposer, analyze_question
 from app.services.chats import ChatStore
 from app.services.knowledge_groups import KnowledgeGroupStore
 from app.services.wb_client import WBApiError, WBFeedbackClient
+from app.services import finance
+from app.services import analytics as analytics_module
+from app.services.analytics import Analytics
+from app.services.rnp import RNP, RNPError
+from app.services import tax as tax_module
+from app.services.transfer.common import TransferError
+from app.services.repricer import Repricer, RepricerError
+from app.services.stocks import Stocks, StocksError
+from app.services.fbs_analytics import FbsAnalytics
+from app.services.penalties import Penalties
+from app.services.ads import AdsAnalytics
+from app.services.transfer.service import TransferService
+from pydantic import BaseModel, Field
 from app.storage import DraftStore
 
 settings = get_settings()
+STATIC_DIR = Path(__file__).parent / "static"
+DASHBOARD_FILE = STATIC_DIR / "dashboard.html"
+DASHBOARD_PAGES = ("products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "notifications", "team", "complaints", "nomenclature", "dashboard", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads")
+DASHBOARD_PATHS = {"/", *(f"/{page}" for page in DASHBOARD_PAGES)}
 app = FastAPI(
     title=settings.app_name,
     version="0.1.0",
@@ -45,9 +77,91 @@ template_store = TemplateStore()
 recommendation_store = RecommendationStore()
 complaint_service = ComplaintService()
 draft_store = DraftStore(settings.database_url)
+phrase_store = PhraseStore()
+reply_service.composer = ReviewComposer(phrase_store)
+REVIEW_MODES = ("individual", "ai", "templates")
+reply_service.review_mode = draft_store.get_setting("review_mode", "individual")
+if reply_service.review_mode not in REVIEW_MODES:
+    reply_service.review_mode = "individual"
+
+
+def ai_config() -> dict:
+    values = get_module_settings("ai")["values"]
+    return {"provider": draft_store.get_setting("ai_provider", "anthropic"),
+            "api_key": draft_store.get_setting("ai_api_key", ""),
+            "base_url": draft_store.get_setting("ai_base_url", ""),
+            "model": draft_store.get_setting("ai_model", ""),
+            "tone": str(values.get("tone") or "").strip(), "length": str(values.get("length") or "").strip(),
+            "use_emojis": bool(values.get("use_emojis", False))}
+
+
+ai_reply_writer = ai_writer.AIWriter(lambda: ai_config())
+reply_service.ai = ai_reply_writer
+analytics = Analytics(draft_store, chat_store)
+team = Team(draft_store)
+wb_images = WBImages(draft_store)
+
+
+def _cabinet_names() -> dict:
+    try:
+        return {c.id: c.name for c in configured_cabinets()}
+    except Exception:
+        return {}
+
+
+review_list = ReviewList(draft_store, cabinet_names=_cabinet_names, product_names=lambda: analytics.product_names())
+notifier = Notifier(draft_store)
+
+# Модели товаров (таблица замеров и факты) для ответов на вопросы
+product_models = ProductModels()
+reply_service.question_composer = QuestionComposer(product_models, products=product_knowledge)
+reply_service.question_mode = draft_store.get_setting("question_mode", "individual")
+if reply_service.question_mode not in REVIEW_MODES:
+    reply_service.question_mode = "individual"
+
+
+def seed_product_models() -> int:
+    """Пустые модели «артикул → WB ID» из прошлых вопросов, чтобы оператору оставалось заполнить замеры."""
+    links: dict[str, set] = {}
+    for record in getattr(reply_service.knowledge, "records", []) or []:
+        vendor, nm = str(record.get("vendor_code") or "").strip(), record.get("nm_id")
+        if vendor and nm:
+            links.setdefault(vendor, set()).add(int(nm))
+    # Связи «WB ID → артикул» из отчёта реализации WB (app/knowledge/nm_vendor.json)
+    try:
+        extra = json.loads(Path("app/knowledge/nm_vendor.json").read_text(encoding="utf-8")).get("links", {})
+    except (OSError, ValueError):
+        extra = {}
+    for nm, vendor in extra.items():
+        if str(nm).isdigit() and str(vendor).strip():
+            links.setdefault(str(vendor).strip(), set()).add(int(nm))
+    return product_models.seed(links)
+
+
+try:
+    seed_product_models()
+except Exception:  # справочник — не повод не запускаться
+    pass
+
+
+def configured_cabinets():
+    """Load cabinets from local settings, falling back to the .env bootstrap list."""
+    raw = draft_store.get_setting("cabinets_json", settings.cabinets_json)
+    try:
+        return load_cabinets(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return load_cabinets(settings.cabinets_json)
+
+
+def save_configured_cabinets(cabinets) -> None:
+    draft_store.set_setting("cabinets_json", dump_cabinets(cabinets))
+
+
 manual_send_file = Path("data/manual_send.json")
 manual_send_enabled = manual_send_file.exists() and json.loads(manual_send_file.read_text(encoding="utf-8")).get("enabled") is True
-reply_publisher = ReplyPublisher(draft_store, settings, load_cabinets, manual_send_enabled=manual_send_enabled)
+# ReplyPublisher historically calls its loader with the env JSON argument;
+# keep that interface while resolving the persisted local cabinet list here.
+reply_publisher = ReplyPublisher(draft_store, settings, lambda _raw: configured_cabinets(), manual_send_enabled=manual_send_enabled)
 bulk_sender = BulkReplySender(draft_store, reply_publisher)
 complaint_browser = ComplaintBrowser(store=draft_store)
 bulk_sender.recover_interrupted()
@@ -171,6 +285,7 @@ def process_auto_review(item: InboxItem) -> dict[str, object]:
         if custom:
             variables = {"name": item.author_name or "", "rating": item.rating or "", "product_id": item.product_id or "", "product_name": item.product_name or "", "text": item.text}
             generated.text = template_store.render(str(custom.get("text", generated.text)), variables)
+            generated.source = "templates"
             custom_signature = str(custom.get("signature") or "").strip()
             if custom_signature:
                 generated.text = f"{generated.text.rstrip()}\n\n{template_store.render(custom_signature, variables)}"
@@ -205,6 +320,7 @@ def process_auto_question(item: InboxItem) -> dict[str, object]:
     if selected:
         variables = {"name": item.author_name or "", "rating": "", "product_id": item.product_id or "", "product_name": item.product_name or "", "text": item.text}
         generated.text = template_store.render(str(selected.get("text", generated.text)), variables)
+        generated.source = "templates"
         if selected.get("signature"):
             generated.text = f"{generated.text.rstrip()}\n\n{template_store.render(str(selected['signature']), variables)}"
     if settings_value.signature:
@@ -216,17 +332,50 @@ def process_auto_question(item: InboxItem) -> dict[str, object]:
     return {"item_id": item.id, "status": status, "warnings": warnings, "text": draft.text}
 
 
+LOCAL_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
+# Только владельцу (на компьютере с WB OPS): команда, токены, ключи, финансы, резервные копии
+OWNER_ONLY = ("/api/team", "/api/admin", "/api/notifications", "/api/finance", "/api/nomenclature", "/api/dashboard", "/api/rnp", "/api/transfer", "/api/repricer", "/api/penalties", "/api/ads", "/api/settings/modules/telegram", "/docs", "/openapi.json",
+              "/api/complaint-browser")
+OWNER_ONLY_WRITE = ("/api/cabinets", "/api/ai/settings", "/api/account", "/api/settings/auto-sync")
+MEMBER_OPEN = ("/api/team/me", "/api/team/logout")
+
+
+def is_owner_only(path: str, method: str) -> bool:
+    if path.startswith(MEMBER_OPEN):
+        return False
+    if path.startswith(OWNER_ONLY) or path in ("/finances", "/nomenclature", "/dashboard", "/rnp", "/transfer", "/repricer", "/penalties", "/ads"):
+        return True
+    return method not in ("GET", "HEAD") and path.startswith(OWNER_ONLY_WRITE)
+
+
 @app.middleware("http")
 async def guard_complaint_browser_origin(request: Request, call_next):
-    if not settings.allow_remote and request.client and request.client.host not in ("127.0.0.1", "::1", "localhost", "testclient"):
-        return JSONResponse({"detail": "Панель доступна только локально"}, status_code=403)
-    if request.method == "POST" and request.url.path.startswith("/api/complaint-browser/"):
+    path = request.url.path
+    local = request.client is None or request.client.host in LOCAL_HOSTS
+    member = None
+    if not local and not settings.allow_remote:
+        member = team.by_token(request.cookies.get(TEAM_COOKIE))
+        if member is None:
+            if path not in ("/join", "/api/team/join"):
+                if path.startswith("/api/"):
+                    return JSONResponse({"detail": "Нужен вход: откройте ссылку-приглашение от владельца панели"}, status_code=401)
+                return RedirectResponse("/join", status_code=303)
+        elif is_owner_only(path, request.method):
+            if path.startswith("/api/"):
+                return JSONResponse({"detail": "Доступно только владельцу панели"}, status_code=403)
+            return RedirectResponse("/", status_code=303)
+    request.state.member = member
+    if request.method == "POST" and path.startswith("/api/complaint-browser/"):
         origin = request.headers.get("origin")
         if origin:
             parsed = urlsplit(origin)
             if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost") or parsed.port != request.url.port:
                 return JSONResponse({"detail": "Операция доступна только из локальной панели сервиса"}, status_code=403)
-    return await call_next(request)
+    actor = current_actor.set(member["name"] if member else "")
+    try:
+        return await call_next(request)
+    finally:
+        current_actor.reset(actor)
 
 
 @app.middleware("http")
@@ -236,21 +385,25 @@ async def inject_knowledge_workspace(request: Request, call_next):
         return response
     body = b"".join([chunk async for chunk in response.body_iterator])
     html = body.decode("utf-8")
-    if request.url.path in {"/", "/knowledge"}:
-        script = Path("app/static/knowledge.js").read_text(encoding="utf-8")
-        html = html.replace("</body>", f"<script>{script}</script></body>")
-    page = request.url.path.strip("/")
-    if page and page not in {"docs"}:
-        html = html.replace("</body>", f'''<script>(()=>{{const page="{page}";const routes={{home:"/",products:"/products",cabinets:"/cabinets",knowledge:"/knowledge",analytics:"/analytics",reviews:"/reviews",templates:"/templates",recommendations:"/recommendations",settings:"/settings",ai:"/ai",import:"/import",questions:"/questions",chats:"/chats",messengers:"/messengers",profile:"/profile",finances:"/finances"}};document.querySelectorAll("[data-nav]").forEach(x=>{{const key=x.dataset.nav;if(routes[key]){{x.href=routes[key];x.onclick=null}}}});if(page!=="home"){{document.querySelectorAll(".shell>section,.shell>.grid,.shell>.toolbar").forEach(x=>x.style.display="none");const target=document.getElementById(page)||document.querySelector(".shell>section.panel");if(target){{target.style.display="block";target.scrollIntoView()}}}}}})() </script></body>''')
+    if request.url.path in DASHBOARD_PATHS:
+        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "penalties.js", "ads.js", "router.js", "knowledge.js"))
+        html = html.replace("</body>", scripts + "</body>")
     return Response(content=html, status_code=response.status_code, headers={"content-type": "text/html; charset=utf-8"})
 
 
 async def perform_sync(cabinet_id: str) -> dict[str, object]:
-    cabinets = {cabinet.id: cabinet for cabinet in load_cabinets(settings.cabinets_json)}
+    cabinets = {cabinet.id: cabinet for cabinet in configured_cabinets()}
     cabinet = cabinets.get(cabinet_id)
     if cabinet is None:
         raise WBApiError("Кабинет не найден")
+    if not cabinet.enabled:
+        raise WBApiError("Кабинет выключен — включите его в настройках кабинета")
+    if cabinet.marketplace != "wildberries":
+        raise WBApiError(f"Загрузка из {CABINET_MARKETPLACES.get(cabinet.marketplace, cabinet.marketplace)} пока не поддерживается")
+    if not (cabinet.reviews or cabinet.questions):
+        raise WBApiError("В кабинете выключены и отзывы, и вопросы")
     items = await WBFeedbackClient(cabinet.token, settings.feedbacks_api_base_url).fetch_unanswered()
+    items = [i for i in items if (cabinet.reviews if i.item_type.value == "review" else cabinet.questions)]
     auto_settings = get_auto_reply_settings()
     for item in items:
         item.cabinet_id = cabinet.id
@@ -271,20 +424,11 @@ async def perform_sync(cabinet_id: str) -> dict[str, object]:
     draft_store.set_setting("sync_last_received", str(len(items)))
     draft_store.set_setting("sync_last_error", "")
     draft_store.audit("sync", cabinet_id, f"received={len(items)}")
-    telegram = get_module_settings("telegram")["values"]
-    if isinstance(telegram, dict) and telegram.get("enabled") and items:
+    if items:
         try:
-            reviews_count = sum(1 for item in items if item.item_type.value == "review")
-            questions_count = sum(1 for item in items if item.item_type.value == "question")
-            messages = []
-            if reviews_count and telegram.get("notify_new_reviews"):
-                messages.append(f"новых отзывов — {reviews_count}")
-            if questions_count and telegram.get("notify_new_questions"):
-                messages.append(f"новых вопросов — {questions_count}")
-            if messages:
-                await send_telegram_message(telegram, f"WB OPS: {', '.join(messages)}. Кабинет: {cabinet.name}.")
-        except Exception as exc:
-            draft_store.audit("telegram_error", cabinet.id, str(exc)[:300])
+            await notifier.new_items(cabinet, items)
+        except Exception as exc:  # уведомление не должно ломать синхронизацию
+            draft_store.audit("notify_error", cabinet.id, str(exc)[:300])
     return {"cabinet_id": cabinet.id, "received": len(items), "drafts_created": len(items), "published": 0}
 
 
@@ -292,31 +436,66 @@ async def auto_sync_loop() -> None:
     global auto_sync_enabled
     while True:
         if auto_sync_enabled:
-            for cabinet in load_cabinets(settings.cabinets_json):
+            for cabinet in configured_cabinets():
+                if not cabinet.enabled or cabinet.marketplace != "wildberries" or not cabinet.token or not (cabinet.reviews or cabinet.questions):
+                    continue
                 try:
                     await perform_sync(cabinet.id)
                 except Exception as exc:
                     # Errors remain isolated to this cycle; manual sync exposes details.
                     draft_store.set_setting("sync_last_error", str(exc)[:500])
                     draft_store.audit("sync_error", cabinet.id, str(exc)[:500])
+                    try:
+                        await notifier.sync_error(cabinet, str(exc))
+                    except Exception:
+                        pass
                     continue
         await asyncio.sleep(auto_sync_interval_minutes * 60)
 
 
 @app.on_event("startup")
 async def start_scheduler() -> None:
-    global auto_sync_task
-    upgrade_file = Path("data/order_status_upgrade.json")
-    if upgrade_file.exists() and not json.loads(upgrade_file.read_text(encoding="utf-8")).get("completed"):
-        from finish_order_status_upgrade import main as finish_upgrade
-        await finish_upgrade()
+    global auto_sync_task, notify_task
     auto_sync_task = asyncio.create_task(auto_sync_loop())
+    notify_task = asyncio.create_task(notify_loop())
+    asyncio.create_task(rnp_loop())
+    asyncio.create_task(stocks_loop())
+    asyncio.create_task(fbs_loop())
+    asyncio.create_task(penalties_loop())
+    asyncio.create_task(ads_loop())
+    try:
+        cabinets = configured_cabinets()
+        for cabinet in cabinets:
+            _apply_tax(cabinet, cabinets)        # ставки кабинетов → расчёт ОПиУ (если кабинет там появился)
+    except Exception as exc:
+        draft_store.audit("cabinet_tax_error", details=str(exc)[:300])
+    try:
+        reevaluate_complaints()
+    except Exception as exc:
+        draft_store.audit("complaints_reevaluate_error", details=str(exc)[:300])
+
+
+notify_task = None
+
+
+async def notify_loop() -> None:
+    """Раз в минуту: сводка отправленных ответов, черновиков на проверке и чатов."""
+    notifier.init_cursor()
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await notifier.scan_journal()
+        except Exception as exc:
+            draft_store.audit("notify_error", details=str(exc)[:300])
 
 
 @app.on_event("shutdown")
 async def stop_scheduler() -> None:
     if auto_sync_task:
         auto_sync_task.cancel()
+    if notify_task:
+        notify_task.cancel()
+    finance_runner.stop()
     tasks = list(bulk_sender.tasks)
     for task in tasks:
         task.cancel()
@@ -325,310 +504,14 @@ async def stop_scheduler() -> None:
     await complaint_browser.close()
 
 
+
+
 @app.get("/", response_class=HTMLResponse)
-def dashboard() -> str:
-    return """<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WB Operations</title><style>
-:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;color:#1f2937;background:#f6f7fb}*{box-sizing:border-box}body{margin:0}.shell{max-width:1180px;margin:auto;padding:28px 20px 60px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:28px}.brand{display:flex;align-items:center;gap:12px}.logo{width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,#7c3aed,#ec4899);color:#fff;display:grid;place-items:center;font-weight:800;box-shadow:0 8px 20px #7c3aed33}.eyebrow{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#8b5cf6;font-weight:700}.title{font-size:25px;font-weight:800;margin:2px 0}.muted{color:#6b7280}.status{background:#ecfdf5;color:#047857;border:1px solid #a7f3d0;border-radius:999px;padding:8px 12px;font-size:13px;font-weight:700}.toolbar{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0}.btn{border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer;background:#6d28d9;color:#fff;box-shadow:0 5px 12px #6d28d933}.btn:disabled{opacity:.55;cursor:wait}.btn.secondary{background:#fff;color:#5b21b6;border:1px solid #ddd6fe;box-shadow:none}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:18px 0}.card,.panel{background:#fff;border:1px solid #e5e7eb;border-radius:16px;box-shadow:0 8px 24px #1118270a}.card{padding:18px}.metric{font-size:28px;font-weight:800;margin-top:6px}.panel{padding:20px;margin-top:18px}.panel h2{font-size:17px;margin:0 0 14px}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:12px 10px;border-bottom:1px solid #f0f1f5;vertical-align:top}th{font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.05em}textarea{width:100%;min-width:300px;min-height:74px;padding:10px;border:1px solid #d1d5db;border-radius:9px;font:inherit;resize:vertical}small.badge{display:inline-block;padding:4px 8px;border-radius:999px;background:#f3e8ff;color:#6b21a8;font-weight:700}.report-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}.report{padding:12px;border:1px solid #eee;border-radius:10px;background:#fafafa}.toast{position:fixed;right:20px;bottom:20px;background:#111827;color:#fff;padding:12px 16px;border-radius:10px;display:none}@media(max-width:760px){.grid{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}}
-.bulk-overlay{position:fixed;inset:0;background:#11182799;z-index:100;display:grid;place-items:center;padding:20px}.bulk-dialog{background:#fff;border-radius:16px;width:min(980px,100%);max-height:90vh;overflow:auto;padding:24px}.bulk-top{position:sticky;top:-24px;background:#fff;padding:12px 0;z-index:1}.bulk-item{border:1px solid #e5e7eb;border-radius:10px;padding:14px;margin:12px 0}.bulk-item textarea{min-height:100px;min-width:0}.bulk-overlay[hidden]{display:none}.bulk-actions{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0}.bulk-dialog h2{margin:0 0 10px}
-.purchase{display:inline-block;padding:5px 9px;border-radius:7px;background:#f3f4f6;color:#4b5563;font-size:12px;font-weight:700;white-space:nowrap}.purchase.buyout{background:#d1fae5;color:#065f46}.purchase.rejected{background:#ffedd5;color:#9a3412}.purchase.returned{background:#fee2e2;color:#991b1b}
-
-.complaint-card{appearance:none;text-align:left;font:inherit;cursor:pointer;width:100%;border:1px solid #e5e7eb;background:#fff;border-radius:12px;padding:16px;transition:border-color .15s,box-shadow .15s}.complaint-card:hover{border-color:#8b5cf6;box-shadow:0 4px 12px #7c3aed18}.complaint-card:focus-visible{outline:3px solid #c4b5fd;outline-offset:2px}.complaint-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px}.complaint-state{font-size:12px;font-weight:700;padding:5px 9px;border-radius:7px;background:#f3f4f6;color:#4b5563}.complaint-state.ready_manual{background:#fff7ed;color:#9a3412}.complaint-state.submitted_manual{background:#ecfdf5;color:#065f46}.complaint-state.dismissed{background:#eef2ff;color:#3730a3}.complaint-excerpt{line-height:1.5;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;margin:10px 0;color:#374151}.complaint-section{padding:16px;border:1px solid #e5e7eb;border-radius:12px;margin:14px 0}.complaint-section p{white-space:pre-wrap;line-height:1.6}.complaint-section textarea{min-width:0;min-height:140px}.complaint-section label{display:block}.complaint-controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px}.complaint-controls a{text-decoration:none}.complaint-id{overflow-wrap:anywhere;font-family:monospace;font-size:13px}.complaint-notice{padding:12px;background:#fff7ed;color:#9a3412;border-radius:9px;font-size:13px;line-height:1.6}.complaint-dialog-title{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.complaint-dialog-title h2{margin-top:0}#complaintModal{z-index:110}@media(max-width:500px){.bulk-overlay{padding:10px}.bulk-dialog{padding:16px}.complaint-meta{align-items:flex-start;flex-direction:column}}
-
-</style></head><body><main class="shell"><aside class="sidebar"><div class="sidebar-brand"><div class="logo">WB</div><div><strong>WB OPS</strong><span>рабочая панель</span></div></div><nav class="side-nav"><a href="#home" class="nav-link active" data-nav="home">⌂ <span>Главная</span></a><div class="nav-label">ОБЩЕЕ</div><a href="#products" class="nav-link" data-nav="products">▣ <span>Товары</span></a><a href="#cabinets" class="nav-link" data-nav="cabinets">▤ <span>Кабинеты маркетплейсов</span></a><a href="#knowledge" class="nav-link" data-nav="knowledge">▥ <span>База знаний</span></a><a href="#analytics" class="nav-link" data-nav="analytics">▥ <span>Аналитика</span><span class="nav-plus">+</span></a><div class="nav-label">СЕРВИСЫ</div><div class="nav-group-title">▧ <span>Управление отзывами</span><span>−</span></div><a href="#inbox-panel" class="nav-link sub active" data-nav="reviews">Все отзывы</a><a href="#templatePanel" class="nav-link sub" data-nav="templates">Шаблоны ответов</a><a href="#productKnowledgePanel" class="nav-link sub" data-nav="recommendations">Рекомендации товаров</a><a href="#templatePanel" class="nav-link sub" data-nav="settings">Настройки ответов</a><a href="#templatePanel" class="nav-link sub" data-nav="ai">Настройки ИИ <em>Beta</em></a><a href="#inbox-panel" class="nav-link sub" data-nav="import">Импорт отзывов</a><div class="nav-group-title">◌ <span>Управление вопросами</span><span>+</span></div><a href="#chats" class="nav-link" data-nav="chats">♧ <span>Управление чатами</span></a><a href="#messengers" class="nav-link" data-nav="messengers">▧ <span>Агенты в мессенджерах</span></a><div class="nav-label">ПАРАМЕТРЫ И НАСТРОЙКИ</div><a href="#profile" class="nav-link" data-nav="profile">♙ <span>Личный кабинет</span><span class="nav-plus">+</span></a><a href="#finances" class="nav-link" data-nav="finances">▱ <span>Финансы</span></a></nav><div class="sidebar-footer">WB Operations <span>v0.1</span></div></aside><header class="top" id="home"><div class="brand"><div class="logo">WB</div><div><div class="eyebrow">Operations</div><div class="title">Отзывы, вопросы и поставки FBS</div><div class="muted">Рабочая панель продавца</div></div></div><div class="status" id="publishStatus">Проверка режима публикации…</div></header>
-<div class="toolbar" id="cabinet"></div><div class="toolbar"><button class="btn secondary" onclick="downloadReport()">⇩ Скачать Excel</button><label class="btn secondary">Автосинхронизация <input id="auto" type="checkbox" onchange="setAuto()"></label><select id="interval" class="btn secondary" onchange="setAuto()"><option value="5">каждые 5 мин</option><option value="15">каждые 15 мин</option><option value="30">каждые 30 мин</option><option value="60">каждый час</option></select></div><section class="grid" id="cards"><div class="card">Загрузка…</div></section>
-<section class="panel"><h2>Входящие вопросы и отзывы</h2><div class="toolbar"><button id="bulkButton" class="btn" onclick="previewBulk()">Отправить отзывы по фильтрам</button><button class="btn secondary" onclick="toggleGroupBar()">Групповые действия</button><button class="btn secondary" onclick="load()">Обновить список</button></div><p class="muted" style="font-size:13px">Фильтруйте по статусу, рейтингу, дате, теме и тональности. Автоматическая разметка используется для поиска и правил обработки.</p><div class="toolbar"><select id="typeFilter" class="btn secondary" onchange="load()"><option value="">Все типы</option><option value="review">Отзывы</option><option value="question">Вопросы</option></select><select id="ratingFilter" class="btn secondary" onchange="load()"><option value="">Любой рейтинг</option><option value="5">5 звёзд</option><option value="4">4 звезды</option><option value="3">3 звезды</option><option value="2">2 звезды</option><option value="1">1 звезда</option></select><select id="orderFilter" aria-label="Статус покупки" class="btn secondary" onchange="load()"><option value="">Все статусы покупки</option><option value="buyout">Выкуп · клиент забрал</option><option value="rejected">Отказ · клиент не забрал</option><option value="returned">Возврат</option><option value="notSpecified">Статус не указан</option></select><select id="topicFilter" class="btn secondary" onchange="load()"><option value="">Все темы</option><option value="quality">Качество</option><option value="size">Размер</option><option value="delivery">Доставка</option><option value="packaging">Упаковка</option><option value="material">Материал</option><option value="color">Цвет</option><option value="price">Цена</option><option value="texture">Текстура</option></select><select id="sentimentFilter" class="btn secondary" onchange="load()"><option value="">Любая тональность</option><option value="positive">Позитивные</option><option value="neutral">Нейтральные</option><option value="negative">Негативные</option></select><input id="productFilter" placeholder="WB ID товара" oninput="load()" style="padding:10px;border:1px solid #ddd6fe;border-radius:10px"><input id="dateFromFilter" type="date" title="Дата от" onchange="load()"><input id="dateToFilter" type="date" title="Дата до" onchange="load()"><select id="sortFilter" class="btn secondary" onchange="load()"><option value="desc">Сначала новые</option><option value="asc">Сначала старые</option></select></div><div id="groupBar" class="toolbar" hidden><span class="muted" data-selected-count>Выбрано: 0</span><button class="btn secondary" onclick="groupAction('confirm')">Подтвердить</button><button class="btn secondary" onclick="groupAction('rework')">На доработку</button><button class="btn secondary" onclick="groupAction('regenerate')">Перегенерировать</button><button class="btn secondary" onclick="groupAction('reject')">Отклонить</button></div><div class="table-wrap"><table><thead><tr><th><input type="checkbox" id="selectAll" onchange="selectAllRows(this.checked)"></th><th>Тип / дата</th><th>Товар и отзыв</th><th>Рейтинг / разметка</th><th>Черновик ответа</th><th>Действия</th></tr></thead><tbody id="inbox"><tr><td colspan="6" class="muted">Загрузка…</td></tr></tbody></table></div></section>
-<section class="panel"><h2>Отчёты Честного знака</h2><div id="reports" class="report-list">Загрузка…</div></section><section class="panel"><h2>Очередь жалоб на отзывы 1–2★</h2><p class="muted">Нажмите на карточку, чтобы проверить отзыв и подготовить жалобу. Подача через сервис выполняется в отдельном Chrome после проверки ID и подтверждения текста.</p><div class="toolbar"><button class="btn" onclick="connectComplaintBrowser()">Подключить WB для подачи жалоб</button><button class="btn secondary" onclick="checkComplaintBrowser()">Проверить подключение</button><span id="complaintBrowserStatus" class="muted">Отправка жалоб через браузер требует настройки.</span></div><div class="toolbar"><select id="complaintFilter" class="btn secondary" aria-label="Статус жалобы" onchange="loadComplaints()"><option value="">Все статусы</option><option value="ready_manual">На ручной проверке</option><option value="not_eligible">Нет явных оснований</option><option value="submitted_manual">Подана вручную</option><option value="submitted_browser">Подана через сервис</option><option value="dismissed">Закрыта без жалобы</option></select><button class="btn secondary" onclick="loadComplaints()">Обновить очередь</button><span id="complaintCount" class="muted"></span></div><div id="complaints" class="report-list">Загрузка…</div></section><section class="panel"><h2>Журнал действий</h2><div id="audit" class="muted">Загрузка…</div></section></main><div id="toast" class="toast"></div>
-<div id="bulkModal" class="bulk-overlay" hidden><section class="bulk-dialog" role="dialog" aria-modal="true" aria-labelledby="bulkTitle"><div class="bulk-top"><h2 id="bulkTitle">Проверка пакета отзывов</h2><div id="bulkSummary"></div><div class="bulk-actions"><button id="bulkConfirm" class="btn" onclick="confirmBulk()">Подтвердить отправку</button><button id="bulkClose" class="btn secondary" onclick="closeBulk()">Закрыть</button></div><div id="bulkProgress" role="status" aria-live="polite"></div></div><div id="bulkItems"></div></section></div>
-<div id="complaintModal" class="bulk-overlay" hidden><section class="bulk-dialog" role="dialog" aria-modal="true" aria-labelledby="complaintTitle" tabindex="-1"><header class="complaint-dialog-title"><div><h2 id="complaintTitle">Проверка отзыва</h2><div id="complaintHeader" class="muted"></div></div><button class="btn secondary" onclick="closeComplaint()">Закрыть</button></header><div id="complaintBody">Загрузка…</div></section></div>
-<script>
-const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const orderLabels={buyout:'Выкуп · забрал',rejected:'Отказ · не забрал',returned:'Возврат',notSpecified:'Статус не указан'};
-function toast(text){const x=document.querySelector('#toast');x.textContent=text;x.style.display='block';setTimeout(()=>x.style.display='none',2600)}
-async function sync(id){const r=await fetch('/api/sync/'+encodeURIComponent(id),{method:'POST'});const d=await r.json();toast(r.ok?`Загружено: ${d.received}. Черновиков: ${d.drafts_created}.`:d.detail||'Ошибка синхронизации');if(r.ok){await load();await loadComplaints()}}
-const sending=new Set(),pendingText=new Map();
-async function sendDraft(id,button){
-if(sending.has(id))return;
-const field=document.querySelector(`[data-draft="${CSS.escape(id)}"], [data-question-draft="${CSS.escape(id)}"]`);
-const text=field.value.trim();
-if(text.length<2){toast('Введите ответ: минимум 2 символа');return}
-pendingText.set(id,text);sending.add(id);button.disabled=true;button.textContent='Отправка…';field.disabled=true;
-let published=false;
-try{
-const r=await fetch('/api/replies/send/'+encodeURIComponent(id),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
-const d=await r.json();
-if(!r.ok){toast(d.detail||'WB не принял ответ');return}
-published=true;pendingText.delete(id);toast('Ответ отправлен в Wildberries');
-field.closest('tr')?.remove();
-await load();
-}catch(e){toast(published?'Ответ отправлен, но список не обновился. Обновите страницу.':'Нет подтверждения отправки. Проверьте ответ в WB перед повторной попыткой.')}
-finally{sending.delete(id);button.disabled=false;button.textContent='Отправить';field.disabled=false}
-}
-async function confirmDraft(id){const r=await fetch('/api/replies/drafts/'+encodeURIComponent(id)+'/confirm',{method:'POST'});toast(r.ok?'Черновик подтверждён':(await r.json()).detail||'Ошибка подтверждения');if(r.ok)load()}
-async function setAuto(){const r=await fetch('/api/settings/auto-sync',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:document.querySelector('#auto').checked,interval_minutes:Number(document.querySelector('#interval').value)})});toast(r.ok?'Настройки автосинхронизации сохранены':'Не удалось сохранить настройки')}
-async function confirmDraft(id){const r=await fetch('/api/replies/drafts/'+encodeURIComponent(id)+'/confirm',{method:'POST'});toast(r.ok?'Черновик подтверждён':(await r.json()).detail||'Ошибка подтверждения');if(r.ok)load()}
-
-let bulkToken=null,bulkRunning=false;
-function closeBulk(){document.querySelector('#bulkModal').hidden=true}
-function currentReviewFilters(){const rating=document.querySelector('#ratingFilter').value,order=document.querySelector('#orderFilter').value,product=document.querySelector('#productFilter').value.trim();if(product&&(!/^[1-9][0-9]*$/.test(product)||!Number.isSafeInteger(Number(product))))throw new Error('WB ID должен быть положительным целым числом');return {rating:rating?Number(rating):null,order_status:order||null,product_id:product?Number(product):null}}
-async function previewBulk(){
-if(bulkRunning){document.querySelector('#bulkModal').hidden=false;return}
-if(document.querySelector('#typeFilter').value==='question'){toast('Выберите отзывы или все типы. Вопросы пакетно не отправляются.');return}
-const button=document.querySelector('#bulkButton');button.disabled=true;
-try{
-const texts=Object.fromEntries(pendingText);document.querySelectorAll('[data-draft]').forEach(x=>texts[x.dataset.draft]=x.value);
-const r=await fetch('/api/replies/bulk/preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filters:currentReviewFilters(),texts})}),d=await r.json();
-if(!r.ok){toast(d.detail||'Не удалось подготовить пакет');return}
-bulkToken=d.token;
-const f=d.filters;const summary=`Отзывы: ${d.total}. Рейтинг: ${f.rating??'любой'}. Статус: ${f.order_status?orderLabels[f.order_status]:'любой'}. WB ID: ${f.product_id??'все'}. Исключено: ${d.skipped.length}.`;
-document.querySelector('#bulkSummary').textContent=summary;
-document.querySelector('#bulkTitle').textContent='Проверьте ответы перед отправкой в Wildberries';
-document.querySelector('#bulkConfirm').textContent=`Отправить ${d.total} ответов в WB`;
-document.querySelector('#bulkConfirm').disabled=!d.total;
-document.querySelector('#bulkProgress').textContent='Будут отправлены только перечисленные ниже тексты. Новые отзывы в этот пакет не добавляются.';
-document.querySelector('#bulkItems').innerHTML=d.items.map(x=>`<article class="bulk-item"><b>Кабинет: ${esc(x.cabinet_id)} · WB ID: ${esc(x.product_id??'—')}</b><div class="muted">Отзыв: ${esc(x.item_id)} · ${x.rating??'—'} ★ · ${esc(orderLabels[x.order_status]||'Статус не указан')}</div><p style="white-space:pre-wrap">${esc(x.review_text)||'Без текста'}</p><label>Ответ для публикации<textarea readonly>${esc(x.text)}</textarea></label></article>`).join('')||'<p>Подходящих отзывов для отправки нет.</p>';
-document.querySelector('#bulkModal').hidden=false;
-}catch(e){toast(e.message==='WB ID должен быть положительным целым числом'?e.message:'Не удалось подготовить пакет. Ничего не отправлено.')}finally{button.disabled=false}
-}
-async function confirmBulk(){
-if(!bulkToken||bulkRunning)return;
-const button=document.querySelector('#bulkConfirm');button.disabled=true;
-try{
-const r=await fetch('/api/replies/bulk/'+encodeURIComponent(bulkToken)+'/send',{method:'POST'}),d=await r.json();
-if(!r.ok){toast(d.detail||'Не удалось запустить отправку');button.disabled=false;return}
-bulkRunning=true;document.querySelector('#bulkButton').textContent='Показать ход отправки';
-document.querySelector('#bulkTitle').textContent='Отправка подтверждённого пакета';
-pollBulk();
-}catch(e){document.querySelector('#bulkProgress').textContent='Запрос отправлен, но результат запуска неясен. Проверяю состояние пакета…';pollBulk()}
-}
-async function pollBulk(){
-try{
-const r=await fetch('/api/replies/bulk/'+encodeURIComponent(bulkToken)),d=await r.json();
-if(!r.ok)throw new Error();
-if(d.status==='preview'){bulkRunning=false;document.querySelector('#bulkConfirm').disabled=false;document.querySelector('#bulkProgress').textContent='Пакет ещё не запущен. Можно подтвердить отправку.';return}
-bulkRunning=d.status==='running';
-document.querySelector('#bulkProgress').textContent=`Обработано ${d.processed||0} из ${d.total}. Отправлено: ${d.sent}. Ошибок: ${d.failed}. ${d.reason||''}`;
-if(bulkRunning){setTimeout(pollBulk,1500);return}
-document.querySelector('#bulkButton').textContent='Отправить отзывы по фильтрам';
-document.querySelector('#bulkConfirm').disabled=true;
-document.querySelector('#bulkTitle').textContent=d.status==='completed'?'Отправка завершена':'Отправка остановлена';
-document.querySelector('#bulkItems').innerHTML+=(d.results||[]).filter(x=>x.status!=='sent').map(x=>`<p><b>${esc(x.item_id)}</b>: ${esc(x.reason)}</p>`).join('');
-for(const x of d.results||[])if(x.status==='sent'){pendingText.delete(x.item_id);document.querySelector(`[data-draft="${CSS.escape(x.item_id)}"]`)?.closest('tr')?.remove()}
-await load();
-}catch(e){document.querySelector('#bulkProgress').textContent='Не удалось получить состояние пакета. Отправка может продолжаться; повторно не запускайте её.';setTimeout(pollBulk,3000)}
-}
-
-async function downloadReport(){window.location='/api/fbs-reports/export'}
-async function load(){
-document.querySelectorAll('[data-draft]').forEach(x=>{const id=x.dataset.draft;if(x.value!==(x.dataset.original??x.value))pendingText.set(id,x.value)});
-const health=await (await fetch('/health')).json();
-document.querySelector('#publishStatus').textContent=health.dry_run&&!health.manual_send_enabled?'Черновики · публикация выключена':'Отправка в WB · только по кнопке «Отправить»';
-const params=new URLSearchParams();const type=document.querySelector('#typeFilter')?.value,rating=document.querySelector('#ratingFilter')?.value,product=document.querySelector('#productFilter')?.value.trim();if(type)params.set('item_type',type);if(rating)params.set('rating',rating);if(product)params.set('product_id',product);const order=document.querySelector('#orderFilter')?.value;if(order)params.set('order_status',order);const [c,r,i,d,a,s]=await Promise.all([fetch('/api/cabinets'),fetch('/api/reports'),fetch('/api/inbox?'+params),fetch('/api/replies/drafts'),fetch('/api/audit'),fetch('/api/settings/auto-sync')]);const cabinets=await c.json(),reports=await r.json(),inbox=await i.json(),drafts=await d.json(),audit=await a.json(),auto=await s.json();document.querySelector('#cabinet').innerHTML=cabinets.map(x=>`<button class="btn" onclick="sync('${esc(x.id)}')">↻ Синхронизировать · ${esc(x.name)}</button>`).join('');document.querySelector('#auto').checked=auto.enabled;document.querySelector('#interval').value=String(auto.interval_minutes);document.querySelector('#cards').innerHTML=`<div class="card"><div class="muted">PDF-отчёты</div><div class="metric">${reports.count}</div></div><div class="card"><div class="muted">Строк товаров</div><div class="metric">${reports.row_count}</div></div><div class="card"><div class="muted">Количество</div><div class="metric">${reports.quantity_total.toLocaleString('ru-RU')}</div></div>`;const dm=Object.fromEntries(drafts.map(x=>[x.item_id,x]));document.querySelector('#inbox').innerHTML=inbox.length?inbox.map(x=>`<tr><td><small class="badge">${x.item_type==='review'?'Отзыв':'Вопрос'}</small></td><td>${esc(x.text)||'<span class="muted">Без текста</span>'}<br><span class="muted">WB ID: ${esc(x.product_id||'—')}</span></td><td>${x.rating??'—'}</td><td>${x.item_type==='review'?`<small class="purchase ${esc(x.order_status)}">${esc(orderLabels[x.order_status]||orderLabels.notSpecified)}</small>`:'<span class="muted">Не применимо</span>'}</td><td><textarea ${sending.has(x.id)?'disabled':''} data-draft="${esc(x.id)}" data-original="${esc(dm[x.id]?.text||'')}">${esc(pendingText.get(x.id)??dm[x.id]?.text??'')}</textarea></td><td><button class="btn secondary" onclick="sendDraft('${esc(x.id)}',this)" ${sending.has(x.id)?'disabled':''}>${sending.has(x.id)?'Отправка…':'Отправить'}</button></td></tr>`).join(''):'<tr><td colspan="6" class="muted">По текущим фильтрам ничего не найдено.</td></tr>';document.querySelector('#reports').innerHTML=reports.reports.map(x=>`<div class="report"><b>${esc(x.warehouse||'Склад')}</b><br><span class="muted">Отчёт №${esc(x.report_id)} · ${Math.round(x.size_bytes/1024)} КБ</span></div>`).join('')||'<span class="muted">Отчёты не найдены</span>';document.querySelector('#audit').innerHTML=audit.slice(0,10).map(x=>`<div style="padding:8px 0;border-bottom:1px solid #f0f1f5"><b>${esc(x.event)}</b> <span class="muted">${esc(x.item_id||'')} · ${new Date(x.created_at).toLocaleString('ru-RU')}</span></div>`).join('')||'Пока нет действий'}load();
-const complaintLabels={ready_manual:'На ручной проверке',not_eligible:'Нет явных оснований',submitted_manual:'Подана вручную',submitted_browser:'Подана через сервис',dismissed:'Закрыта без жалобы'};
-let complaintCases=[],currentComplaint=null,complaintFocus=null;
-async function loadComplaints(){
-const target=document.querySelector('#complaints');
-try{
-const value=document.querySelector('#complaintFilter').value,r=await fetch('/api/complaints'+(value?'?status='+encodeURIComponent(value):''));
-if(!r.ok)throw new Error();
-complaintCases=await r.json();
-document.querySelector('#complaintCount').textContent='В списке: '+complaintCases.length;
-target.innerHTML=complaintCases.length?complaintCases.map(x=>`<button type="button" class="complaint-card" data-complaint="${esc(x.item_id)}"><div class="complaint-meta"><b>${x.rating??'—'} ★ · WB ID ${esc(x.product_id??'—')}</b><span class="complaint-state ${esc(x.status)}">${esc(complaintLabels[x.status]||x.status)}</span></div><b>${esc(x.reason_title||'Ручная проверка')}</b><p class="complaint-excerpt">${esc(x.review_text)||'Текст отзыва не найден'}</p><span class="muted">${esc(orderLabels[x.order_status]||'Статус не указан')} · Кабинет ${esc(x.cabinet_id)}</span><div style="color:#6d28d9;font-weight:700;margin-top:12px">Открыть отзыв и действия →</div></button>`).join(''):'<div class="muted">По выбранному статусу отзывов нет.</div>';
-target.querySelectorAll('[data-complaint]').forEach(button=>button.addEventListener('click',()=>openComplaint(button.dataset.complaint)));
-}catch(e){target.innerHTML='<p class="muted">Не удалось загрузить очередь. Нажмите «Обновить очередь».</p>'}
-}
-async function openComplaint(id){
-complaintFocus=document.activeElement;const modal=document.querySelector('#complaintModal');modal.hidden=false;document.querySelector('#complaintBody').textContent='Загрузка…';
-modal.querySelector('[role=dialog]').focus();
-try{
-const r=await fetch('/api/complaints/'+encodeURIComponent(id));if(!r.ok)throw new Error();
-currentComplaint=await r.json();renderComplaint();
-}catch(e){document.querySelector('#complaintBody').textContent='Не удалось открыть отзыв. Закройте окно и повторите попытку.'}
-}
-function renderComplaint(){
-const x=currentComplaint;
-document.querySelector('#complaintHeader').textContent=`${x.rating??'—'} ★ · WB ID: ${x.product_id??'—'} · ${orderLabels[x.order_status]||'Статус не указан'} · Кабинет: ${x.cabinet_id}`;
-document.querySelector('#complaintBody').innerHTML=`
-<section class="complaint-section"><b>Отзыв покупателя</b><p>${esc(x.review_text)||(x.review_exists?'Отзыв без текста':'Исходный отзыв не найден в базе')}</p><div class="complaint-id">ID: ${esc(x.item_id)}</div><div class="muted">Ответ покупателю: ${x.reply_published?'уже отправлен':'не отправлен'}</div><div class="complaint-controls"><button class="btn secondary" onclick="copyComplaint('id')">Скопировать ID</button><button class="btn secondary" onclick="copyComplaint('product')" ${x.product_id?'':'disabled'}>Скопировать WB ID</button>${x.product_id?`<a class="btn secondary" href="https://www.wildberries.ru/catalog/${encodeURIComponent(x.product_id)}/detail.aspx" target="_blank" rel="noopener noreferrer">Карточка товара</a>`:''}</div></section>
-<section class="complaint-section"><b>Результат предварительной проверки</b><p>${esc(x.reason_title||'Основание не указано')}</p>${x.evidence?`<p><b>Найденный фрагмент:</b><br>${esc(x.evidence)}</p>`:'<div class="complaint-notice">Явные признаки нарушения не найдены. Низкая оценка, отказ от заказа или претензия к товару сами по себе не доказывают нарушение.</div>'}<p><b>Пункты для ручной проверки</b></p><ul>${(x.checklist||[]).map(y=>`<li>${esc(y)}</li>`).join('')}</ul></section>
-<section class="complaint-section"><label for="complaintDraft"><b>Черновик обращения в модерацию</b></label><p class="muted">Проверьте факты перед копированием. Для подачи через сервис требуется 50–1000 символов. Без вашего подтверждения текст не отправляется.</p><textarea id="complaintDraft" maxlength="1000" placeholder="Если вы нашли нарушение, опишите его и приведите конкретный фрагмент отзыва.">${esc(x.complaint_draft)}</textarea><div class="complaint-controls"><button class="btn secondary" onclick="copyComplaint('draft')">Скопировать текст жалобы</button><a class="btn" href="https://seller.wildberries.ru/" target="_blank" rel="noopener noreferrer">Открыть личный кабинет WB</a><a class="btn secondary" href="https://seller.wildberries.ru/instructions/ru/tj/material/customer-reviews" target="_blank" rel="noopener noreferrer">Инструкция WB</a></div><p class="muted">В личном кабинете выберите нужный кабинет и раздел «Отзывы и вопросы». Найдите товар по WB ID и нужный отзыв по его тексту; в меню отзыва выберите «Пожаловаться на отзыв».</p></section>
-<section class="complaint-section"><b>Подача через сервис</b><p id="complaintBrowserModalStatus" class="muted">Нужен вход в отдельный Chrome для WB. Основной браузер и его пароли не используются.</p><p class="muted">Причина WB: «Другое», с вашим полным текстом обращения. Вложения подаются вручную. После подготовки проверьте кабинет, ID, текст отзыва и жалобу.</p><div class="complaint-controls"><button class="btn secondary" onclick="connectComplaintBrowser()">Подключить браузер WB</button><button class="btn secondary" onclick="checkComplaintBrowser()">Проверить подключение</button><button id="complaintBrowserSend" class="btn" onclick="prepareComplaintBrowser(false)" ${['submitted_manual','submitted_browser','dismissed'].includes(x.status)?'disabled':''}>Отправить жалобу через сервис</button><button id="complaintBrowserSelected" class="btn secondary" onclick="prepareComplaintBrowser(true)" ${['submitted_manual','submitted_browser','dismissed'].includes(x.status)?'disabled':''}>Проверить отзыв, открытый в Chrome</button></div><p class="muted">Если автопоиск не нашёл отзыв, откройте его вручную в отдельном Chrome и нажмите «Ещё», чтобы показать ID. Проверка открытого отзыва не отправляет жалобу.</p><div id="complaintSendPreview" aria-live="polite"></div></section>
-<section class="complaint-section"><label for="complaintState"><b>Статус обработки в этой панели</b></label><div class="complaint-controls"><select id="complaintState" class="btn secondary">${Object.entries(complaintLabels).filter(([key])=>key!=='submitted_browser'||x.status===key).map(([key,label])=>`<option value="${key}" ${x.status===key?'selected':''}>${esc(label)}</option>`).join('')}</select><button id="complaintSave" class="btn" onclick="saveComplaintState()">Сохранить статус</button></div><p class="muted">«Подана вручную» выбирайте только после подачи в WB. Изменение статуса здесь не отправляет жалобу.</p></section>`;
-}
-function closeComplaint(){document.querySelector('#complaintModal').hidden=true;currentComplaint=null;complaintSendPreview=null;complaintFocus?.focus()}
-async function copyComplaint(kind){
-if(!currentComplaint)return;
-const text=kind==='id'?currentComplaint.item_id:kind==='product'?String(currentComplaint.product_id||''):document.querySelector('#complaintDraft').value.trim();
-if(!text){toast('Сначала заполните текст жалобы');return}
-try{await navigator.clipboard.writeText(text);toast('Скопировано')}
-catch(e){const field=document.querySelector('#complaintDraft');if(kind==='draft'){field.focus();field.select()}else{window.prompt('Скопируйте значение:',text)}toast('Автокопирование недоступно. Скопируйте выделенный текст вручную.')}
-}
-async function saveComplaintState(){
-if(!currentComplaint)return;const button=document.querySelector('#complaintSave'),status=document.querySelector('#complaintState').value;
-button.disabled=true;
-try{const r=await fetch('/api/complaints/'+encodeURIComponent(currentComplaint.item_id),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})}),d=await r.json();if(!r.ok){toast(d.detail||'Не удалось сохранить статус');return}currentComplaint.status=d.status;toast('Статус сохранён. Жалоба в WB не отправлялась.');await loadComplaints()}catch(e){toast('Не удалось сохранить статус')}finally{button.disabled=false}
-}
-document.querySelector('#complaintModal').addEventListener('click',event=>{if(event.target.id==='complaintModal')closeComplaint()});
-document.addEventListener('keydown',event=>{if(document.querySelector('#complaintModal').hidden)return;if(event.key==='Escape'){closeComplaint();return}if(event.key==='Tab'){const elements=Array.from(document.querySelectorAll('#complaintModal button:not(:disabled),#complaintModal a,#complaintModal textarea,#complaintModal select'));const first=elements[0],last=elements.at(-1);if(event.shiftKey&&(document.activeElement===first||document.activeElement.getAttribute('role')==='dialog')){event.preventDefault();last.focus()}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus()}}});
-
-let complaintBrowserPoll=null,complaintSendPreview=null,complaintSending=false;
-function showComplaintBrowserState(data){const text=data.message||'Браузер не подключён';document.querySelector('#complaintBrowserStatus').textContent=text;const modal=document.querySelector('#complaintBrowserModalStatus');if(modal)modal.textContent=text}
-async function connectComplaintBrowser(){
-try{const r=await fetch('/api/complaint-browser/connect',{method:'POST'}),d=await r.json();if(!r.ok){toast(d.detail||'Не удалось подключить браузер');return}showComplaintBrowserState(d);pollComplaintBrowser()}catch(e){toast('Не удалось подключить браузер WB')}
-}
-async function pollComplaintBrowser(){
-clearTimeout(complaintBrowserPoll);
-try{const r=await fetch('/api/complaint-browser/status'),d=await r.json();showComplaintBrowserState(d);if(['starting','installing','opening_browser'].includes(d.status))complaintBrowserPoll=setTimeout(pollComplaintBrowser,2000)}catch(e){showComplaintBrowserState({message:'Не удалось получить состояние браузера'})}
-}
-async function checkComplaintBrowser(){
-try{const r=await fetch('/api/complaint-browser/inspect'),d=await r.json();if(!r.ok){toast(d.detail||'Не удалось проверить подключение');return}showComplaintBrowserState(d);toast(d.status==='waiting_login'?'Завершите вход в браузере':'Браузер WB подключён. Можно подготовить конкретную жалобу.')}catch(e){toast('Не удалось проверить браузер')}
-}
-
-async function prepareComplaintBrowser(useSelected){
-if(!currentComplaint||complaintSending)return;
-const text=document.querySelector('#complaintDraft').value.trim();
-if(text.length<50||text.length>1000){toast('Заполните фактическое основание жалобы: 50–1000 символов');return}
-const item=currentComplaint.item_id,box=document.querySelector('#complaintSendPreview');
-complaintSending=true;complaintSendPreview=null;
-document.querySelector('#complaintBrowserSend').disabled=true;document.querySelector('#complaintBrowserSelected').disabled=true;
-box.textContent='Проверяем выбранный отзыв и подготавливаем форму WB. Жалоба ещё не отправляется…';
-try{
-const r=await fetch('/api/complaint-browser/prepare/'+encodeURIComponent(item),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,use_selected:useSelected})}),d=await r.json();
-if(!currentComplaint||currentComplaint.item_id!==item)return;
-if(!r.ok){box.textContent=d.detail||'Не удалось подготовить форму. Жалоба не отправлена.';return}
-if(!d.token){box.textContent=d.message||'Подключите браузер WB на локальном компьютере.';return}
-complaintSendPreview=d;
-box.innerHTML=`<section class="complaint-section"><h3>Подтвердите подачу жалобы</h3><p><b>Получатель:</b> ${esc(d.destination)}<br><b>Кабинет WB:</b> ${esc(d.cabinet)}<br><b>WB ID:</b> ${esc(d.product_id)}<br><b>ID отзыва:</b> ${esc(d.item_id)}<br><b>Причина:</b> ${esc(d.reason)}</p><b>Отзыв покупателя</b><p>${esc(d.review_text)}</p><b>Полный текст жалобы</b><p>${esc(d.text)}</p><div class="complaint-notice">Низкая оценка или отказ не являются сами по себе основанием для удаления. Подтверждая отправку, вы подтверждаете указанные факты и выбранный кабинет. Предпросмотр действует 5 минут.</div><label style="margin-top:14px"><input id="complaintConfirmCheck" type="checkbox" onchange="document.querySelector('#complaintFinalSend').disabled=!this.checked"> Проверил кабинет, отзыв и весь текст жалобы</label><div class="complaint-controls"><button id="complaintFinalSend" class="btn" disabled onclick="submitComplaintBrowser()">Подтвердить и отправить в WB</button><button class="btn secondary" onclick="cancelComplaintPreview()">Отмена</button></div></section>`;
-box.scrollIntoView({behavior:'smooth',block:'nearest'});
-}catch(e){if(currentComplaint?.item_id===item)box.textContent='Ошибка подготовки. Жалоба не отправлена.'}
-finally{complaintSending=false;if(currentComplaint?.item_id===item){document.querySelector('#complaintBrowserSend').disabled=false;document.querySelector('#complaintBrowserSelected').disabled=false}}
-}
-function cancelComplaintPreview(){complaintSendPreview=null;document.querySelector('#complaintSendPreview').textContent='Отправка отменена. Форма в Chrome не отправлена.'}
-async function submitComplaintBrowser(){
-if(!complaintSendPreview||complaintSending||!document.querySelector('#complaintConfirmCheck')?.checked)return;
-const approved=complaintSendPreview,item=approved.item_id;
-if(document.querySelector('#complaintDraft').value.trim()!==approved.text){toast('Текст изменён. Подготовьте жалобу заново.');cancelComplaintPreview();return}
-complaintSending=true;
-const box=document.querySelector('#complaintSendPreview');
-box.querySelectorAll('button,input').forEach(e=>e.disabled=true);
-try{
-const r=await fetch('/api/complaint-browser/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:approved.token,confirmed:true})}),d=await r.json();
-complaintSendPreview=null;
-if(!currentComplaint||currentComplaint.item_id!==item)return;
-box.textContent=d.message||d.detail||'Проверьте результат в «Мои жалобы» WB.';
-if(r.ok&&d.status==='sent'){currentComplaint.status='submitted_browser';document.querySelector('#complaintState').innerHTML+='<option value="submitted_browser" selected>Подана через сервис</option>';toast('WB подтвердил подачу жалобы')}
-else if(r.ok&&d.status==='uncertain'){toast('Результат требует проверки в WB. Повтор заблокирован.')}
-else{toast(d.detail||'Отправка не выполнена')}
-await loadComplaints();
-}catch(e){complaintSendPreview=null;if(currentComplaint?.item_id===item)box.textContent='Соединение прервано. Не повторяйте отправку, пока не проверите «Мои жалобы» WB.'}
-finally{complaintSending=false}
-}
-pollComplaintBrowser();
-
-loadComplaints();
-
-/* Усиленный рабочий слой панели: не меняет безопасную серверную публикацию, только делает состояния видимыми. */
-const dashboardStyle=document.createElement('style');dashboardStyle.textContent='.dashboard-extra{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#6b7280}.dashboard-search{padding:10px;border:1px solid #ddd6fe;border-radius:10px;min-width:220px}.draft-saved{background:#ecfdf5!important;border-color:#a7f3d0!important}.metric-note{font-size:12px;color:#6b7280;margin-top:3px}.toolbar{align-items:center}.toolbar .btn,.toolbar select,.toolbar input{height:40px}.toolbar label.btn{display:inline-flex;align-items:center;gap:8px}.toolbar input[type=checkbox]{height:auto;width:auto;margin:0}.toolbar select.btn{appearance:auto;background:#fff;color:#4c1d95;padding:0 34px 0 13px;min-width:150px}.toolbar input{font:inherit;background:#fff}.panel{overflow:hidden}.table-wrap{border:1px solid #eef0f5;border-radius:12px}.table-wrap table{table-layout:fixed}.table-wrap th:nth-child(1){width:105px}.table-wrap th:nth-child(2){width:28%}.table-wrap th:nth-child(3){width:70px}.table-wrap th:nth-child(4){width:155px}.table-wrap th:nth-child(5){width:37%}.table-wrap th:nth-child(6){width:112px}.table-wrap td{padding:14px 10px}.table-wrap tbody tr{transition:background .15s}.table-wrap tbody tr:hover{background:#faf8ff}.table-wrap textarea{display:block;width:100%;min-width:0;min-height:88px;line-height:1.45;border-color:#d8d4e3;transition:border-color .15s,box-shadow .15s}.table-wrap textarea:focus{border-color:#8b5cf6;outline:3px solid #ede9fe;box-shadow:none}.draft-actions{display:flex;align-items:center;flex-wrap:wrap;gap:7px;margin-top:9px}.draft-actions .btn,.table-wrap td:last-child .btn{height:36px;padding:7px 11px;font-size:12px;white-space:nowrap}.table-wrap td:last-child{vertical-align:middle;text-align:center}.status-chip{display:inline-flex;align-items:center;min-height:27px;padding:4px 9px;border-radius:999px;background:#f3f4f6;color:#4b5563;font-size:11px;font-weight:800;white-space:nowrap}.status-chip.sent{background:#dcfce7;color:#166534}.status-chip:not(.sent){background:#ede9fe;color:#5b21b6}.badge{white-space:nowrap}@media(max-width:900px){.table-wrap{overflow-x:auto}.table-wrap table{min-width:980px}}@media(max-width:600px){.shell{padding:18px 12px 40px}.panel{padding:14px}.toolbar{gap:8px}.toolbar .btn,.toolbar select,.toolbar input{width:100%}.toolbar input[type=checkbox]{width:auto}.toolbar label.btn{display:flex;justify-content:space-between;align-items:center}.title{font-size:21px}}';document.head.appendChild(dashboardStyle);
-function readableEvent(value){return ({sync:'Синхронизация завершена',sync_error:'Ошибка синхронизации',published:'Ответ опубликован',draft_confirmed_by_send:'Черновик подтверждён отправкой',draft_updated:'Черновик сохранён',complaint_ready:'Жалоба требует проверки',complaint_not_eligible:'Жалоба без явного основания',complaint_status_updated:'Статус жалобы изменён',report_exported:'Отчёт выгружен',auto_sync_updated:'Настройки автосинхронизации изменены',publish_failed:'Ошибка публикации',publish_uncertain:'Публикация требует проверки'})[value]||value}
-async function saveDraft(id,field,button){const text=field.value.trim();if(text.length<2){toast('Черновик должен содержать минимум 2 символа');return}button.disabled=true;try{const r=await fetch('/api/replies/drafts/'+encodeURIComponent(id),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})}),d=await r.json();if(!r.ok){toast(d.detail||'Не удалось сохранить черновик');return}field.dataset.original=text;field.classList.add('draft-saved');button.textContent='Сохранено';toast('Черновик сохранён. В WB не отправлялся.');setTimeout(()=>{field.classList.remove('draft-saved');button.textContent='Сохранить'},1800)}catch(e){toast('Нет соединения с сервисом')}finally{button.disabled=false}}
-function enhanceInbox(){const body=document.querySelector('#inbox');if(!body)return;const rows=[...body.querySelectorAll('tr')];const search=document.querySelector('#dashboardSearch')?.value.trim().toLowerCase()||'';let visible=0;rows.forEach(row=>{if(!row.querySelector('textarea'))return;const field=row.querySelector('textarea'),id=field.dataset.draft;const text=row.innerText.toLowerCase();const matches=!search||text.includes(search);row.style.display=matches?'':'none';if(matches)visible++;if(!row.querySelector('[data-save-draft]')){const cell=field.closest('td'),actions=document.createElement('div');actions.className='draft-actions';const save=document.createElement('button');save.className='btn secondary';save.dataset.saveDraft='1';save.textContent='Сохранить';save.onclick=()=>saveDraft(id,field,save);const state=document.createElement('span');state.className='dashboard-extra';state.textContent='Черновик';actions.append(save,state);cell.append(actions)}});const counter=document.querySelector('#inboxCount');if(counter)counter.textContent=`Показано: ${visible} · поиск работает по тексту и ID`}
-async function updateSyncStatus(){try{const d=await (await fetch('/api/sync-status')).json(),box=document.querySelector('#syncState');if(!box)return;box.className='sync-state '+(d.last_error?'error':'ok');if(d.last_error)box.textContent='Ошибка синхронизации: '+d.last_error;else if(d.last_at){const when=new Date(d.last_at).toLocaleString('ru-RU');box.textContent=`Синхронизация: ${when} · новых ${d.last_received}` }else box.textContent=d.auto_enabled?'Автосинхронизация включена':'Синхронизация ещё не запускалась'}catch(e){}}
-async function updateDashboardCounters(){const cards=document.querySelector('#cards');if(!cards)return;const inboxRows=[...document.querySelectorAll('#inbox tr textarea')].length;const complaints=await (await fetch('/api/complaints?status=ready_manual')).json();const extra=`<div class="card"><div class="muted">Новые обращения</div><div class="metric">${inboxRows}</div><div class="metric-note">отзывы и вопросы в работе</div></div><div class="card"><div class="muted">Ждут проверки</div><div class="metric">${complaints.length}</div><div class="metric-note">жалобы на 1–2★</div></div>`;if(!cards.querySelector('[data-extra-cards]')){const wrap=document.createElement('div');wrap.dataset.extraCards='1';wrap.style.display='contents';wrap.innerHTML=extra;cards.append(wrap)}}
-const baseLoad=load;load=async function(){await baseLoad();enhanceInbox();updateSyncStatus();updateDashboardCounters();const audit=document.querySelector('#audit');if(audit) audit.innerHTML=audit.innerHTML.replace(/>([a-z_]+)</g,(m,e)=>'>'+readableEvent(e)+'<');};
-const originalSync=sync;sync=async function(id){await originalSync(id);updateSyncStatus();};
-const searchHost=document.querySelector('#productFilter')?.parentElement;if(searchHost&&!document.querySelector('#dashboardSearch')){const input=document.createElement('input');input.id='dashboardSearch';input.className='dashboard-search';input.placeholder='Быстрый поиск по тексту или ID';input.oninput=enhanceInbox;searchHost.append(input)}
-const syncHost=document.querySelector('#interval')?.parentElement;if(syncHost&&!document.querySelector('#syncState')){const state=document.createElement('span');state.id='syncState';state.className='sync-state';state.textContent='Синхронизация: проверка…';syncHost.append(state)}
-const filterHost=document.querySelector('#productFilter')?.parentElement;if(filterHost&&!document.querySelector('#statusFilter')){const state=document.createElement('select');state.id='statusFilter';state.className='btn secondary';state.innerHTML='<option value="">Все статусы</option><option value="draft">Активные черновики</option>';state.onchange=enhanceInbox;filterHost.insertBefore(state,document.querySelector('#productFilter'))}
-const baseEnhance=enhanceInbox;enhanceInbox=function(){baseEnhance();const state=document.querySelector('#statusFilter')?.value||'';if(state){document.querySelectorAll('#inbox tr').forEach(row=>{if(row.querySelector('textarea'))row.style.display=state==='draft'?'':'none'})}};
-const bulkHint=document.querySelector('#bulkButton')?.nextElementSibling;if(bulkHint)bulkHint.textContent='Пакетная отправка доступна только для отзывов. Перед публикацией сервис покажет количество, статусы покупки и полный текст каждого ответа.';
-function relabelFbs(){document.querySelectorAll('h2').forEach(h=>{if(h.textContent.includes('Честного знака'))h.textContent='Отчёты поставок FBS'});const title=document.querySelector('.title');if(title)title.textContent='Отзывы, вопросы и поставки FBS';const download=document.querySelector('button[onclick="downloadReport()"]');if(download)download.textContent='⇩ Скачать сводку поставок FBS';const backup=document.querySelector('button[data-backup]');if(!backup&&download){const b=document.createElement('button');b.className='btn secondary';b.dataset.backup='1';b.textContent='⇩ Резервная копия';b.onclick=()=>window.location='/api/admin/backup';download.parentElement.appendChild(b)}const first=document.querySelector('#cards .card .muted');if(first)first.textContent='FBS-отчёты';const report=document.querySelector('#reports');if(report&&!report.children.length)report.innerHTML='<span class="muted">Загрузите отчёты поставок FBS в папку fbs_reports</span>'}
-async function enhanceAdminPanels(){const reports=document.querySelector('#reports');if(!reports)return;const panel=reports.closest('.panel');if(panel&&!panel.querySelector('[data-fbs-upload]')){const bar=document.createElement('div');bar.className='toolbar';bar.innerHTML='<input data-fbs-upload type="file" accept=".pdf,.csv,.xlsx,.xls" hidden><button class="btn secondary" data-upload-btn>Загрузить FBS-файл</button><span class="muted" data-upload-state>PDF, CSV или Excel до 50 МБ</span>';panel.querySelector('h2')?.after(bar);const input=bar.querySelector('input');bar.querySelector('[data-upload-btn]').onclick=()=>input.click();input.onchange=async()=>{if(!input.files[0])return;const fd=new FormData();fd.append('file',input.files[0]);bar.querySelector('[data-upload-state]').textContent='Загрузка…';const r=await fetch('/api/fbs-reports/upload',{method:'POST',body:fd});const d=await r.json();bar.querySelector('[data-upload-state]').textContent=r.ok?'Файл загружен: '+d.filename:(d.detail||'Ошибка загрузки');if(r.ok)load()}}const existing=document.querySelector('#templatePanel');if(!existing){const p=document.createElement('section');p.id='templatePanel';p.className='panel';p.innerHTML='<h2>Шаблоны ответов</h2><p class="muted">Изменения применяются к новым и перегенерируемым черновикам.</p><div data-template-list>Загрузка…</div>';panel?.after(p);const templates=await (await fetch('/api/templates')).json();p.querySelector('[data-template-list]').innerHTML=Object.entries(templates).map(([key,text])=>`<div class="template-row"><label><b>${esc(key)}</b><textarea data-template="${esc(key)}">${esc(text)}</textarea><button class="btn secondary" data-save-template="${esc(key)}">Сохранить шаблон</button></label></div>`).join('');p.querySelectorAll('[data-save-template]').forEach(b=>b.onclick=async()=>{const key=b.dataset.saveTemplate;const text=p.querySelector(`[data-template="${CSS.escape(key)}"]`).value;const r=await fetch('/api/templates/'+encodeURIComponent(key),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});toast(r.ok?'Шаблон сохранён':'Не удалось сохранить шаблон')})}}
-const dashboardLoadWithLabels=load;load=async function(){await dashboardLoadWithLabels();relabelFbs();enhanceAdminPanels()};
-function enhanceProductKnowledge(){if(document.querySelector('#productKnowledgePanel'))return;const templates=document.querySelector('#templatePanel');if(!templates)return;const p=document.createElement('section');p.id='productKnowledgePanel';p.className='panel';p.innerHTML='<h2>База характеристик товаров</h2><p class="muted">Характеристики привязаны к WB ID и используются при подготовке ответов.</p><div class="toolbar"><input id="knowledgeProductId" class="dashboard-search" placeholder="WB ID товара"><button class="btn secondary" onclick="loadProductKnowledge()">Открыть</button></div><div id="knowledgeEditor" hidden><div class="knowledge-grid"><label>Состав<textarea data-fact="composition"></textarea></label><label>Замеры<textarea data-fact="measurements"></textarea></label><label>Детали модели<textarea data-fact="details"></textarea></label><label>Уход<textarea data-fact="care"></textarea></label><label>Сезонность<textarea data-fact="season"></textarea></label></div><button class="btn" onclick="saveProductKnowledge()">Сохранить характеристики</button></div>';templates.after(p)}
-async function renderFbsRegistry(){const box=document.querySelector('#reports');if(!box)return;const r=await fetch('/api/fbs-reports'),d=await r.json();const labels={new:'Новый',checked:'Проверен',reported:'Отчитан',error:'Ошибка'};box.innerHTML=d.reports.length?d.reports.map(x=>`<div class="report"><b>${esc(x.warehouse||'Склад не указан')}</b><br><span class="muted">${esc(x.filename)} · ${Math.round(x.size_bytes/1024)} КБ</span><select class="btn secondary" onchange="setFbsStatus('${esc(x.filename)}',this.value)">${Object.entries(labels).map(([v,l])=>`<option value="${v}" ${x.status===v?'selected':''}>${l}</option>`).join('')}</select></div>`).join(''):'<span class="muted">FBS-файлы ещё не загружены</span>'}
-async function setFbsStatus(filename,status){const r=await fetch('/api/fbs-reports/'+encodeURIComponent(filename)+'/status?status='+encodeURIComponent(status),{method:'PUT'});toast(r.ok?'Статус FBS сохранён':'Не удалось изменить статус')}
-async function enhanceCabinets(){const box=document.querySelector('#cabinet');if(!box)return;const cabinets=await (await fetch('/api/cabinets')).json();[...box.querySelectorAll('button')].forEach((button,i)=>{const cabinet=cabinets[i];if(cabinet&&!button.querySelector('[data-cabinet-state]')){const state=document.createElement('span');state.dataset.cabinetState='1';state.className='dashboard-extra';state.textContent=cabinet.token_configured?' · токен подключён':' · нужен токен';button.append(state)}})}
-async function loadProductKnowledge(){const id=document.querySelector('#knowledgeProductId').value.trim();if(!/^\\d+$/.test(id)){toast('Введите корректный WB ID');return}const r=await fetch('/api/products/knowledge/'+id),d=await r.json();const editor=document.querySelector('#knowledgeEditor');editor.hidden=false;editor.dataset.productId=id;editor.querySelectorAll('[data-fact]').forEach(x=>x.value=d.facts[x.dataset.fact]||'')}
-async function saveProductKnowledge(){const editor=document.querySelector('#knowledgeEditor'),id=editor.dataset.productId;if(!id)return;const facts={};editor.querySelectorAll('[data-fact]').forEach(x=>facts[x.dataset.fact]=x.value.trim());const r=await fetch('/api/products/knowledge/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(facts)});toast(r.ok?'Характеристики сохранены':'Не удалось сохранить характеристики')}
-const dashboardLoadWithKnowledge=load;load=async function(){await dashboardLoadWithKnowledge();enhanceProductKnowledge();await renderFbsRegistry();await enhanceCabinets()};
-async function enhanceAutoReplies(){
-  if(document.querySelector('#autoRepliesPanel'))return;
-  const anchor=document.querySelector('#templatePanel')||document.querySelector('#inbox-panel');if(!anchor)return;
-  const p=document.createElement('section');p.id='autoRepliesPanel';p.className='panel';
-  p.innerHTML='<div class="auto-head"><div><h2>Автоматические ответы на отзывы</h2><p class="muted">Сервис анализирует новые отзывы, выбирает подходящий шаблон и создаёт персональный черновик. Публикация без подтверждения выключена.</p></div><span class="status-chip" data-auto-state>Загрузка…</span></div><div class="auto-grid"><label class="auto-toggle"><input data-auto-enabled type="checkbox"><span><b>Включить автоответы</b><small>Обрабатывать отзывы при синхронизации</small></span></label><label>Режим<select data-auto-mode class="btn secondary"><option value="draft">Черновик + модерация</option><option value="auto_generate">Автогенерация черновика</option></select></label><label>От рейтинга<select data-auto-min class="btn secondary"></select></label><label>До рейтинга<select data-auto-max class="btn secondary"></select></label></div><div class="auto-grid"><label class="auto-toggle"><input data-auto-moderation type="checkbox" checked><span><b>Требовать модерацию</b><small>Перед отправкой оператор проверяет текст</small></span></label><label class="auto-toggle"><input data-auto-publish type="checkbox"><span><b>Автопубликация</b><small>Опасный режим: доступен только без модерации</small></span></label></div><label class="auto-rules-label">Правила по ключевым словам <small class="muted">JSON-массив: name, min_rating, max_rating, keywords, action (generate/skip)</small><textarea data-auto-rules placeholder="[{&quot;name&quot;:&quot;Проблемы с размером&quot;,&quot;keywords&quot;:[&quot;размер&quot;,&quot;маломерит&quot;]}]"></textarea></label><div class="toolbar"><button class="btn" data-auto-save>Сохранить настройки</button><button class="btn secondary" data-auto-run>Обработать загруженные отзывы</button><span class="muted" data-auto-result></span></div>';
-  anchor.after(p);
-  const fill=(select)=>{select.innerHTML=[1,2,3,4,5].map(x=>`<option value="${x}">${x} ★</option>`).join('')};fill(p.querySelector('[data-auto-min]'));fill(p.querySelector('[data-auto-max]'));
-  const setState=(x)=>{p.querySelector('[data-auto-enabled]').checked=!!x.enabled;p.querySelector('[data-auto-mode]').value=x.mode;p.querySelector('[data-auto-min]').value=x.min_rating;p.querySelector('[data-auto-max]').value=x.max_rating;p.querySelector('[data-auto-moderation]').checked=!!x.require_moderation;p.querySelector('[data-auto-publish]').checked=!!x.auto_publish;p.querySelector('[data-auto-rules]').value=JSON.stringify(x.rules||[],null,2);p.querySelector('[data-auto-state]').textContent=x.enabled?'Включено':'Выключено';p.querySelector('[data-auto-state]').classList.toggle('sent',!!x.enabled)};
-  const r=await fetch('/api/settings/auto-replies');if(r.ok)setState(await r.json());
-  p.querySelector('[data-auto-save]').onclick=async()=>{let rules=[];try{rules=JSON.parse(p.querySelector('[data-auto-rules]').value||'[]');if(!Array.isArray(rules))throw new Error()}catch(e){toast('Правила должны быть корректным JSON-массивом');return}const body={enabled:p.querySelector('[data-auto-enabled]').checked,mode:p.querySelector('[data-auto-mode]').value,min_rating:Number(p.querySelector('[data-auto-min]').value),max_rating:Number(p.querySelector('[data-auto-max]').value),require_moderation:p.querySelector('[data-auto-moderation]').checked,auto_publish:p.querySelector('[data-auto-publish]').checked,rules};const response=await fetch('/api/settings/auto-replies',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),data=await response.json();if(!response.ok){toast(data.detail||'Не удалось сохранить настройки');return}setState(data);toast('Настройки автоответов сохранены')};
-  p.querySelector('[data-auto-run]').onclick=async()=>{const b=p.querySelector('[data-auto-run]');b.disabled=true;b.textContent='Обработка…';try{const response=await fetch('/api/auto-replies/run',{method:'POST'}),data=await response.json();p.querySelector('[data-auto-result]').textContent=response.ok?`Проверено: ${data.checked}, создано: ${data.generated}`:(data.detail||'Ошибка обработки');if(response.ok)await load()}finally{b.disabled=false;b.textContent='Обработать загруженные отзывы'}};
-}
-const autoRepliesLoad=load;load=async function(){await autoRepliesLoad();await enhanceAutoReplies()};
-const autoRepliesStyle=document.createElement('style');autoRepliesStyle.textContent='.auto-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.auto-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:14px 0}.auto-grid label,.auto-rules-label{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:700}.auto-grid select{width:100%;margin:0}.auto-toggle{display:flex!important;flex-direction:row!important;align-items:flex-start;gap:9px;padding:12px;border:1px solid #eee;border-radius:11px;background:#fafafa}.auto-toggle input{margin-top:3px}.auto-toggle small{display:block;color:#6b7280;font-weight:400;margin-top:4px}.auto-rules-label textarea{min-width:0;min-height:100px;font-family:ui-monospace,Consolas,monospace;font-size:12px}@media(max-width:800px){.auto-grid{grid-template-columns:1fr 1fr}}@media(max-width:560px){.auto-head{flex-direction:column}.auto-grid{grid-template-columns:1fr}}';document.head.appendChild(autoRepliesStyle);
-const reviewMarkupStyle=document.createElement('style');reviewMarkupStyle.textContent='.tag-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}.review-tag,.sentiment,.moderation-status{display:inline-flex;align-items:center;border-radius:999px;padding:3px 7px;font-size:10px;font-weight:800;white-space:nowrap}.review-tag{background:#eef2ff;color:#4338ca}.topic-quality{background:#fee2e2;color:#991b1b}.topic-size{background:#fef3c7;color:#92400e}.topic-delivery{background:#dbeafe;color:#1d4ed8}.topic-packaging{background:#f3e8ff;color:#6b21a8}.topic-material{background:#dcfce7;color:#166534}.topic-color{background:#fce7f3;color:#9d174d}.sentiment.positive{background:#dcfce7;color:#166534}.sentiment.negative{background:#fee2e2;color:#991b1b}.sentiment.neutral{background:#f3f4f6;color:#4b5563}.moderation-line{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:7px}.moderation-status{background:#fff7ed;color:#9a3412}.table-wrap th:first-child,.table-wrap td:first-child{width:38px;text-align:center}.table-wrap th:nth-child(2){width:100px}.table-wrap th:nth-child(3){width:29%}.table-wrap th:nth-child(4){width:150px}.table-wrap th:nth-child(5){width:35%}';document.head.appendChild(reviewMarkupStyle);
-const settingsStyle=document.createElement('style');settingsStyle.textContent='.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:14px 0}.settings-field{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:700}.settings-field input,.settings-field select,.settings-grid>input,.settings-grid>select{width:100%;min-width:0;padding:10px;border:1px solid #d8d4e3;border-radius:9px;font:inherit;background:#fff}.settings-field small{font-size:11px;color:#6b7280;font-weight:400}.settings-checks{display:flex;flex-wrap:wrap;gap:16px;margin:14px 0;color:#4b5563;font-size:13px}.settings-checks label{display:flex;gap:7px;align-items:center}.panel>textarea[data-rules-json],.panel>textarea[data-knowledge-store],.panel>textarea[data-tpl-text]{width:100%;min-width:0;min-height:110px;margin:12px 0;padding:11px;border:1px solid #d8d4e3;border-radius:9px;font:inherit}.template-card{padding:14px;border:1px solid #eef0f5;border-radius:11px;margin-top:10px;background:#fff}.template-card>div{display:flex;gap:8px;align-items:center}.template-card p{white-space:pre-wrap;color:#4b5563;line-height:1.5}.template-card .btn{float:right}@media(max-width:760px){.settings-grid{grid-template-columns:1fr}}';document.head.appendChild(settingsStyle);
-async function moduleSettings(name){const r=await fetch('/api/settings/modules/'+encodeURIComponent(name));return r.ok?await r.json():{values:{}}}
-async function saveModuleSettings(name,values){const r=await fetch('/api/settings/modules/'+encodeURIComponent(name),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({values})});toast(r.ok?'Настройки сохранены':'Не удалось сохранить настройки');return r.ok}
-function field(label,html){return `<label class="settings-field"><span>${label}</span>${html}</label>`}
-/* async function enhanceExtendedPanels(){
-  const anchor=document.querySelector('#autoRepliesPanel')||document.querySelector('#templatePanel');if(!anchor)return;
-  if(!document.querySelector('#aiSettingsPanel')){const p=document.createElement('section');p.id='aiSettingsPanel';p.className='panel';p.innerHTML='<h2>Настройки ИИ</h2><p class="muted">Стиль и ограничения генератора. Настройки применяются к новым черновикам.</p><div class="settings-grid">'+field('Фирменное приветствие','<input data-ai="greeting" placeholder="Здравствуйте!"><small>Если заполнено, добавляется в начало ответа.</small>')+field('Подпись','<input data-ai="signature" placeholder="С уважением, команда магазина"><small>Добавляется в конец ответа.</small>')+field('Обращение','<select data-ai="address"><option value="name">По имени покупателя</option><option value="neutral">Нейтрально</option></select>')+field('Длина ответа','<select data-ai="length"><option value="short">Короткий</option><option value="medium">Средний</option><option value="long">Подробный</option></select>')+'</div><div class="settings-checks"><label><input type="checkbox" data-ai="use_emojis"> Использовать смайлики</label><label><input type="checkbox" data-ai="favorite_prompt"> Предлагать добавить магазин в избранное</label><label><input type="checkbox" data-ai="photo_compliment"> Делать комплимент при фото или видео</label></div><button class="btn" data-ai-save>Сохранить настройки ИИ</button>';anchor.after(p);const data=await moduleSettings('ai');const values=data.values||{};p.querySelectorAll('[data-ai]').forEach(x=>{if(x.type==='checkbox')x.checked=!!values[x.dataset.ai];else x.value=values[x.dataset.ai]||''});p.querySelector('[data-ai-save]').onclick=async()=>{const values={};p.querySelectorAll('[data-ai]').forEach(x=>values[x.dataset.ai]=x.type==='checkbox'?x.checked:x.value);await saveModuleSettings('ai',values)}}
-  if(!document.querySelector('#notificationsPanel')){const p=document.createElement('section');p.id='notificationsPanel';p.className='panel';p.innerHTML='<h2>Настройки оповещений Telegram</h2><p class="muted">Токен хранится только в локальных настройках. Уведомления отправляются после синхронизации.</p><div class="settings-grid">'+field('Токен Telegram-бота','<input type="password" data-tg="bot_token" placeholder="123456:...">')+field('Chat ID','<input data-tg="chat_id" placeholder="-100..."><small>Узнать можно через @userinfobot.</small>')+field('Кабинеты','<input data-tg="cabinet_ids" placeholder="default, второй кабинет">')+field('Рейтинг для важных отзывов','<select data-tg="min_rating"><option value="1">1–5 звёзд</option><option value="2">1–2 звезды</option><option value="3">1–3 звезды</option></select>')+'</div><div class="settings-checks"><label><input type="checkbox" data-tg="enabled"> Включить Telegram</label><label><input type="checkbox" data-tg="notify_new_reviews"> Новые отзывы</label><label><input type="checkbox" data-tg="notify_published"> Ответы опубликованы</label><label><input type="checkbox" data-tg="notify_low_balance"> Низкий баланс</label></div><button class="btn" data-tg-save>Сохранить Telegram</button>';p.after(document.querySelector('#aiSettingsPanel'));const data=await moduleSettings('telegram');const values=data.values||{};p.querySelectorAll('[data-tg]').forEach(x=>{if(x.type==='checkbox')x.checked=!!values[x.dataset.tg];else x.value=values[x.dataset.tg]||''});p.querySelector('[data-tg-save]').onclick=async()=>{const values={};p.querySelectorAll('[data-tg]').forEach(x=>values[x.dataset.tg]=x.type==='checkbox'?x.checked:x.value);await saveModuleSettings('telegram',values)}}
-  if(!document.querySelector('#importPanel')){const p=document.createElement('section');p.id='importPanel';p.className='panel';p.innerHTML='<h2>Подгрузка отзывов</h2><p class="muted">Загрузка истории по выбранному периоду. Ранее сохранённые отзывы не дублируются.</p><div class="settings-grid">'+field('Дата от','<input type="date" data-import="date_from">')+field('Дата до','<input type="date" data-import="date_to">')+field('Кабинеты','<input data-import="cabinet_ids" placeholder="default, cabinet-2">')+field('Разметка','<select data-import="with_markup"><option value="true">Загружать с темами и тональностью</option><option value="false">Только тексты</option></select>')+'</div><button class="btn" data-import-run>Загрузить отзывы</button><span class="muted" data-import-result></span>';p.after(document.querySelector('#notificationsPanel'));p.querySelector('[data-import-run]').onclick=async()=>{const b=p.querySelector('[data-import-run']);b.disabled=true;const cabinetText=p.querySelector('[data-import="cabinet_ids"]').value.trim();const body={cabinet_ids:cabinetText?cabinetText.split(',').map(x=>x.trim()).filter(Boolean):undefined,date_from:p.querySelector('[data-import="date_from"]').value||null,date_to:p.querySelector('[data-import="date_to"]').value||null,with_markup:p.querySelector('[data-import="with_markup"]').value==='true'};const r=await fetch('/api/import/reviews',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),d=await r.json();p.querySelector('[data-import-result]').textContent=r.ok?'Загружено: '+d.imported:(d.detail||'Ошибка импорта');b.disabled=false;if(r.ok)await load()}}}
-  if(!document.querySelector('#rulesPanel')){const p=document.createElement('section');p.id='rulesPanel';p.className='panel';p.innerHTML='<h2>Правила обработки отзывов</h2><p class="muted">Правила проверяются сверху вниз. Укажите темы, тональность, рейтинг, товар, медиа, стоп-слова и тип ответа.</p><textarea data-rules-json placeholder="[{&quot;name&quot;:&quot;Негатив о размере&quot;,&quot;topics&quot;:[&quot;size&quot;],&quot;sentiments&quot;:[&quot;negative&quot;],&quot;response_type&quot;:&quot;ai&quot;,&quot;moderation_required&quot;:true,&quot;priority&quot;:10}]"></textarea><div class="toolbar"><button class="btn" data-rules-save>Сохранить правила</button><span class="muted">Подробные правила также доступны в блоке автоответов.</span></div>';p.after(document.querySelector('#importPanel'));const data=await moduleSettings('rules');p.querySelector('[data-rules-json]').value=JSON.stringify(data.values?.rules||[],null,2);p.querySelector('[data-rules-save]').onclick=async()=>{try{const rules=JSON.parse(p.querySelector('[data-rules-json]').value||'[]');if(!Array.isArray(rules))throw new Error();await saveModuleSettings('rules',{rules})}catch(e){toast('Правила должны быть корректным JSON-массивом')}}}}
-  if(!document.querySelector('#recommendationsPanel')){const p=document.createElement('section');p.id='recommendationsPanel';p.className='panel';p.innerHTML='<h2>Рекомендации товаров</h2><p class="muted">Сохраняйте товары, категории или ссылки, которые можно использовать в ответах по правилам.</p><div class="settings-grid"><input data-rec-name placeholder="Название рекомендации"><input data-rec-products placeholder="WB ID товаров через запятую"><input data-rec-category placeholder="Категория"><input data-rec-link placeholder="Ссылка на подборку (Ozon)"></div><button class="btn" data-rec-save>Добавить рекомендацию</button><div data-rec-list class="report-list"></div>';p.after(document.querySelector('#rulesPanel'));const render=async()=>{const r=await fetch('/api/recommendations'),items=await r.json();p.querySelector('[data-rec-list]').innerHTML=items.map(x=>`<div class="report"><b>${esc(x.name)}</b><br><span class="muted">${esc(x.product_ids||x.category||x.link||'Без условий')}</span></div>`).join('')||'<span class="muted">Рекомендаций пока нет</span>'};p.querySelector('[data-rec-save]').onclick=async()=>{const body={name:p.querySelector('[data-rec-name]').value.trim(),product_ids:p.querySelector('[data-rec-products]').value.split(',').map(x=>x.trim()).filter(Boolean),category:p.querySelector('[data-rec-category]').value.trim(),link:p.querySelector('[data-rec-link]').value.trim(),enabled:true};if(!body.name){toast('Укажите название рекомендации');return}const r=await fetch('/api/recommendations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(r.ok){toast('Рекомендация добавлена');await render()}};await render()}
-  if(!document.querySelector('#knowledgeHubPanel')){const p=document.createElement('section');p.id='knowledgeHubPanel';p.className='panel';p.innerHTML='<h2>База знаний магазина</h2><p class="muted">Общие правила магазина используются как контекст для ответов: доставка, оплата, гарантия, обмен, запреты и группы товаров.</p><textarea data-knowledge-store placeholder="Например: не предлагаем возврат в ответе на отзыв; по размеру направляем к таблице замеров; вопросы по заказу — в поддержку WB."></textarea><button class="btn" data-knowledge-save>Сохранить правила магазина</button>';p.after(document.querySelector('#recommendationsPanel'));const data=await moduleSettings('knowledge');p.querySelector('[data-knowledge-store]').value=data.values?.text||'';p.querySelector('[data-knowledge-save]').onclick=async()=>{await saveModuleSettings('knowledge',{text:p.querySelector('[data-knowledge-store]').value})}}
-  const navTargets={knowledge:'knowledgeHubPanel',recommendations:'recommendationsPanel',settings:'templatePanel',ai:'aiSettingsPanel',import:'importPanel'};Object.entries(navTargets).forEach(([nav,target])=>{const link=document.querySelector(`[data-nav="${nav}"]`);if(link)link.setAttribute('href','#'+target)});
-  if(!document.querySelector('#customTemplatesPanel')){const p=document.createElement('section');p.id='customTemplatesPanel';p.className='panel';p.innerHTML='<h2>Личные шаблоны ответов</h2><p class="muted">Можно создавать неограниченное количество шаблонов. Переменные: <code>{{name}}</code>, <code>{{rating}}</code>, <code>{{product_id}}</code>, <code>{{product_name}}</code>, <code>{{text}}</code>.</p><div class="settings-grid"><input data-tpl-name placeholder="Название шаблона"><select data-tpl-topic><option value="general">Общее</option><option value="quality">Качество</option><option value="size">Размер</option><option value="delivery">Доставка</option><option value="material">Материал</option><option value="color">Цвет</option></select><select data-tpl-sentiment><option value="any">Любая тональность</option><option value="positive">Позитив</option><option value="negative">Негатив</option><option value="neutral">Нейтральный</option></select></div><textarea data-tpl-text placeholder="Здравствуйте, {{name}}! Спасибо за обратную связь..."></textarea><input data-tpl-signature placeholder="Подпись под ответом"><button class="btn" data-tpl-create>Создать шаблон</button><div data-tpl-list></div>';p.after(document.querySelector('#templatePanel'));const render=async()=>{const r=await fetch('/api/templates/custom'),items=await r.json();p.querySelector('[data-tpl-list]').innerHTML=items.map(x=>`<article class="template-card"><div><b>${esc(x.name)}</b><span class="review-tag">${esc(x.topic||'general')} · ${esc(x.sentiment||'any')}</span></div><p>${esc(x.text)}</p><button class="btn secondary" onclick="deleteCustomTemplate('${esc(x.id)}')">Удалить</button></article>`).join('')||'<p class="muted">Личных шаблонов пока нет.</p>'};window.deleteCustomTemplate=async(id)=>{const r=await fetch('/api/templates/custom/'+encodeURIComponent(id),{method:'DELETE'});if(r.ok){toast('Шаблон удалён');await render()}};p.querySelector('[data-tpl-create]').onclick=async()=>{const body={name:p.querySelector('[data-tpl-name]').value.trim(),topic:p.querySelector('[data-tpl-topic]').value,sentiment:p.querySelector('[data-tpl-sentiment]').value,text:p.querySelector('[data-tpl-text]').value,signature:p.querySelector('[data-tpl-signature]').value,enabled:true};if(!body.name||body.text.length<2){toast('Укажите название и текст шаблона');return}const r=await fetch('/api/templates/custom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(r.ok){toast('Шаблон создан');p.querySelector('[data-tpl-name]').value='';p.querySelector('[data-tpl-text]').value='';await render()}};await render()}
-}
-} */
-const extendedLoad=load;load=async function(){await extendedLoad()};
-async function loadModulePanel(id,title,module,fields){
-  if(document.querySelector('#'+id))return;
-  const anchor=document.querySelector('#autoRepliesPanel')||document.querySelector('#templatePanel');if(!anchor)return;
-  const p=document.createElement('section');p.id=id;p.className='panel';
-  p.innerHTML='<h2>'+title+'</h2><p class="muted">Настройки сохраняются локально и применяются к новым операциям.</p><div class="module-fields">'+fields.map(f=>f.type==='checkbox'?'<label class="module-check"><input data-module-key="'+f.key+'" type="checkbox"> <span>'+f.label+'</span></label>':'<label><span>'+f.label+'</span><input data-module-key="'+f.key+'" type="'+(f.secret?'password':'text')+'" placeholder="'+(f.placeholder||'')+'"></label>').join('')+'</div><button class="btn" data-module-save>Сохранить</button>';
-  anchor.after(p);
-  const response=await fetch('/api/settings/modules/'+encodeURIComponent(module));const data=response.ok?await response.json():{values:{}};const values=data.values||{};
-  p.querySelectorAll('[data-module-key]').forEach(x=>x.type==='checkbox'?x.checked===true||values[x.dataset.moduleKey]===true||values[x.dataset.moduleKey]==='true':x.value=values[x.dataset.moduleKey]||'');
-  p.querySelector('[data-module-save]').onclick=async()=>{const out={};p.querySelectorAll('[data-module-key]').forEach(x=>out[x.dataset.moduleKey]=x.type==='checkbox'?x.checked:x.value);const r=await fetch('/api/settings/modules/'+encodeURIComponent(module),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({values:out})});toast(r.ok?'Настройки сохранены':'Не удалось сохранить настройки')};
-}
-async function enhanceSimplePanels(){
-  await loadModulePanel('aiSettingsPanel','Настройки ИИ','ai',[{key:'signature',label:'Фирменная подпись',placeholder:'С уважением, команда магазина'},{key:'tone',label:'Тон ответа',placeholder:'дружелюбный, спокойный'},{key:'length',label:'Длина ответа',placeholder:'короткий / средний / подробный'}]);
-  await loadModulePanel('notificationsPanel','Настройки оповещений Telegram','telegram',[{key:'bot_token',label:'Токен бота',secret:true},{key:'chat_id',label:'Chat ID'},{key:'min_rating',label:'Минимальный рейтинг для уведомлений',placeholder:'1'},{key:'enabled',label:'Включить Telegram',type:'checkbox'},{key:'notify_new_reviews',label:'Новые отзывы',type:'checkbox'},{key:'notify_new_questions',label:'Новые вопросы',type:'checkbox'},{key:'notify_published',label:'Опубликованные ответы',type:'checkbox'},{key:'notify_question_answers',label:'Ответы на вопросы',type:'checkbox'}]);
-  await loadModulePanel('knowledgeHubPanel','База знаний магазина','knowledge',[{key:'text',label:'Общие правила магазина',placeholder:'Правила доставки, возврата, оплаты и общения'}]);
-  await loadModulePanel('recommendationsPanel','Рекомендации товаров','recommendations',[{key:'default_product_ids',label:'WB ID товаров через запятую'},{key:'categories',label:'Категории'}]);
-}
-async function enhanceCustomTemplatePanel(){if(document.querySelector('#customTemplatesPanel'))return;const anchor=document.querySelector('#templatePanel');if(!anchor)return;const p=document.createElement('section');p.id='customTemplatesPanel';p.className='panel';p.innerHTML='<h2>Личные шаблоны ответов</h2><p class="muted">Переменные: {{name}}, {{rating}}, {{product_id}}, {{product_name}}, {{text}}.</p><input data-tpl-name placeholder="Название шаблона"><textarea data-tpl-text placeholder="Здравствуйте, {{name}}! Спасибо за обратную связь..."></textarea><input data-tpl-signature placeholder="Подпись"><button class="btn" data-tpl-create>Создать шаблон</button><div data-tpl-list></div>';anchor.after(p);const render=async()=>{const r=await fetch('/api/templates/custom'),items=await r.json();p.querySelector('[data-tpl-list]').innerHTML=items.map(x=>'<div class="template-card"><b>'+esc(x.name)+'</b><p>'+esc(x.text)+'</p></div>').join('')||'<span class="muted">Личных шаблонов пока нет.</span>'};p.querySelector('[data-tpl-create]').onclick=async()=>{const body={name:p.querySelector('[data-tpl-name]').value.trim(),text:p.querySelector('[data-tpl-text]').value,signature:p.querySelector('[data-tpl-signature]').value,topic:'general',sentiment:'any',enabled:true};if(!body.name||body.text.length<2){toast('Укажите название и текст шаблона');return}const r=await fetch('/api/templates/custom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(r.ok){toast('Шаблон создан');await render()}};await render()}
-const simplePanelsLoad=load;load=async function(){await simplePanelsLoad();await enhanceSimplePanels();await enhanceCustomTemplatePanel()};
-async function enhanceQuestionsPanel(){if(document.querySelector('#questionsPanel'))return;const anchor=document.querySelector('#inbox-panel')||document.querySelector('#autoRepliesPanel');if(!anchor)return;const p=document.createElement('section');p.id='questionsPanel';p.className='panel';p.innerHTML='<div class="question-head"><div><h2>Все вопросы покупателей</h2><p class="muted">Автоответы формируются по базе знаний и шаблонам. Перед отправкой ответ проходит модерацию.</p></div><button class="btn secondary" data-question-refresh>Обновить</button></div><div class="toolbar"><input data-question-search placeholder="Поиск по вопросу, имени или WB ID"><select data-question-status class="btn secondary"><option value="">Все статусы</option><option value="draft">Черновики</option><option value="ready">Готовы к отправке</option><option value="published">Отправлены</option></select><input data-question-from type="date"><input data-question-to type="date"><button class="btn" data-question-run>Сформировать автоответы</button></div><div class="table-wrap"><table><thead><tr><th>Дата</th><th>Товар</th><th>Вопрос</th><th>Ответ</th></tr></thead><tbody data-question-list><tr><td colspan="4">Загрузка…</td></tr></tbody></table></div><hr><h3>Настройки ответов на вопросы</h3><div class="question-settings"><label><input type="checkbox" data-question-enabled> Включить автоответы</label><label><input type="checkbox" data-question-keywords checked> Сначала искать по ключевым словам</label><label><input type="checkbox" data-question-ai checked> Использовать генерацию ИИ</label><label><input type="checkbox" data-question-moderation checked> Модерировать ответы</label><label><input type="checkbox" data-question-name checked> Обращаться по имени</label><input data-question-signature placeholder="Подпись под ответом"><select data-question-empty><option value="manual">Если ответа нет — ручной ответ</option><option value="ai">Если ответа нет — ИИ</option><option value="ignore">Если ответа нет — игнорировать</option></select></div><button class="btn" data-question-save>Сохранить настройки вопросов</button><h3>Шаблон вопроса с ключевыми словами</h3><div class="question-settings"><input data-question-tpl-name placeholder="Название шаблона"><input data-question-tpl-keywords placeholder="Ключевые слова через запятую"><textarea data-question-tpl-text placeholder="Здравствуйте, {{name}}! Ответ на вопрос..."></textarea><input data-question-tpl-signature placeholder="Подпись"></div><button class="btn secondary" data-question-tpl-save>Добавить шаблон</button></section>';anchor.after(p);const loadQuestions=async()=>{const q=new URLSearchParams({item_type:'question',limit:'100'});const search=p.querySelector('[data-question-search]').value.trim(),status=p.querySelector('[data-question-status]').value,from=p.querySelector('[data-question-from]').value,to=p.querySelector('[data-question-to]').value;if(search)q.set('search',search);if(status)q.set('status',status);if(from)q.set('date_from',from);if(to)q.set('date_to',to);const r=await fetch('/api/inbox/overview?'+q),items=r.ok?await r.json():[];p.querySelector('[data-question-list]').innerHTML=items.map(x=>`<tr><td>${esc(workflowDate(x.created_at))}</td><td>WB ID: ${esc(x.product_id||'—')}<br><span class="muted">${esc(x.product_name||'')}</span></td><td><b>${esc(x.author_name||'Аноним')}</b><br>${esc(x.text)}</td><td><span class="status-chip">${esc({pending:'На модерации',approved:'Подтверждён',rework:'На доработке',rejected:'Отклонён'}[x.moderation_status]||'Черновик')}</span><textarea data-question-draft="${esc(x.id)}">${esc(x.draft_text)}</textarea><div class="draft-actions"><button class="btn secondary" onclick="moderateDraft('${esc(x.id)}','approve')">Подтвердить</button><button class="btn secondary" onclick="moderateDraft('${esc(x.id)}','rework')">На доработку</button><button class="btn secondary" onclick="sendDraft('${esc(x.id)}',this)">Отправить</button></div></td></tr>`).join('')||'<tr><td colspan="4" class="muted">Вопросов по фильтрам нет</td></tr>'};p.querySelectorAll('[data-question-search],[data-question-status],[data-question-from],[data-question-to]').forEach(x=>x.onchange=loadQuestions);p.querySelector('[data-question-search]').oninput=loadQuestions;p.querySelector('[data-question-refresh]').onclick=loadQuestions;p.querySelector('[data-question-run]').onclick=async()=>{const r=await fetch('/api/auto-questions/run',{method:'POST'});toast(r.ok?'Черновики вопросов обновлены':'Включите автоответы на вопросы');if(r.ok)await loadQuestions()};const settings=await (await fetch('/api/settings/questions')).json();p.querySelector('[data-question-enabled]').checked=!!settings.enabled;p.querySelector('[data-question-keywords]').checked=!!settings.use_keywords;p.querySelector('[data-question-ai]').checked=!!settings.use_ai;p.querySelector('[data-question-moderation]').checked=!!settings.require_moderation;p.querySelector('[data-question-name]').checked=!!settings.address_by_name;p.querySelector('[data-question-signature]').value=settings.signature||'';p.querySelector('[data-question-empty]').value=settings.no_answer_action||'manual';p.querySelector('[data-question-save]').onclick=async()=>{const body={enabled:p.querySelector('[data-question-enabled]').checked,use_keywords:p.querySelector('[data-question-keywords]').checked,use_ai:p.querySelector('[data-question-ai]').checked,require_moderation:p.querySelector('[data-question-moderation]').checked,address_by_name:p.querySelector('[data-question-name]').checked,signature:p.querySelector('[data-question-signature]').value,no_answer_action:p.querySelector('[data-question-empty]').value};const r=await fetch('/api/settings/questions',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast(r.ok?'Настройки вопросов сохранены':'Не удалось сохранить настройки')};p.querySelector('[data-question-tpl-save]').onclick=async()=>{const body={name:p.querySelector('[data-question-tpl-name]').value.trim(),keywords:p.querySelector('[data-question-tpl-keywords]').value.split(',').map(x=>x.trim()).filter(Boolean),text:p.querySelector('[data-question-tpl-text]').value,signature:p.querySelector('[data-question-tpl-signature]').value,kind:'question',topic:'general',sentiment:'any',group:'questions',enabled:true};if(!body.name||body.text.length<2){toast('Заполните название и текст шаблона');return}const r=await fetch('/api/templates/custom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast(r.ok?'Шаблон вопроса добавлен':'Не удалось сохранить шаблон')};await loadQuestions()}
-const questionNav=[...document.querySelectorAll('.nav-group-title')].find(x=>x.textContent.includes('вопросами'));if(questionNav&&!document.querySelector('[data-nav="questions"]')){const link=document.createElement('a');link.href='#questionsPanel';link.className='nav-link sub';link.dataset.nav='questions';link.textContent='Все вопросы';link.onclick=()=>document.querySelector('#questionsPanel')?.scrollIntoView({behavior:'smooth'});questionNav.after(link)}
-const questionsLoad=load;load=async function(){await questionsLoad();await enhanceQuestionsPanel()};
-const simpleNavTargets={knowledge:'knowledgeHubPanel',recommendations:'recommendationsPanel',ai:'aiSettingsPanel'};Object.entries(simpleNavTargets).forEach(([nav,target])=>{const link=document.querySelector(`[data-nav="${nav}"]`);if(link)link.setAttribute('href','#'+target)});
-const adminStyle=document.createElement('style');adminStyle.textContent='.template-row{padding:14px 0;border-bottom:1px solid #eef0f5}.template-row label{display:grid;grid-template-columns:190px 1fr auto;gap:12px;align-items:center}.template-row textarea{min-width:0;min-height:72px}.knowledge-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:14px 0}.knowledge-grid label{font-size:13px;font-weight:700}.knowledge-grid textarea{display:block;min-width:0;margin-top:6px}.report select{display:block;width:100%;margin-top:10px;height:36px}.module-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:14px 0}.module-fields label{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:700}.module-fields input{padding:10px;border:1px solid #d8d4e3;border-radius:9px;font:inherit}@media(max-width:760px){.template-row label,.knowledge-grid,.module-fields{grid-template-columns:1fr}.template-row .btn{width:100%}}';document.head.appendChild(adminStyle);
-const layoutStyle=document.createElement('style');layoutStyle.textContent='.shell{max-width:none;padding:28px 38px 70px 315px}.sidebar{position:fixed;z-index:20;left:0;top:0;bottom:0;width:270px;padding:26px 18px 18px;background:#fff;border-right:1px solid #edf0f5;box-shadow:8px 0 28px #11182708;overflow:auto}.sidebar-brand{display:flex;align-items:center;gap:10px;padding:0 10px 27px}.sidebar-brand .logo{width:36px;height:36px;border-radius:11px}.sidebar-brand strong{display:block;letter-spacing:.04em;font-size:17px}.sidebar-brand span{display:block;color:#98a0ad;font-size:11px;margin-top:2px}.side-nav{display:flex;flex-direction:column;gap:3px}.nav-label{color:#a1a8b4;font-size:11px;font-weight:800;letter-spacing:.08em;margin:19px 10px 7px}.nav-link,.nav-group-title{display:flex;align-items:center;gap:10px;min-height:38px;padding:8px 11px;border-radius:9px;color:#4b5563;text-decoration:none;font-size:13px;font-weight:650}.nav-link:hover,.nav-link.active{background:#f0f1f5;color:#111827}.nav-link.active{box-shadow:inset 3px 0 #2563eb}.nav-link.sub{padding-left:34px;font-size:12px;font-weight:600}.nav-link em{font-style:normal;font-size:10px;margin-left:auto;padding:2px 5px;border-radius:5px;background:#f0f0f0;color:#8b93a1}.nav-plus{margin-left:auto;color:#9ca3af}.nav-group-title{justify-content:flex-start;color:#4b5563}.nav-group-title span:last-child{margin-left:auto;color:#9ca3af}.sidebar-footer{margin:24px 10px 0;padding-top:14px;border-top:1px solid #eef0f5;color:#a1a8b4;font-size:11px}.sidebar-footer span{float:right}.placeholder-panel{min-height:180px}.placeholder-panel h2{margin-bottom:8px}@media(max-width:900px){.shell{padding-left:92px}.sidebar{width:72px;padding:18px 9px}.sidebar-brand{padding:0 0 20px;justify-content:center}.sidebar-brand>div:last-child,.nav-link span,.nav-group-title span,.nav-label,.sidebar-footer{display:none}.nav-link,.nav-group-title{justify-content:center;padding:9px}.nav-link.sub{display:none}.nav-link em,.nav-plus{display:none}}';document.head.appendChild(layoutStyle);
-const topStyle=document.createElement('style');topStyle.textContent='.top .brand>.logo{display:none}.top{padding-top:8px}';document.head.appendChild(topStyle);
-function setupNavigation(){const main=document.querySelector('main.shell');if(!main)return;const missing={products:['Товары','Здесь будет каталог товаров, характеристики и привязка WB ID.'],cabinets:['Кабинеты маркетплейсов','Управление кабинетами и токенами будет доступно здесь.'],analytics:['Аналитика','Сводка по обращениям, публикациям, ошибкам и FBS.'],chats:['Управление чатами','Раздел для рабочих диалогов с покупателями.'],messengers:['Агенты в мессенджерах','Подключение уведомлений и агентов мессенджеров.'],profile:['Личный кабинет','Профиль пользователя и права доступа.'],finances:['Финансы','Финансовая сводка и расходы по кабинетам.']};Object.entries(missing).forEach(([id,[title,text]])=>{if(!document.getElementById(id)){const s=document.createElement('section');s.id=id;s.className='panel placeholder-panel';s.innerHTML=`<h2>${title}</h2><p class="muted">${text}</p><span class="status-chip">Раздел готовится</span>`;main.append(s)}});document.querySelectorAll('[data-nav]').forEach(link=>{link.onclick=e=>{const target=document.getElementById(link.getAttribute('href').slice(1));if(!target){e.preventDefault();toast('Раздел появится в следующем обновлении');return}document.querySelectorAll('[data-nav]').forEach(x=>x.classList.remove('active'));link.classList.add('active');setTimeout(()=>target.scrollIntoView({behavior:'smooth',block:'start'}),0)}})}setupNavigation();
-function bindPanelIds(){document.querySelectorAll('.panel h2').forEach(h=>{const t=h.textContent.toLowerCase(),p=h.closest('.panel');if(!p.id&&t.includes('входящие'))p.id='inbox-panel';if(!p.id&&t.includes('отчёт'))p.id='fbs-panel';if(!p.id&&t.includes('очередь жалоб'))p.id='complaints-panel';if(!p.id&&t.includes('журнал действий'))p.id='audit-panel'});setupNavigation()}bindPanelIds();
-const workflowLabels={new:'Новое',draft:'Черновик',ready:'Готово к отправке',sending:'Отправляется',error:'Нужна проверка',published:'Опубликовано'};let workflowPage=0;const workflowSize=20;
-function workflowFilters(){const p=new URLSearchParams();const type=document.querySelector('#typeFilter')?.value,rating=document.querySelector('#ratingFilter')?.value,order=document.querySelector('#orderFilter')?.value,product=document.querySelector('#productFilter')?.value.trim(),search=document.querySelector('#dashboardSearch')?.value.trim(),status=document.querySelector('#statusFilter')?.value,topic=document.querySelector('#topicFilter')?.value,sentiment=document.querySelector('#sentimentFilter')?.value,dateFrom=document.querySelector('#dateFromFilter')?.value,dateTo=document.querySelector('#dateToFilter')?.value,sort=document.querySelector('#sortFilter')?.value;if(type)p.set('item_type',type);if(rating)p.set('rating',rating);if(order)p.set('order_status',order);if(product)p.set('product_id',product);if(search)p.set('search',search);if(status)p.set('status',status);if(topic)p.set('topic',topic);if(sentiment)p.set('sentiment',sentiment);if(dateFrom)p.set('date_from',dateFrom);if(dateTo)p.set('date_to',dateTo);if(sort)p.set('sort',sort);p.set('limit',workflowSize);p.set('offset',workflowPage*workflowSize);return p}
-function workflowDate(value){const d=new Date(value);return Number.isNaN(d.valueOf())?'':d.toLocaleString('ru-RU',{dateStyle:'short',timeStyle:'short'})}
-function statusLabel(value){return workflowLabels[value]||value}
-async function checkDraft(id,field){const r=await fetch('/api/replies/check/'+encodeURIComponent(id),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:field.value})}),d=await r.json();if(d.ok)toast('Проверка пройдена: ответ можно отправлять');else toast('Проверьте: '+d.warnings.join('; '))}
-async function regenerateDraft(id){const button=document.querySelector(`button[data-regenerate="${CSS.escape(id)}"]`);if(button){button.disabled=true;button.textContent='Обновление…'}try{const r=await fetch('/api/replies/drafts/'+encodeURIComponent(id)+'/regenerate',{method:'POST'});const data=await r.json().catch(()=>({}));if(!r.ok){toast(data.detail||'Не удалось перегенерировать ответ');return}toast('Черновик обновлён по шаблону');await load()}catch(e){toast('Не удалось обновить черновик')}finally{if(button){button.disabled=false;button.textContent='Обновить'}}}
-function renderWorkflowRows(items){const body=document.querySelector('#inbox');if(!body)return;const labels={positive:'Позитив',negative:'Негатив',neutral:'Нейтральный'};body.innerHTML=items.length?items.map(x=>`<tr><td><input class="row-select" type="checkbox" value="${esc(x.id)}" onchange="updateSelectedCount()"></td><td><small class="badge">${x.item_type==='review'?'Отзыв':'Вопрос'}</small><br><span class="muted">${esc(workflowDate(x.created_at))}</span></td><td>${esc(x.text)||'<span class="muted">Без текста</span>'}<br><span class="muted">WB ID: ${esc(x.product_id||'—')}</span><div class="tag-row">${(x.topics||[]).map(t=>`<span class="review-tag topic-${esc(t)}">${esc({quality:'Качество',size:'Размер',delivery:'Доставка',packaging:'Упаковка',material:'Материал',color:'Цвет',price:'Цена',texture:'Текстура',general:'Общее'}[t]||t)}</span>`).join('')}</div></td><td><b>${x.rating??'—'} ${x.rating?'★':''}</b><br><span class="sentiment ${esc(x.sentiment||'neutral')}">${labels[x.sentiment]||'Нейтральный'}</span><br>${x.item_type==='review'?`<small class="purchase ${esc(x.order_status)}">${esc(orderLabels[x.order_status]||orderLabels.notSpecified)}</small>`:'<span class="muted">Не применимо</span>'}</td><td><div class="moderation-line"><span class="status-chip ${x.published?'sent':''}">${esc(statusLabel(x.status))}</span><span class="moderation-status">${esc({pending:'На модерации',approved:'Подтверждён',rejected:'Отклонён',rework:'На доработке'}[x.moderation_status]||'На модерации')}</span></div><textarea data-draft="${esc(x.id)}" data-original="${esc(x.draft_text)}" ${x.published||x.status==='sending'?'disabled':''}>${esc(x.draft_text)}</textarea><div class="draft-actions">${x.published?'':`<button class="btn secondary" onclick="saveDraft('${esc(x.id)}',this.closest('td').querySelector('textarea'),this)">Сохранить</button><button class="btn secondary" onclick="checkDraft('${esc(x.id)}',this.closest('td').querySelector('textarea'))">Проверить</button><button class="btn secondary" onclick="moderateDraft('${esc(x.id)}','approve')">Подтвердить</button><button class="btn secondary" onclick="moderateDraft('${esc(x.id)}','rework')">На доработку</button><button class="btn secondary" data-regenerate="${esc(x.id)}" onclick="regenerateDraft('${esc(x.id)}')">Обновить</button>`}</div></td><td>${x.published?'<span class="muted">Ответ опубликован</span>':`<button class="btn secondary" onclick="sendDraft('${esc(x.id)}',this)">Отправить</button>`}</td></tr>`).join(''):'<tr><td colspan="6" class="muted">По текущим фильтрам ничего не найдено.</td></tr>';const pager=document.querySelector('#workflowPager')||document.createElement('div');pager.id='workflowPager';pager.className='toolbar';pager.innerHTML=`<button class="btn secondary" ${workflowPage===0?'disabled':''} onclick="workflowPage--;load()">← Предыдущие</button><span class="dashboard-extra">Страница ${workflowPage+1} · показано ${items.length}</span><button class="btn secondary" ${items.length<workflowSize?'disabled':''} onclick="workflowPage++;load()">Следующие →</button>`;if(!pager.parentElement)body.closest('.table-wrap').after(pager)}
-function selectedRows(){return [...document.querySelectorAll('.row-select:checked')].map(x=>x.value)}function updateSelectedCount(){const values=selectedRows();const node=document.querySelector('[data-selected-count]');if(node)node.textContent='Выбрано: '+values.length}function selectAllRows(checked){document.querySelectorAll('.row-select').forEach(x=>x.checked=checked);updateSelectedCount()}function toggleGroupBar(){const bar=document.querySelector('#groupBar');bar.hidden=!bar.hidden}async function groupAction(action){const item_ids=selectedRows();if(!item_ids.length){toast('Выберите хотя бы один отзыв');return}const r=await fetch('/api/replies/group-action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_ids,action})}),d=await r.json();toast(r.ok?'Групповое действие выполнено':'Не удалось выполнить действие');if(r.ok)await load()}async function moderateDraft(id,action){const r=await fetch('/api/replies/drafts/'+encodeURIComponent(id)+'/moderate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});toast(r.ok?(action==='approve'?'Ответ подтверждён':'Ответ отправлен на доработку'):'Не удалось изменить модерацию');if(r.ok)await load()}
-async function renderWorkflow(){try{const r=await fetch('/api/inbox/overview?'+workflowFilters());if(!r.ok)return;const items=await r.json();renderWorkflowRows(items);const count=document.querySelector('#inboxCount');if(count)count.textContent=`Показано ${items.length} · страница ${workflowPage+1}`;updateDashboardCounters()}catch(e){toast('Не удалось загрузить рабочую очередь')}}
-const workflowLoad=load;load=async function(){await workflowLoad();await renderWorkflow()};
-const workflowStatus=document.querySelector('#statusFilter');if(workflowStatus)workflowStatus.innerHTML='<option value="">Все статусы</option><option value="new">Новые</option><option value="draft">Черновики</option><option value="ready">Готовы к отправке</option><option value="error">Нужна проверка</option><option value="published">Отправленные</option>';
-setInterval(updateSyncStatus,30000);load();
-</script><script>
-(()=>{const ready=()=>{const root=document.querySelector('#chats');if(!root||root.dataset.chatReady)return;root.dataset.chatReady='1';root.className='panel chats-workspace';root.innerHTML='<div class="chat-layout"><section><div class="chat-head"><div><h2>Чаты с покупателями</h2><p class="muted">Единая история сообщений из подключённых маркетплейсов.</p></div><button class="btn secondary" data-chat-refresh>Обновить</button></div><div class="toolbar"><input data-chat-search placeholder="Поиск по товару или истории переписки"><select data-chat-market><option value="">Все площадки</option><option value="wildberries">Wildberries</option><option value="ozon">Ozon</option><option value="yandex">Яндекс Маркет</option></select><select data-chat-status><option value="">Все статусы</option><option value="waiting">Ждут ответа</option><option value="answered">Отвеченные</option><option value="closed">Закрытые</option></select></div><div data-chat-list>Загрузка…</div></section><section data-chat-thread class="chat-thread"><div class="empty-state">Выберите диалог слева</div></section></div><hr><h3>Настройки чатов</h3><div class="settings-checks"><label><input type="checkbox" data-chat-setting="auto_generate"> Генерировать ответы</label><label><input type="checkbox" data-chat-setting="auto_send"> Отправлять автоматически</label><label><input type="checkbox" data-chat-setting="manager_redirect"> Перенаправлять менеджеру</label><label><input type="checkbox" data-chat-setting="off_hours_enabled"> Ответ в нерабочие часы</label></div><div class="settings-grid"><input data-chat-setting="manager_contact" placeholder="Контакт менеджера"><textarea data-chat-setting="off_hours_template" placeholder="Шаблон для нерабочих часов"></textarea></div><button class="btn" data-chat-save>Сохранить настройки</button><h3>Шаблоны рассылок</h3><div class="settings-grid"><textarea data-broadcast="new_order" placeholder="Шаблон нового заказа"></textarea><textarea data-broadcast="delivery" placeholder="Шаблон уведомления по доставке"></textarea></div><button class="btn secondary" data-broadcast-save>Сохранить шаблоны</button>';const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const load=async()=>{const q=new URLSearchParams(),s=root.querySelector('[data-chat-search]').value.trim(),m=root.querySelector('[data-chat-market]').value,st=root.querySelector('[data-chat-status]').value;if(s)q.set('search',s);if(m)q.set('marketplace',m);if(st)q.set('status',st);const r=await fetch('/api/chats?'+q),items=r.ok?await r.json():[];root.querySelector('[data-chat-list]').innerHTML=items.map(x=>{const last=(x.messages||[]).slice(-1)[0]||{};return '<button class="chat-card" data-chat-id="'+esc(x.id)+'"><b>'+esc(x.product_name||'Диалог')+'</b><small>'+esc(x.marketplace||'')+' · '+esc(x.product_id||'')+'</small><p>'+esc(last.text||'Нет сообщений')+'</p></button>'}).join('')||'<p class="muted">Чаты не найдены. Подключите адаптер маркетплейса или выполните импорт.</p>';root.querySelectorAll('[data-chat-id]').forEach(b=>b.onclick=async()=>{const c=await (await fetch('/api/chats/'+encodeURIComponent(b.dataset.chatId))).json();root.querySelector('[data-chat-thread]').innerHTML='<h3>'+esc(c.product_name||'Чат')+'</h3><div class="messages">'+(c.messages||[]).map(x=>'<div class="message '+(x.sender==='seller'?'seller':'buyer')+'"><b>'+esc(x.sender==='seller'?'Магазин':'Покупатель')+'</b><p>'+esc(x.text)+'</p></div>').join('')+'</div><textarea data-chat-text placeholder="Введите сообщение…"></textarea><button class="btn" data-chat-send>Отправить</button>';root.querySelector('[data-chat-send]').onclick=async()=>{const text=root.querySelector('[data-chat-text]').value;if(!text.trim())return;const z=await fetch('/api/chats/'+encodeURIComponent(c.id)+'/reply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});toast(z.ok?'Сообщение сохранено':'Ошибка сохранения');if(z.ok){await b.click();await load()}}})};root.querySelectorAll('[data-chat-search],[data-chat-market],[data-chat-status]').forEach(x=>x.oninput=load);root.querySelector('[data-chat-refresh]').onclick=load;const ms=async(name)=>{const r=await fetch('/api/settings/modules/'+name);return (await r.json()).values||{}};const save=async(name,v)=>{await fetch('/api/settings/modules/'+name,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({values:v})});toast('Настройки сохранены')};ms('chats').then(v=>root.querySelectorAll('[data-chat-setting]').forEach(x=>x.type==='checkbox'?x.checked=!!v[x.dataset.chatSetting]:x.value=v[x.dataset.chatSetting]||''));ms('broadcasts').then(v=>root.querySelectorAll('[data-broadcast]').forEach(x=>x.value=v[x.dataset.broadcast]||''));root.querySelector('[data-chat-save]').onclick=()=>{const v={};root.querySelectorAll('[data-chat-setting]').forEach(x=>v[x.dataset.chatSetting]=x.type==='checkbox'?x.checked:x.value);return save('chats',v)};root.querySelector('[data-broadcast-save]').onclick=()=>{const v={};root.querySelectorAll('[data-broadcast]').forEach(x=>v[x.dataset.broadcast]=x.value);return save('broadcasts',v)};load()};document.readyState==='loading'?document.addEventListener('DOMContentLoaded',ready):ready()})();
-</script><script>(()=>{const clean=()=>{document.querySelectorAll('#inbox tr').forEach(row=>{const saves=[...row.querySelectorAll('button')].filter(x=>x.textContent.trim()==='Сохранить');saves.slice(1).forEach(x=>x.closest('.draft-actions')?.remove());row.querySelectorAll('.draft-actions').forEach(x=>{x.style.display='flex';x.style.flexWrap='wrap';x.style.gap='6px';x.style.alignItems='center'})})};new MutationObserver(clean).observe(document.querySelector('#inbox')||document.body,{childList:true,subtree:true});clean()})();</script></body></html>"""
+def dashboard() -> HTMLResponse:
+    return HTMLResponse(DASHBOARD_FILE.read_text(encoding="utf-8"))
 
 
-for _page in ("products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances"):
+for _page in DASHBOARD_PAGES:
     app.add_api_route(f"/{_page}", dashboard, methods=["GET"], response_class=HTMLResponse, include_in_schema=False)
 
 
@@ -683,9 +566,265 @@ def health() -> dict[str, object]:
     return {"status": "ok", "environment": settings.environment, "dry_run": settings.dry_run, "manual_send_enabled": manual_send_enabled}
 
 
+def _tax_project():
+    try:
+        return finance_project()
+    except HTTPException:
+        return None
+
+
+def _cabinet_public(cabinet, cabinets=None, project=...) -> dict[str, object]:
+    cabinets = cabinets if cabinets is not None else configured_cabinets()
+    project = _tax_project() if project is ... else project
+    same = sum(1 for c in cabinets if c.marketplace == cabinet.marketplace)
+    opiu = tax_module.opiu_rate(project, cabinet, same)
+    data = cabinet.public()
+    data.update({"tax_effective": cabinet.tax_percent if cabinet.tax_percent is not None else opiu["rate"],
+                 "tax_opiu_rate": opiu["rate"], "tax_opiu_account": opiu["account"], "tax_opiu_found": project is not None})
+    return data
+
+
+def _apply_tax(cabinet, cabinets) -> None:
+    """Перенести ставку кабинета в конфиг ОПиУ (если кабинет там есть)."""
+    if cabinet.tax_percent is None:
+        return
+    try:
+        same = sum(1 for c in cabinets if c.marketplace == cabinet.marketplace)
+        account = tax_module.write_opiu_rate(_tax_project(), cabinet, same, cabinet.tax_percent)
+        if account is not None:
+            draft_store.audit("cabinet_tax_applied", cabinet.id, f"opiu={account};rate={cabinet.tax_percent}")
+    except OSError as exc:
+        draft_store.audit("cabinet_tax_error", cabinet.id, str(exc)[:300])
+
+
 @app.get("/api/cabinets")
 def list_cabinets() -> list[dict[str, object]]:
-    return [{"id": cabinet.id, "name": cabinet.name, "token_configured": bool(cabinet.token)} for cabinet in load_cabinets(settings.cabinets_json)]
+    cabinets, project = configured_cabinets(), _tax_project()
+    return [_cabinet_public(cabinet, cabinets, project) for cabinet in cabinets]
+
+
+def _new_cabinet_id(marketplace: str, existing: set[str]) -> str:
+    import secrets as _secrets
+    prefix = {"wildberries": "wb", "ozon": "ozon", "yandex": "ym"}.get(marketplace, "mp")
+    while True:
+        candidate = f"{prefix}-{_secrets.token_hex(3)}"
+        if candidate not in existing:
+            return candidate
+
+
+@app.post("/api/cabinets")
+def create_cabinet(payload: CabinetCreate) -> dict[str, object]:
+    cabinets = configured_cabinets()
+    ids = {cabinet.id for cabinet in cabinets}
+    cabinet_id = payload.id or _new_cabinet_id(payload.marketplace, ids)
+    if cabinet_id in ids:
+        raise HTTPException(409, "Кабинет с таким ID уже существует")
+    if payload.marketplace == "wildberries" and not payload.token.strip():
+        raise HTTPException(400, "Вставьте API-токен кабинета Wildberries")
+    cabinet = Cabinet(id=cabinet_id, name=payload.name.strip(), token=payload.token.strip(), marketplace=payload.marketplace,
+                      legal_name=payload.legal_name.strip(), client_id=payload.client_id.strip(),
+                      chats=False, tax_percent=payload.tax_percent, enabled=payload.enabled, country=payload.country,
+                      ads_token=payload.ads_token.strip())
+    cabinets.append(cabinet)
+    save_configured_cabinets(cabinets)
+    draft_store.audit("cabinet_created", cabinet_id, f"name={cabinet.name};marketplace={cabinet.marketplace};tax={cabinet.tax_percent}")
+    _apply_tax(cabinet, cabinets)
+    return _cabinet_public(cabinet, cabinets)
+
+
+def _find_cabinet(cabinet_id: str):
+    cabinets = configured_cabinets()
+    current = next((cabinet for cabinet in cabinets if cabinet.id == cabinet_id), None)
+    if current is None:
+        raise HTTPException(404, "Кабинет не найден")
+    return cabinets, current
+
+
+@app.put("/api/cabinets/{cabinet_id}")
+def update_cabinet(cabinet_id: str, payload: CabinetCreate) -> dict[str, object]:
+    if payload.id and payload.id != cabinet_id:
+        raise HTTPException(400, "ID кабинета в адресе и теле запроса должны совпадать")
+    cabinets, current = _find_cabinet(cabinet_id)
+    updated = current.with_changes(name=payload.name.strip(), token=payload.token.strip() or current.token,
+                                   legal_name=payload.legal_name.strip() if payload.legal_name or "legal_name" in payload.model_fields_set else current.legal_name,
+                                   client_id=payload.client_id.strip() or current.client_id,
+                                   tax_percent=payload.tax_percent if "tax_percent" in payload.model_fields_set else current.tax_percent,
+                                   enabled=payload.enabled if "enabled" in payload.model_fields_set else current.enabled,
+                                   country=payload.country if "country" in payload.model_fields_set else current.country,
+                                   ads_token=payload.ads_token.strip() or current.ads_token)
+    cabinets[cabinets.index(current)] = updated
+    save_configured_cabinets(cabinets)
+    draft_store.audit("cabinet_updated", cabinet_id, f"name={updated.name};token_changed={bool(payload.token.strip())};"
+                      f"ads_token_changed={bool(payload.ads_token.strip())};enabled={int(updated.enabled)};country={updated.country};tax={updated.tax_percent}")
+    if updated.tax_percent is not None and updated.tax_percent != current.tax_percent:
+        _apply_tax(updated, cabinets)
+    elif updated.tax_percent is None and current.tax_percent is not None:
+        try:      # ставку очистили — в ОПиУ снова общая ставка файла
+            tax_module.write_opiu_rate(_tax_project(), updated, sum(1 for c in cabinets if c.marketplace == updated.marketplace), None)
+        except OSError:
+            pass
+    return _cabinet_public(updated, cabinets)
+
+
+@app.patch("/api/cabinets/{cabinet_id}/channels")
+def update_cabinet_channels(cabinet_id: str, value: dict) -> dict[str, object]:
+    cabinets, current = _find_cabinet(cabinet_id)
+    changes = {k: bool(value[k]) for k in ("reviews", "questions", "chats") if k in value}
+    if not changes:
+        raise HTTPException(400, "Укажите reviews, questions или chats")
+    updated = current.with_changes(**changes)
+    cabinets[cabinets.index(current)] = updated
+    save_configured_cabinets(cabinets)
+    draft_store.audit("cabinet_channels_updated", cabinet_id, ";".join(f"{k}={int(v)}" for k, v in changes.items()))
+    return _cabinet_public(updated, cabinets)
+
+
+@app.delete("/api/cabinets/{cabinet_id}")
+def delete_cabinet(cabinet_id: str) -> dict[str, object]:
+    cabinets, current = _find_cabinet(cabinet_id)
+    cabinets.remove(current)
+    save_configured_cabinets(cabinets)
+    draft_store.audit("cabinet_deleted", cabinet_id, f"name={current.name}")
+    return {"deleted": cabinet_id}
+
+
+# ---------------------------------------------------------------- учётная запись и команда
+def owner_label() -> str:
+    return draft_store.get_setting("owner_email", "") or draft_store.get_setting("owner_name", "") or "Владелец"
+
+
+@app.get("/api/account")
+def get_account(request: Request) -> dict[str, object]:
+    member = getattr(request.state, "member", None)
+    if member:
+        return {"role": "member", "name": member["name"], "email": member["email"]}
+    return {"role": "owner", "name": draft_store.get_setting("owner_name", ""), "email": draft_store.get_setting("owner_email", "")}
+
+
+@app.put("/api/account")
+def update_account(value: dict) -> dict[str, object]:
+    name = " ".join(str(value.get("name") or "").split())[:80]
+    email = str(value.get("email") or "").strip()[:120]
+    if email and "@" not in email:
+        raise HTTPException(400, "Проверьте email")
+    draft_store.set_setting("owner_name", name)
+    draft_store.set_setting("owner_email", email)
+    draft_store.audit("account_updated")
+    return {"role": "owner", "name": name, "email": email}
+
+
+def team_network(request: Request) -> dict[str, object]:
+    ip = lan_ip()
+    port = request.url.port or 8000
+    reachable = ip != "127.0.0.1" and port_open(ip, port)
+    return {"lan_ip": ip, "port": port, "reachable": reachable, "base_url": f"http://{ip}:{port}"}
+
+
+@app.get("/api/team/me")
+def team_me(request: Request) -> dict[str, object]:
+    member = getattr(request.state, "member", None)
+    return {"role": "member", "member": member} if member else {"role": "owner", "name": owner_label()}
+
+
+@app.get("/api/team")
+def team_overview(request: Request) -> dict[str, object]:
+    return {"invites": team.invites(), "members": team.members(), "network": team_network(request)}
+
+
+@app.post("/api/team/invites")
+def team_create_invite(request: Request, value: dict | None = None) -> dict[str, object]:
+    invite = team.create_invite(owner_label(), int((value or {}).get("days") or 7))
+    network = team_network(request)
+    draft_store.audit("team_invite_created", details=f"expires={invite['expires_at'][:10]}")
+    return {**invite, "link": f"{network['base_url']}/join?code={invite['code']}", "network": network}
+
+
+@app.delete("/api/team/invites/{code}")
+def team_delete_invite(code: str) -> dict[str, object]:
+    if not team.delete_invite(code):
+        raise HTTPException(404, "Приглашение не найдено")
+    draft_store.audit("team_invite_deleted")
+    return {"deleted": code}
+
+
+@app.put("/api/team/members/{member_id}")
+def team_update_member(member_id: int, value: dict) -> dict[str, object]:
+    try:
+        member = team.set_active(member_id, bool(value.get("active")))
+    except KeyError:
+        raise HTTPException(404, "Сотрудник не найден")
+    draft_store.audit("team_member_" + ("enabled" if member["active"] else "disabled"), details=member["name"])
+    return member
+
+
+@app.delete("/api/team/members/{member_id}")
+def team_delete_member(member_id: int) -> dict[str, object]:
+    member = team.member(member_id)
+    if not member or not team.delete_member(member_id):
+        raise HTTPException(404, "Сотрудник не найден")
+    draft_store.audit("team_member_deleted", details=member["name"])
+    return {"deleted": member_id}
+
+
+@app.post("/api/team/join")
+def team_join(value: dict) -> JSONResponse:
+    try:
+        member, token = team.join(value.get("code"), value.get("name"), value.get("email", ""))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("team_member_joined", details=member["name"])
+    response = JSONResponse({"member": member})
+    response.set_cookie(TEAM_COOKIE, token, max_age=COOKIE_DAYS * 86400, httponly=True, samesite="lax")
+    return response
+
+
+@app.post("/api/team/logout")
+def team_logout() -> JSONResponse:
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(TEAM_COOKIE)
+    return response
+
+
+@app.get("/join", response_class=HTMLResponse)
+def join_page(code: str = "") -> HTMLResponse:
+    return HTMLResponse((STATIC_DIR / "join.html").read_text(encoding="utf-8").replace("{{code}}", re.sub(r"[^0-9a-fA-F-]", "", code)[:36]))
+
+
+# ---------------------------------------------------------------- уведомления
+@app.get("/api/notifications")
+def get_notifications() -> dict[str, object]:
+    return {**notifier.public(), "cabinet_list": [{"id": c.id, "name": c.name, "marketplace": c.marketplace} for c in configured_cabinets()]}
+
+
+@app.put("/api/notifications")
+def update_notifications(value: dict) -> dict[str, object]:
+    try:
+        saved = notifier.save(value)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("notifications_updated")
+    return {**saved, "cabinet_list": [{"id": c.id, "name": c.name, "marketplace": c.marketplace} for c in configured_cabinets()]}
+
+
+@app.post("/api/notifications/test")
+async def test_notifications(value: dict) -> dict[str, object]:
+    channel = value.get("channel")
+    if channel not in ("telegram", "email"):
+        raise HTTPException(400, "channel: telegram или email")
+    try:
+        return await notifier.test(channel)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/notifications/telegram/chat")
+async def detect_telegram_chat(value: dict | None = None) -> dict[str, object]:
+    try:
+        return await notifier.detect_chat((value or {}).get("bot_token"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(502, f"Telegram недоступен: {type(exc).__name__}")
 
 
 @app.post("/api/sync/{cabinet_id}")
@@ -694,7 +833,7 @@ async def sync_cabinet(cabinet_id: str) -> dict[str, object]:
         return await perform_sync(cabinet_id)
     except WBApiError as exc:
         draft_store.set_setting("sync_last_error", str(exc)[:500])
-        status = 404 if "не найден" in str(exc) else 502
+        status = 404 if "не найден" in str(exc) else 400 if ("не поддерживается" in str(exc) or "выключены" in str(exc)) else 502
         raise HTTPException(status_code=status, detail=str(exc)) from exc
 
 
@@ -703,14 +842,14 @@ async def import_reviews(request: Request) -> dict[str, object]:
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(400, "Ожидается JSON-объект настроек импорта")
-    cabinet_ids = payload.get("cabinet_ids") or [cabinet.id for cabinet in load_cabinets(settings.cabinets_json)]
+    cabinet_ids = payload.get("cabinet_ids") or [cabinet.id for cabinet in configured_cabinets() if cabinet.enabled]
     date_from = payload.get("date_from")
     date_to = payload.get("date_to")
     with_markup = bool(payload.get("with_markup", True))
     imported = 0
     results = []
     for cabinet_id in cabinet_ids:
-        cabinets = {cabinet.id: cabinet for cabinet in load_cabinets(settings.cabinets_json)}
+        cabinets = {cabinet.id: cabinet for cabinet in configured_cabinets()}
         cabinet = cabinets.get(str(cabinet_id))
         if cabinet is None:
             results.append({"cabinet_id": cabinet_id, "status": "error", "reason": "Кабинет не найден"})
@@ -838,6 +977,72 @@ def complaint_details(item_id: str) -> ComplaintDetails:
         raise HTTPException(status_code=404, detail="Карточка жалобы не найдена")
     return complaint_service.details(case, draft_store.get_inbox(item_id), draft_store.get(item_id))
 
+COMPLAINT_GROUPS = {"ready": ("ready_manual",), "not_eligible": ("not_eligible",), "submitted": ("submitted_manual", "submitted_browser"), "dismissed": ("dismissed",)}
+
+
+def reevaluate_complaints() -> int:
+    """Проверить основания для жалоб по всем отзывам 1–2★ (поданные, скрытые и открытые вручную не трогаем)."""
+    existing = {c.item_id: c for c in draft_store.list_complaints()}
+    changed = 0
+    with draft_store._connect() as connection:
+        ids = [r[0] for r in connection.execute("SELECT id FROM inbox_items WHERE item_type='review' AND rating IN (1,2)")]
+    for item_id in ids:
+        item = draft_store.get_inbox(item_id)
+        if item is None:
+            continue
+        current = existing.get(item.id)
+        if current and current.status != ComplaintStatus.NOT_ELIGIBLE:
+            continue
+        case = complaint_service.evaluate(item)
+        if case and (current is None or current.reason_code != case.reason_code or current.status != case.status):
+            draft_store.save_complaint(case)
+            changed += 1
+    return changed
+
+
+def complaint_reasons() -> list[str]:
+    try:
+        reasons = json.loads(draft_store.get_setting("wb_complaint_reasons", "[]") or "[]")
+    except ValueError:
+        reasons = []
+    return reasons or ["Другое"]
+
+
+@app.get("/api/complaints-queue")
+def complaints_queue(group: str = "ready", search: str = "", refresh: bool = False) -> dict[str, object]:
+    if refresh:
+        reevaluate_complaints()
+    cases = draft_store.list_complaints()
+    counts = {g: sum(1 for c in cases if c.status.value in statuses) for g, statuses in COMPLAINT_GROUPS.items()}
+    wanted = COMPLAINT_GROUPS.get(group)
+    names = analytics.product_names()
+    cabinets = _cabinet_names()
+    term = search.strip().lower()
+    items = []
+    for case in cases:
+        if wanted and case.status.value not in wanted:
+            continue
+        item = draft_store.get_inbox(case.item_id)
+        details = complaint_service.details(case, item, draft_store.get(case.item_id))
+        row = {**details.model_dump(mode="json"),
+               "created": item.created_at.isoformat() if item else None,
+               "author_name": item.author_name if item else "", "product_name": (item.product_name if item else "") or names.get(details.product_id, ""),
+               "cabinet_name": cabinets.get(case.cabinet_id, case.cabinet_id), "marketplace": item.marketplace if item else "wildberries",
+               "delivery": draft_store.get_setting("complaint_delivery:" + case.item_id, "")}
+        if term and term not in " ".join(str(row.get(k) or "") for k in ("review_text", "product_name", "author_name", "product_id", "item_id")).lower():
+            continue
+        items.append(row)
+    items.sort(key=lambda r: r.get("created") or "", reverse=True)
+    return {"items": items, "counts": counts, "reasons": complaint_reasons(), "browser": complaint_browser.snapshot()}
+
+
+@app.post("/api/complaints-reevaluate")
+def complaints_reevaluate() -> dict[str, object]:
+    changed = reevaluate_complaints()
+    draft_store.audit("complaints_reevaluated", details=f"changed={changed}")
+    return {"changed": changed}
+
+
 @app.get("/api/complaint-browser/status")
 def complaint_browser_status() -> dict:
     return complaint_browser.snapshot()
@@ -894,8 +1099,8 @@ def list_inbox(item_type: str | None = Query(default=None, pattern="^(review|que
 
 
 @app.get("/api/inbox/overview")
-def inbox_overview(item_type: str | None = Query(default=None, pattern="^(review|question)$"), rating: int | None = Query(default=None, ge=1, le=5), product_id: int | None = Query(default=None), order_status: OrderStatus | None = Query(default=None), search: str | None = Query(default=None, max_length=100), status: str | None = Query(default=None, pattern="^(new|draft|ready|sending|error|published)$"), topic: str | None = Query(default=None, max_length=40), sentiment: str | None = Query(default=None, pattern="^(positive|negative|neutral)$"), date_from: str | None = Query(default=None, max_length=10), date_to: str | None = Query(default=None, max_length=10), sort: str = Query(default="desc", pattern="^(asc|desc)$"), limit: int = Query(default=25, ge=1, le=100), offset: int = Query(default=0, ge=0)) -> list[dict[str, object]]:
-    return draft_store.list_inbox_overview(item_type=item_type, rating=rating, product_id=product_id, order_status=order_status, search=search, status=status, topic=topic, sentiment=sentiment, date_from=date_from, date_to=date_to, sort=sort, limit=limit, offset=offset)
+def inbox_overview(item_type: str | None = Query(default=None, pattern="^(review|question)$"), rating: int | None = Query(default=None, ge=1, le=5), product_id: int | None = Query(default=None), cabinet_id: str | None = Query(default=None, max_length=64), order_status: OrderStatus | None = Query(default=None), search: str | None = Query(default=None, max_length=100), status: str | None = Query(default=None, pattern="^(new|draft|ready|sending|error|published)$"), topic: str | None = Query(default=None, max_length=40), sentiment: str | None = Query(default=None, pattern="^(positive|negative|neutral)$"), date_from: str | None = Query(default=None, max_length=10), date_to: str | None = Query(default=None, max_length=10), sort: str = Query(default="desc", pattern="^(asc|desc)$"), limit: int = Query(default=25, ge=1, le=100), offset: int = Query(default=0, ge=0)) -> list[dict[str, object]]:
+    return draft_store.list_inbox_overview(item_type=item_type, rating=rating, product_id=product_id, cabinet_id=cabinet_id, order_status=order_status, search=search, status=status, topic=topic, sentiment=sentiment, date_from=date_from, date_to=date_to, sort=sort, limit=limit, offset=offset)
 
 
 @app.post("/api/replies/draft", response_model=ReplyDraft)
@@ -1023,8 +1228,8 @@ def preview_review_batch(request: BulkPreviewRequest) -> dict:
 
 
 @app.post("/api/replies/bulk/{token}/send")
-async def send_review_batch(token: str) -> dict:
-    return bulk_sender.start(token)
+async def send_review_batch(token: str, request: BulkSendRequest | None = None) -> dict:
+    return bulk_sender.start(token, request.texts if request else None)
 
 
 @app.get("/api/replies/bulk/{token}")
@@ -1216,6 +1421,212 @@ def review_analytics() -> dict[str, object]:
     return {"total": len(rows), "topics": topics, "topic_labels": {key: topic_label(key) for key in topics}, "sentiments": sentiments, "ratings": ratings}
 
 
+def _analytics_period(date_from: str | None, date_to: str | None, default_days: int = 30) -> tuple:
+    from datetime import date as _date, timedelta as _td
+    try:
+        end = _date.fromisoformat(date_to) if date_to else _date.today()
+        start = _date.fromisoformat(date_from) if date_from else end - _td(days=default_days - 1)
+    except ValueError:
+        raise HTTPException(400, "Даты в формате ГГГГ-ММ-ДД")
+    if start > end:
+        raise HTTPException(400, "Дата «с» позже даты «по»")
+    if (end - start).days > 1100:
+        raise HTTPException(400, "Период не больше трёх лет")
+    return start, end
+
+
+def _analytics_kind(kind: str) -> str:
+    if kind not in ("review", "question", "chat"):
+        raise HTTPException(400, "kind: review, question или chat")
+    return kind
+
+
+def _grain(grain: str) -> str:
+    return grain if grain in ("day", "week", "month") else "day"
+
+
+def _table_download(tables: dict, fmt: str, name: str) -> Response:
+    if fmt == "xlsx":
+        try:
+            content = analytics_module.to_xlsx(tables)
+        except ImportError:
+            raise HTTPException(500, "Для Excel нужен пакет openpyxl — скачайте CSV или выполните .venv\\Scripts\\pip install openpyxl")
+        media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    elif fmt == "csv":
+        content, media = analytics_module.to_csv(tables), "text/csv; charset=utf-8"
+    else:
+        raise HTTPException(400, "format: csv или xlsx")
+    from urllib.parse import quote
+    filename = f"{name}.{fmt}"
+    return Response(content, media_type=media, headers={"Content-Disposition": f"attachment; filename=\"report.{fmt}\"; filename*=UTF-8''{quote(filename)}"})
+
+
+@app.get("/api/analytics/filters")
+def analytics_filters() -> dict[str, object]:
+    with draft_store._connect() as c:
+        cabinets = [r[0] for r in c.execute("SELECT DISTINCT cabinet_id FROM inbox_items WHERE cabinet_id<>'' ORDER BY cabinet_id")]
+        span = c.execute("SELECT MIN(created_at), MAX(created_at) FROM inbox_items").fetchone()
+    try:
+        names = {c.id: c.name for c in configured_cabinets()}
+    except Exception:
+        names = {}
+    return {"marketplaces": analytics_module.MARKETPLACES, "cabinets": [{"id": c, "name": names.get(c, c)} for c in cabinets],
+            "first_day": (span[0] or "")[:10], "last_day": (span[1] or "")[:10], "methods": analytics_module.METHODS}
+
+
+@app.get("/api/analytics/dashboard")
+def analytics_dashboard(kind: str = "review", date_from: str | None = Query(None, alias="from"), date_to: str | None = Query(None, alias="to"),
+                        cabinet: str | None = None, marketplace: str | None = None, grain: str = "day",
+                        format: str | None = None):
+    start, end = _analytics_period(date_from, date_to)
+    data = analytics.dashboard(_analytics_kind(kind), start, end, cabinet or None, marketplace or None, _grain(grain))
+    if format:
+        return _table_download(analytics_module.dashboard_tables(data), format, f"analytics_{kind}_{start}_{end}")
+    return data
+
+
+@app.get("/api/analytics/detailed")
+def analytics_detailed(kind: str = "review", date_from: str | None = Query(None, alias="from"), date_to: str | None = Query(None, alias="to"),
+                       cabinet: str | None = None, marketplace: str | None = None, grain: str = "week") -> dict[str, object]:
+    start, end = _analytics_period(date_from, date_to)
+    return analytics.detailed(_analytics_kind(kind), start, end, cabinet or None, marketplace or None, _grain(grain))
+
+
+@app.get("/api/analytics/tags")
+def analytics_tags(date_from: str | None = Query(None, alias="from"), date_to: str | None = Query(None, alias="to"),
+                   cabinet: str | None = None, marketplace: str | None = None, product_id: int | None = None) -> dict[str, object]:
+    start, end = _analytics_period(date_from, date_to)
+    return analytics.tags(start, end, cabinet or None, marketplace or None, product_id)
+
+
+@app.get("/api/analytics/trends")
+def analytics_trends(date_from: str | None = Query(None, alias="from"), date_to: str | None = Query(None, alias="to"),
+                     cabinet: str | None = None, marketplace: str | None = None) -> dict[str, object]:
+    start, end = _analytics_period(date_from, date_to)
+    return analytics.trends(start, end, cabinet or None, marketplace or None)
+
+
+@app.get("/api/analytics/products")
+def analytics_products(date_from: str | None = Query(None, alias="from"), date_to: str | None = Query(None, alias="to")) -> dict[str, object]:
+    start, end = _analytics_period(date_from, date_to, 365)
+    return {"products": analytics.products(start, end)}
+
+
+@app.get("/api/analytics/product/{product_id}")
+def analytics_product(product_id: int, date_from: str | None = Query(None, alias="from"), date_to: str | None = Query(None, alias="to"),
+                      format: str | None = None):
+    start, end = _analytics_period(date_from, date_to, 365)
+    data = analytics.product(product_id, start, end)
+    if format:
+        return _table_download(analytics_module.report_tables(data), format, f"product_{product_id}_{start}_{end}")
+    return data
+
+
+@app.post("/api/analytics/product/{product_id}/ai")
+async def analytics_product_ai(product_id: int, date_from: str | None = Query(None, alias="from"),
+                               date_to: str | None = Query(None, alias="to")) -> dict[str, object]:
+    start, end = _analytics_period(date_from, date_to, 365)
+    data = analytics.product(product_id, start, end)
+    texts = analytics.review_texts(product_id, start, end)
+    try:
+        result = await asyncio.to_thread(ai_reply_writer.analyze_product, data.get("name") or "", texts)
+    except Exception as exc:
+        raise HTTPException(400, str(exc)[:300])
+    return {**result, "reviews_used": len(texts)}
+
+
+@app.get("/api/analytics/reports")
+def analytics_reports(search: str = "") -> dict[str, object]:
+    return {"reports": analytics.list_reports(search)}
+
+
+@app.post("/api/analytics/reports")
+def analytics_save_report(value: dict) -> dict[str, object]:
+    if "product_id" in value and "stats" not in value:
+        start, end = _analytics_period(value.get("date_from"), value.get("date_to"), 365)
+        data = analytics.product(int(value["product_id"]), start, end)
+        if isinstance(value.get("ai"), dict):
+            data["ai"] = value["ai"]
+    elif {"product_id", "stats", "date_from", "date_to", "pros", "cons", "advice", "ratings"} <= set(value):
+        data = value
+    else:
+        raise HTTPException(400, "Нужен product_id и период")
+    if not data["stats"]["reviews"] and not data["stats"]["questions"]:
+        raise HTTPException(400, "По товару нет отзывов за выбранный период")
+    return analytics.save_report(data)
+
+
+@app.get("/api/analytics/reports/{report_id}")
+def analytics_report(report_id: int, format: str | None = None):
+    data = analytics.get_report(report_id)
+    if not data:
+        raise HTTPException(404, "Отчёт не найден")
+    if format:
+        return _table_download(analytics_module.report_tables(data), format, f"report_{report_id}_{data['product_id']}")
+    return data
+
+
+@app.delete("/api/analytics/reports/{report_id}")
+def analytics_delete_report(report_id: int) -> dict[str, object]:
+    if not analytics.delete_report(report_id):
+        raise HTTPException(404, "Отчёт не найден")
+    return {"deleted": report_id}
+
+
+def _review_filters(item_type, search, date_from, date_to, marketplace, cabinet_id, order_status, answer, rating, tag, product_id, sort):
+    ratings = sorted({int(x) for x in re.findall(r"[1-5]", rating or "")}) or None
+    if answer and answer not in ANSWER_STATUSES:
+        raise HTTPException(400, "Неизвестный статус ответа")
+    return dict(item_type=item_type, search=(search or "")[:100], date_from=date_from, date_to=date_to, marketplace=marketplace or None,
+                cabinet_id=cabinet_id or None, order_status=order_status or None, answer=answer or None, ratings=ratings,
+                tags=[t for t in (tag or "").split(",") if t][:6], product_id=product_id, sort="asc" if sort == "asc" else "desc")
+
+
+@app.get("/api/reviews")
+def reviews_list(item_type: str = Query("review", pattern="^(review|question)$"), search: str = "", date_from: str | None = Query(None, alias="from"),
+                 date_to: str | None = Query(None, alias="to"), marketplace: str = "", cabinet_id: str = "", order_status: str = "", answer: str = "",
+                 rating: str = "", tag: str = "", product_id: int | None = None, sort: str = "desc",
+                 limit: int = Query(20, ge=1, le=200), offset: int = Query(0, ge=0), meta: bool = False) -> dict[str, object]:
+    filters = _review_filters(item_type, search, date_from, date_to, marketplace, cabinet_id, order_status, answer, rating, tag, product_id, sort)
+    data = review_list.query(**filters, limit=limit, offset=offset, with_warnings=reply_service.validate)
+    if meta:
+        data["meta"] = {
+            "cabinets": [c.public() for c in configured_cabinets()],
+            "marketplaces": CABINET_MARKETPLACES, "answer_statuses": ANSWER_STATUSES, "order_statuses": ORDER_STATUSES,
+            "tags": [{"tag": k, "title": v[0], "icon": TAG_ICONS.get(k, "•"), "positive": bool(v[1]), "negative": bool(v[2])} for k, v in ANALYTICS_TAGS.items()],
+            "publishing": {"enabled": not settings.dry_run or manual_send_enabled},
+            "complaints": len(draft_store.list_complaints("ready_manual")),
+        }
+    return data
+
+
+@app.get("/api/reviews/export")
+def reviews_export(item_type: str = Query("review", pattern="^(review|question)$"), search: str = "", date_from: str | None = Query(None, alias="from"),
+                   date_to: str | None = Query(None, alias="to"), marketplace: str = "", cabinet_id: str = "", order_status: str = "", answer: str = "",
+                   rating: str = "", tag: str = "", product_id: int | None = None, sort: str = "desc", format: str = "xlsx"):
+    filters = _review_filters(item_type, search, date_from, date_to, marketplace, cabinet_id, order_status, answer, rating, tag, product_id, sort)
+    rows = review_list.export_rows(**filters)
+    draft_store.audit("reviews_exported", details=f"count={len(rows) - 1}")
+    return _table_download({"Отзывы" if item_type == "review" else "Вопросы": rows}, format, f"{'reviews' if item_type == 'review' else 'questions'}_{datetime.now():%Y-%m-%d}")
+
+
+@app.get("/api/wb/images")
+async def wb_images_batch(nm: str = "", size: str = "small") -> dict[str, object]:
+    ids = [int(x) for x in re.findall(r"\d{4,12}", nm)]
+    return {"urls": await wb_images.urls(ids, size)}
+
+
+@app.get("/api/wb/image/{nm}")
+async def wb_image(nm: int, size: str = "small"):
+    from app.services.wb_images import image_url
+    if nm < 1000 or nm > 10**11:
+        raise HTTPException(404, "Нет фото")
+    host = await wb_images.host_for(nm)
+    if not host:
+        raise HTTPException(404, "Нет фото")
+    return RedirectResponse(image_url(host, nm, size), status_code=302, headers={"Cache-Control": "max-age=86400"})
+
+
 @app.get("/api/products/knowledge")
 def list_product_knowledge() -> dict[str, object]:
     return {"products": product_knowledge.all()}
@@ -1262,6 +1673,1312 @@ async def update_product_knowledge(product_id: int, request: Request) -> dict[st
     saved = product_knowledge.upsert(product_id, facts)
     draft_store.audit("product_knowledge_updated", details=f"product_id={product_id}")
     return {"product_id": product_id, "facts": saved}
+
+
+# --- Индивидуальные ответы на отзывы: режим, фразы сборщика, ИИ, предпросмотр ---------------------
+@app.get("/api/replies/review-mode")
+def get_review_mode() -> dict[str, object]:
+    return {"mode": reply_service.review_mode, "ai": ai_writer.describe(ai_config()), "ai_last_error": ai_reply_writer.last_error}
+
+
+@app.put("/api/replies/review-mode")
+async def set_review_mode(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    mode = str((payload or {}).get("mode") or "")
+    if mode not in REVIEW_MODES:
+        raise HTTPException(400, "Режим: individual, ai или templates")
+    if mode == "ai" and not ai_config()["api_key"]:
+        raise HTTPException(400, "Сначала укажите API-ключ ИИ")
+    draft_store.set_setting("review_mode", mode)
+    reply_service.review_mode = mode
+    draft_store.audit("review_mode_updated", details=mode)
+    return get_review_mode()
+
+
+@app.get("/api/templates/phrases")
+def list_review_phrases() -> dict[str, object]:
+    phrases = phrase_store.all()
+    return {"phrases": [{"key": key, "title": PHRASE_TITLES.get(key, key), "variants": phrases[key],
+                         "customized": phrases[key] != DEFAULT_PHRASES[key]} for key in DEFAULT_PHRASES]}
+
+
+@app.put("/api/templates/phrases/{key}")
+async def update_review_phrase(key: str, request: Request) -> dict[str, object]:
+    payload = await request.json()
+    variants = (payload or {}).get("variants")
+    if not isinstance(variants, list):
+        raise HTTPException(400, "Ожидается список вариантов")
+    try:
+        saved = phrase_store.update(key, [str(v) for v in variants])
+    except KeyError as exc:
+        raise HTTPException(404, "Неизвестная фраза") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    draft_store.audit("review_phrase_updated", details=key)
+    return {"key": key, "variants": saved}
+
+
+@app.delete("/api/templates/phrases/{key}")
+def reset_review_phrase(key: str) -> dict[str, object]:
+    try:
+        return {"key": key, "variants": phrase_store.reset(key)}
+    except KeyError as exc:
+        raise HTTPException(404, "Неизвестная фраза") from exc
+
+
+@app.post("/api/replies/preview")
+async def preview_review_reply(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Ожидается JSON-объект")
+    status = str(payload.get("order_status") or "notSpecified")
+    if status not in ("buyout", "rejected", "returned", "notSpecified"):
+        status = "notSpecified"
+    rating = payload.get("rating")
+    item = InboxItem(id=str(payload.get("id") or f"preview-{payload.get('seed', 0)}"), cabinet_id="preview", item_type="review",
+                     text=str(payload.get("text") or "")[:5000], rating=int(rating) if rating not in (None, "") else None,
+                     order_status=status, author_name=str(payload.get("author_name") or "") or None,
+                     product_name=str(payload.get("product_name") or "") or None)
+    mode = payload.get("mode") or reply_service.review_mode
+    source, text = "individual", None
+    if mode == "ai":
+        text = ai_reply_writer.write(item, reply_service.validate)
+        source = "ai" if text else "individual"
+    if not text:
+        text, _ = reply_service.composer.compose(item)
+    facts = analyze_review_facts(item)
+    return {"text": text, "source": source, "ai_error": ai_reply_writer.last_error if mode == "ai" and source != "ai" else None,
+            "name": facts.name, "status": facts.status,
+            "details": [PHRASE_TITLES.get(k, k) for k in sorted(facts.aspects)],
+            "warnings": reply_service.validate(text, item)}
+
+
+@app.post("/api/replies/regenerate-reviews")
+def regenerate_review_drafts() -> dict[str, object]:
+    """Пересоздать черновики отзывов в текущем режиме. Подтверждённые, отправленные и исправленные вручную не трогаем."""
+    updated = kept = 0
+    items, offset = [], 0
+    while True:
+        page = draft_store.list_inbox(item_type="review", limit=500, offset=offset)
+        items += page
+        if len(page) < 500:
+            break
+        offset += 500
+    for item in items:
+        before = draft_store.get(item.id)
+        saved = draft_store.save_generated(reply_service.draft(item))
+        if before is not None and saved.text == before.text:
+            kept += 1
+        else:
+            updated += 1
+    draft_store.audit("review_drafts_regenerated", details=f"mode={reply_service.review_mode};updated={updated};kept={kept}")
+    return {"updated": updated, "kept": kept, "mode": reply_service.review_mode}
+
+
+@app.get("/api/ai/settings")
+def get_ai_settings() -> dict[str, object]:
+    return {**ai_writer.describe(ai_config()), "last_error": ai_reply_writer.last_error}
+
+
+@app.put("/api/ai/settings")
+async def update_ai_settings(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Ожидается JSON-объект")
+    provider = str(payload.get("provider") or "anthropic")
+    if provider not in ("anthropic", "openai"):
+        raise HTTPException(400, "Провайдер: anthropic или openai")
+    draft_store.set_setting("ai_provider", provider)
+    draft_store.set_setting("ai_base_url", str(payload.get("base_url") or "").strip())
+    draft_store.set_setting("ai_model", str(payload.get("model") or "").strip())
+    if payload.get("api_key") is not None:
+        key = str(payload.get("api_key") or "").strip()
+        draft_store.set_setting("ai_api_key", key)
+        if not key and reply_service.review_mode == "ai":
+            draft_store.set_setting("review_mode", "individual")
+            reply_service.review_mode = "individual"
+    draft_store.audit("ai_settings_updated", details=provider)
+    return get_ai_settings()
+
+
+@app.post("/api/ai/test")
+def test_ai_settings() -> dict[str, object]:
+    cfg = ai_config()
+    try:
+        models = ai_reply_writer.list_models(cfg)
+    except Exception as exc:
+        raise HTTPException(400, f"Не удалось подключиться: {exc}") from exc
+    return {"ok": True, "models": models[:50], "selected": cfg["model"] or (ai_reply_writer.pick_model(cfg) if models else "")}
+
+
+# --- Вопросы: режим, проверка, модели товаров ----------------------------------------------------
+@app.get("/api/replies/question-mode")
+def get_question_mode() -> dict[str, object]:
+    models = product_models.all()
+    filled = sum(1 for m in models.values() if m.get("sizes"))
+    return {"mode": reply_service.question_mode, "ai": ai_writer.describe(ai_config()), "ai_last_error": ai_reply_writer.last_error,
+            "models_total": len(models), "models_with_sizes": filled}
+
+
+@app.put("/api/replies/question-mode")
+async def set_question_mode(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    mode = str((payload or {}).get("mode") or "")
+    if mode not in REVIEW_MODES:
+        raise HTTPException(400, "Режим: individual, ai или templates")
+    if mode == "ai" and not ai_config()["api_key"]:
+        raise HTTPException(400, "Сначала укажите API-ключ ИИ в разделе «Настройки ИИ»")
+    draft_store.set_setting("question_mode", mode)
+    reply_service.question_mode = mode
+    draft_store.audit("question_mode_updated", details=mode)
+    return get_question_mode()
+
+
+@app.post("/api/replies/question-preview")
+async def preview_question_reply(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Ожидается JSON-объект")
+    product = str(payload.get("product_id") or "").strip()
+    item = InboxItem(id=f"qpreview-{payload.get('seed', 0)}", cabinet_id="preview", item_type="question",
+                     text=str(payload.get("text") or "")[:5000], product_id=int(product) if product.isdigit() else None,
+                     author_name=str(payload.get("author_name") or "") or None)
+    if not item.text.strip():
+        raise HTTPException(400, "Введите текст вопроса")
+    mode = payload.get("mode") or reply_service.question_mode
+    previous = reply_service.question_mode
+    reply_service.question_mode = mode if mode in REVIEW_MODES else previous
+    try:
+        draft = reply_service.draft(item)
+    finally:
+        reply_service.question_mode = previous
+    facts = analyze_question(item)
+    model = product_models.for_product(item.product_id)
+    source = "templates" if mode == "templates" else ("ai" if mode == "ai" and ai_reply_writer.last_error is None and ai_config()["api_key"] else "individual")
+    params = {k: v for k, v in {"рост": facts.height, "вес": facts.weight, "обхват талии": facts.waist, "обхват бёдер": facts.hips,
+                                 "размер": facts.size, "рос. размер": facts.ru_size, "ростовка": facts.length_l, "маркировка": facts.mark}.items() if v}
+    return {"text": draft.text, "source": source, "ai_error": ai_reply_writer.last_error if mode == "ai" else None,
+            "intents": facts.intents, "params": params, "model": (model or {}).get("key"),
+            "model_has_sizes": bool((model or {}).get("sizes"))}
+
+
+@app.post("/api/replies/regenerate-questions")
+def regenerate_question_drafts() -> dict[str, object]:
+    updated = kept = 0
+    items, offset = [], 0
+    while True:
+        page = draft_store.list_inbox(item_type="question", limit=500, offset=offset)
+        items += page
+        if len(page) < 500:
+            break
+        offset += 500
+    for item in items:
+        before = draft_store.get(item.id)
+        saved = draft_store.save_generated(reply_service.draft(item))
+        if before is not None and saved.text == before.text:
+            kept += 1
+        else:
+            updated += 1
+    draft_store.audit("question_drafts_regenerated", details=f"mode={reply_service.question_mode};updated={updated};kept={kept}")
+    return {"updated": updated, "kept": kept, "mode": reply_service.question_mode}
+
+
+def _model_hints(nm_ids: list) -> list[dict[str, str]]:
+    wanted = {int(x) for x in nm_ids}
+    hints = []
+    for record in getattr(reply_service.knowledge, "records", []) or []:
+        answer = str(record.get("answer") or "")
+        if record.get("nm_id") in wanted and re.search(r"\d", answer):
+            hints.append({"question": str(record.get("question") or "")[:200], "answer": answer[:500]})
+    return hints[:25]
+
+
+def _inbox_products() -> dict[str, dict[str, object]]:
+    products: dict[str, dict[str, object]] = {}
+    for item in draft_store.list_inbox(item_type="question", limit=500) + draft_store.list_inbox(item_type="review", limit=500):
+        if item.product_id:
+            entry = products.setdefault(str(item.product_id), {"name": item.product_name or "", "questions": 0})
+            if item.item_type.value == "question":
+                entry["questions"] += 1
+    return products
+
+
+@app.get("/api/models")
+def list_product_models() -> dict[str, object]:
+    products = _inbox_products()
+    models = []
+    for key, m in sorted(product_models.all().items(), key=lambda kv: kv[0].lower()):
+        names = [products[str(nm)]["name"] for nm in m.get("nm_ids", []) if str(nm) in products and products[str(nm)]["name"]]
+        questions = sum(products.get(str(nm), {}).get("questions", 0) for nm in m.get("nm_ids", []))
+        filled = [f for f in FACT_FIELDS if f != "name" and m.get(f)]
+        models.append({"key": key, "name": m.get("name") or (names[0] if names else ""), "nm_ids": m.get("nm_ids", []),
+                       "sizes": len(m.get("sizes", [])), "facts": len(filled), "open_questions": questions})
+    linked = {str(nm) for m in product_models.all().values() for nm in m.get("nm_ids", [])}
+    unlinked = [{"nm_id": nm, **info} for nm, info in products.items() if nm not in linked and info["questions"]]
+    unlinked.sort(key=lambda x: -x["questions"])
+    models.sort(key=lambda m: (-m["open_questions"], m["key"].lower()))
+    return {"models": models, "unlinked": unlinked[:30], "fact_fields": FACT_FIELDS, "size_fields": SIZE_FIELDS}
+
+
+@app.get("/api/models/{key}")
+def get_product_model(key: str) -> dict[str, object]:
+    model = product_models.get(key)
+    if model is None:
+        raise HTTPException(404, "Модель не найдена")
+    return {"key": key, **model, "hints": _model_hints(model.get("nm_ids", []))}
+
+
+@app.put("/api/models/{key}")
+async def save_product_model(key: str, request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Ожидается JSON-объект")
+    new_key = str(payload.get("key") or key).strip()
+    old = product_models.get(key) if new_key != key else None
+    if new_key != key and product_models.get(new_key) is not None:
+        raise HTTPException(400, f"Модель {new_key} уже есть")
+    try:
+        if old is not None:
+            product_models.delete(key)
+        saved = product_models.save(new_key, payload)
+    except ValueError as exc:
+        if old is not None:
+            product_models.save(key, old)
+        raise HTTPException(400, str(exc)) from exc
+    draft_store.audit("product_model_saved", details=new_key)
+    return saved
+
+
+@app.delete("/api/models/{key}")
+def delete_product_model(key: str) -> dict[str, object]:
+    try:
+        product_models.delete(key)
+    except KeyError as exc:
+        raise HTTPException(404, "Модель не найдена") from exc
+    draft_store.audit("product_model_deleted", details=key)
+    return {"deleted": key}
+
+
+# --- Финансы: ОПиУ из папки opiu -----------------------------------------------------------
+finance_runner = finance.ReportRunner()
+
+
+def finance_settings() -> dict[str, str]:
+    return {"dir": draft_store.get_setting("finance_dir", ""), "python": draft_store.get_setting("finance_python", "")}
+
+
+def finance_project():
+    configured = finance_settings()["dir"]
+    project = finance.find_project_dir(configured or None)
+    if project is None:
+        detail = (f"В папке «{configured}» нет opiu_all.py" if configured
+                  else "Не найдена папка opiu с расчётом ОПиУ (WB OPS\\opiu\\opiu_all.py).")
+        raise HTTPException(404, detail)
+    return project
+
+
+@app.get("/api/finance/settings")
+def get_finance_settings() -> dict[str, object]:
+    values = finance_settings()
+    project = finance.find_project_dir(values["dir"] or None)
+    return {**values, "resolved_dir": str(project) if project else None}
+
+
+@app.put("/api/finance/settings")
+async def update_finance_settings(request: Request) -> dict[str, object]:
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Ожидается JSON-объект")
+    folder = str(payload.get("dir") or "").strip().strip('"')
+    python = str(payload.get("python") or "").strip().strip('"')
+    if folder and finance.find_project_dir(folder) is None:
+        raise HTTPException(400, f"В папке «{folder}» нет opiu_all.py")
+    draft_store.set_setting("finance_dir", folder)
+    draft_store.set_setting("finance_python", python)
+    draft_store.audit("finance_settings_updated", details=folder or "auto")
+    return get_finance_settings()
+
+
+@app.get("/api/finance/report")
+def finance_report() -> dict[str, object]:
+    project = finance_project()
+    path = finance.latest_report(project)
+    if path is None:
+        raise HTTPException(404, "Отчёт ещё не собран: нажмите «Собрать из кэша» или «Обновить данные».")
+    try:
+        data = finance.read_report(path)
+    except finance.FinanceError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    return {**data, "project_dir": str(project)}
+
+
+@app.get("/api/finance/report/download")
+def finance_report_download() -> FileResponse:
+    path = finance.latest_report(finance_project())
+    if path is None:
+        raise HTTPException(404, "Отчёт ещё не собран")
+    return FileResponse(path, filename=path.name,
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+# ---------------------------------------------------------------- номенклатура и себестоимость
+nomenclature = Nomenclature(lambda: finance_project(), cabinets=lambda: configured_cabinets(), models=product_models,
+                            product_names=lambda: analytics.product_names())
+
+
+def _nomenclature_guard():
+    if finance_runner.status().get("status") == "running":
+        raise HTTPException(409, "Сейчас пересобирается ОПиУ — дождитесь окончания и повторите")
+
+
+def _price_args(value: dict) -> dict:
+    out = {}
+    for key in ("cost", "prep", "multiplier"):
+        if key in value and value[key] not in (None, ""):
+            try:
+                out[key] = float(str(value[key]).replace(",", ".").replace(" ", ""))
+            except ValueError:
+                raise HTTPException(400, "Цены — числами")
+    if value.get("effective_from"):
+        out["effective_from"] = str(value["effective_from"])
+    for key in ("brand", "category"):
+        if key in value and value[key] is not None:
+            out[key] = str(value[key])
+    return out
+
+
+@app.get("/api/nomenclature")
+def nomenclature_list() -> dict[str, object]:
+    try:
+        return {**nomenclature.items(), "finance": finance_runner.status().get("status")}
+    except NomenclatureError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.put("/api/nomenclature/price")
+def nomenclature_price(value: dict) -> dict[str, object]:
+    _nomenclature_guard()
+    article = str(value.get("article") or "").strip()
+    args = _price_args(value)
+    if not article or not args:
+        raise HTTPException(400, "Нужны артикул и хотя бы одно значение")
+    try:
+        row = nomenclature.update_price(article, **args)
+    except NomenclatureError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("cost_updated", article, ";".join(f"{k}={v}" for k, v in args.items()))
+    return {"saved": row}
+
+
+@app.post("/api/nomenclature/bulk")
+def nomenclature_bulk(value: dict) -> dict[str, object]:
+    _nomenclature_guard()
+    articles = [str(a).strip() for a in value.get("articles") or [] if str(a).strip()][:1000]
+    args = _price_args(value)
+    if not articles or not any(k in args for k in ("cost", "prep", "multiplier", "brand", "category")):
+        raise HTTPException(400, "Выберите товары и укажите себестоимость, подготовку или кратность")
+    done = 0
+    try:
+        for article in articles:
+            nomenclature.update_price(article, **args)
+            done += 1
+    except NomenclatureError as exc:
+        raise HTTPException(400, f"Сохранено {done} из {len(articles)}: {exc}")
+    draft_store.audit("cost_bulk_updated", details=f"count={done};" + ";".join(f"{k}={v}" for k, v in args.items()))
+    return {"updated": done}
+
+
+@app.delete("/api/nomenclature/price")
+def nomenclature_delete_price(article: str, effective_from: str = Query(..., alias="from")) -> dict[str, object]:
+    _nomenclature_guard()
+    try:
+        nomenclature.delete_price(article, effective_from)
+    except NomenclatureError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("cost_price_deleted", article, effective_from)
+    return {"deleted": True}
+
+
+def _opiu_wb_tokens() -> list[tuple[str, str]]:
+    try:
+        path = finance_project() / "Wildberries" / "wb_accounts.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return [(a.get("name") or "WB", a.get("token") or "") for a in data.get("accounts", []) if a.get("enabled", True)]
+    except Exception:
+        return []
+
+
+@app.post("/api/nomenclature/refresh")
+async def nomenclature_refresh() -> dict[str, object]:
+    try:
+        result = await asyncio.to_thread(nomenclature.refresh_cards, _opiu_wb_tokens())
+    except NomenclatureError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("wb_cards_refreshed", details=f"cards={result['cards']}")
+    return result
+
+
+@app.get("/api/nomenclature/export")
+def nomenclature_export(format: str = "xlsx"):
+    data = nomenclature.items()
+    rows = [["Артикул", "Название", "Бренд", "Категория", "WB ID", "Маркетплейсы", "Себестоимость, ₽", "Подготовка, ₽", "Кратность",
+             "Действует с", "Будущие цены с", "Продано, шт", "Выручка, ₽", "Остаток WB, шт", "Цена WB, ₽"]]
+    for i in data["items"]:
+        rows.append([i["article"], i["name"], i["brand"], i["category"], ", ".join(map(str, i["nm_ids"])), ", ".join(i["marketplaces"]),
+                     i["cost"], i["prep"], i["multiplier"], i["effective_from"], ", ".join(i["future"]), i["sold"], round(i["revenue"] or 0, 2),
+                     i["stock"], i["price"]])
+    return _table_download({"Номенклатура": rows}, format, f"nomenclature_{datetime.now():%Y-%m-%d}")
+
+
+# ---------------------------------------------------------------- дашборд
+kpi_dashboard = Dashboard(lambda: finance_project(), lambda: finance_settings()["python"] or finance.default_python(),
+                      lambda: nomenclature.read_cost_rows()[1])
+
+
+@app.get("/api/dashboard")
+def dashboard_data(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "",
+                   brand: str = "", category: str = "", article: str = "", prev_from: str = "", prev_to: str = "") -> dict[str, object]:
+    from datetime import date as _date
+    try:
+        start, end = _date.fromisoformat(date_from), _date.fromisoformat(date_to)
+        previous = (_date.fromisoformat(prev_from), _date.fromisoformat(prev_to)) if prev_from and prev_to else None
+    except ValueError:
+        raise HTTPException(400, "Даты в формате ГГГГ-ММ-ДД")
+    try:
+        if kpi_dashboard.stale():
+            if not kpi_dashboard.dump_path().exists():
+                return {"status": "building", "state": kpi_dashboard.refresh()}
+            kpi_dashboard.refresh()                # данные есть — показываем их, свежие соберутся в фоне
+        articles = {x.strip().upper().replace(" ", "") for x in article.split(",") if x.strip()} or None
+        return {"status": "ok", "state": kpi_dashboard.state,
+                **kpi_dashboard.summary(start, end, previous=previous, cabinet=cabinet or None, brand=brand or None, category=category or None, articles=articles)}
+    except DashboardError as exc:
+        return {"status": "error", "message": str(exc), "state": kpi_dashboard.state}
+
+
+@app.get("/api/dashboard/status")
+def dashboard_status() -> dict[str, object]:
+    return {**kpi_dashboard.state, "ready": kpi_dashboard.dump_path().exists() if dashboard_project_ok() else False}
+
+
+def dashboard_project_ok() -> bool:
+    try:
+        finance_project()
+        return True
+    except HTTPException:
+        return False
+
+
+@app.post("/api/dashboard/refresh")
+def dashboard_refresh() -> dict[str, object]:
+    try:
+        return kpi_dashboard.refresh()
+    except DashboardError as exc:
+        raise HTTPException(400, str(exc))
+
+
+# ---------------------------------------------------------------- РНП
+def _rnp_tokens() -> list[tuple[str, str, str]]:
+    """(кабинет, ключ API, ключ API рекламы) — включённые кабинеты WB панели и кабинеты из расчёта ОПиУ."""
+    cabinets = [c for c in configured_cabinets() if c.marketplace == "wildberries"]
+    seen = {c.token for c in cabinets if not c.enabled}          # выключенные — не загружаем
+    out = []
+    for name, token, ads in [(c.name, c.token, c.ads_token) for c in cabinets if c.enabled and c.token] + [(n, t, "") for n, t in _opiu_wb_tokens()]:
+        if token and token not in seen:
+            seen.add(token)
+            out.append((name, token, ads or token))
+    return out
+
+
+def _rnp_economics():
+    if kpi_dashboard.stale() and kpi_dashboard.dump_path().exists():
+        kpi_dashboard.refresh()                      # свежая выгрузка соберётся в фоне
+    return kpi_dashboard.data()
+
+
+rnp = RNP(draft_store, _rnp_tokens, _rnp_economics, lambda: nomenclature.read_cost_rows()[1])
+RNP_SYNC_HOURS = 2
+
+
+async def rnp_loop() -> None:
+    """Каждые 2 часа подтягивать заказы и рекламу из WB (если есть токен)."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            if _rnp_tokens():
+                await asyncio.to_thread(rnp.sync)
+        except Exception as exc:
+            draft_store.audit("rnp_sync_error", details=str(exc)[:300])
+        await asyncio.sleep(RNP_SYNC_HOURS * 3600)
+
+
+def _rnp_period(date_from: str, date_to: str) -> tuple[str, str]:
+    from datetime import date as _date
+    try:
+        start, end = _date.fromisoformat(date_from), _date.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(400, "Даты в формате ГГГГ-ММ-ДД")
+    if end < start or (end - start).days > 92:
+        raise HTTPException(400, "Период — от 1 до 93 дней")
+    return start.isoformat(), end.isoformat()
+
+
+def _rnp_articles(article: str):
+    return {x.strip().upper().replace(" ", "") for x in article.split(",") if x.strip()} or None
+
+
+@app.get("/api/rnp")
+def rnp_table(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), brand: str = "", category: str = "",
+              article: str = "") -> dict[str, object]:
+    start, end = _rnp_period(date_from, date_to)
+    data = rnp.table(start, end, brand=brand or None, category=category or None, articles=_rnp_articles(article))
+    try:
+        opts = kpi_dashboard.options()
+    except Exception:
+        opts = {}
+    data["options"] = opts
+    data["has_tokens"] = bool(_rnp_tokens())
+    data["sync_hours"] = RNP_SYNC_HOURS
+    return data
+
+
+@app.get("/api/rnp/heatmap")
+def rnp_heatmap(metric: str, date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), brand: str = "",
+                category: str = "", article: str = "") -> dict[str, object]:
+    start, end = _rnp_period(date_from, date_to)
+    try:
+        return rnp.heatmap(start, end, metric, brand=brand or None, category=category or None, articles=_rnp_articles(article))
+    except RNPError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/rnp/status")
+def rnp_status() -> dict[str, object]:
+    return {**rnp.state, "synced_at": draft_store.get_setting("rnp_synced_at", ""), "has_tokens": bool(_rnp_tokens())}
+
+
+@app.post("/api/rnp/sync")
+def rnp_sync(days: int = 0) -> dict[str, object]:
+    if not _rnp_tokens():
+        raise HTTPException(400, "Нет кабинета WB с API-токеном — добавьте его в «Кабинеты маркетплейсов»")
+    if rnp.state.get("status") == "running":
+        return dict(rnp.state)
+    days = max(0, min(int(days or 0), 90))
+    threading.Thread(target=rnp.sync, args=(days or None,), daemon=True).start()
+    draft_store.audit("rnp_sync", details=f"days={days}")
+    return {"status": "running", "message": "Загрузка началась"}
+
+
+class RNPPlanRequest(BaseModel):
+    article: str
+    month: str
+    orders_per_day: float | None = Field(default=None, ge=0, le=100000)
+    margin: float | None = Field(default=None, ge=-100, le=100)
+
+
+@app.put("/api/rnp/plan")
+def rnp_set_plan(body: RNPPlanRequest) -> dict[str, object]:
+    try:
+        rnp.set_plan(body.article, body.month, body.orders_per_day, body.margin)
+    except RNPError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("rnp_plan", body.article, f"{body.month}: {body.orders_per_day} / {body.margin}")
+    return {"saved": True}
+
+
+class RNPNoteRequest(BaseModel):
+    day: str
+    article: str = ""
+    text: str = Field(min_length=1, max_length=500)
+
+
+@app.post("/api/rnp/notes")
+def rnp_add_note(body: RNPNoteRequest) -> dict[str, object]:
+    try:
+        return rnp.add_note(body.day, body.article, body.text, current_actor.get() or "Владелец")
+    except RNPError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.delete("/api/rnp/notes/{note_id}")
+def rnp_delete_note(note_id: int) -> dict[str, object]:
+    if not rnp.delete_note(note_id):
+        raise HTTPException(404, "Заметка не найдена")
+    return {"deleted": True}
+
+
+# ---------------------------------------------------------------- перенос карточек между маркетплейсами
+transfer = TransferService(draft_store, configured_cabinets)
+
+
+def _transfer_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except TransferError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/transfer/cabinets")
+def transfer_cabinets() -> list[dict[str, object]]:
+    return transfer.cabinet_list()
+
+
+@app.get("/api/transfer/settings")
+def transfer_settings_get() -> dict[str, object]:
+    return {**transfer.settings(), "certificate_files": [Path(p).name for p in transfer.cert_files()]}
+
+
+@app.put("/api/transfer/settings")
+def transfer_settings_put(body: dict) -> dict[str, object]:
+    saved = transfer.update_settings(body)
+    draft_store.audit("transfer_settings", details=json.dumps({k: v for k, v in body.items() if k != "certificate"}, ensure_ascii=False)[:300])
+    return {**saved, "certificate_files": [Path(p).name for p in transfer.cert_files()]}
+
+
+@app.post("/api/transfer/certificate-file")
+async def transfer_certificate_file(file: UploadFile = File(...)) -> dict[str, object]:
+    name = Path(file.filename or "declaration.pdf").name
+    if name.lower().rsplit(".", 1)[-1] not in ("pdf", "jpg", "jpeg", "png"):
+        raise HTTPException(400, "Нужен файл PDF, JPG или PNG")
+    folder = transfer.data_dir / "certificate"
+    folder.mkdir(parents=True, exist_ok=True)
+    data = await file.read()
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(400, "Файл больше 20 МБ")
+    (folder / name).write_bytes(data)
+    return {"files": [Path(p).name for p in transfer.cert_files()]}
+
+
+@app.delete("/api/transfer/certificate-file/{name}")
+def transfer_certificate_file_delete(name: str) -> dict[str, object]:
+    path = transfer.data_dir / "certificate" / Path(name).name
+    if path.exists():
+        path.unlink()
+    return {"files": [Path(p).name for p in transfer.cert_files()]}
+
+
+@app.get("/api/transfer/categories")
+def transfer_categories(cabinet: str, q: str = Query(..., min_length=2)) -> list[dict[str, object]]:
+    return _transfer_call(transfer.search_categories, cabinet, q)
+
+
+@app.put("/api/transfer/category")
+def transfer_set_category(body: dict) -> dict[str, object]:
+    if body.get("target_mp") not in ("wildberries", "ozon", "yandex") or not body.get("source_key"):
+        raise HTTPException(400, "Нужны target_mp и source_key")
+    transfer.set_category(body["target_mp"], body["source_key"], body.get("category"))
+    return {"saved": True}
+
+
+@app.put("/api/transfer/extra")
+def transfer_set_extra(body: dict) -> dict[str, object]:
+    if body.get("target_mp") not in ("wildberries", "ozon", "yandex") or not body.get("category") or not body.get("attr"):
+        raise HTTPException(400, "Нужны target_mp, category и attr")
+    value = None if body.get("skip") else str(body.get("value") or "").strip()
+    transfer.set_extra(body["target_mp"], body["category"], body["attr"], value)
+    return {"saved": True}
+
+
+@app.post("/api/transfer/runs")
+def transfer_run(body: dict) -> dict[str, object]:
+    articles = body.get("articles") or []
+    if isinstance(articles, str):
+        articles = re.split(r"[\n,;\t]+", articles)
+    result = _transfer_call(transfer.start, str(body.get("source") or ""), str(body.get("target") or ""), articles,
+                            auto=bool(body.get("auto")), author=current_actor.get() or "Владелец")
+    draft_store.audit("transfer_started", result["id"], f"{result['source_title']} → {result['target_title']}: {', '.join(result['articles'])[:200]}")
+    return result
+
+
+@app.get("/api/transfer/runs")
+def transfer_runs() -> list[dict[str, object]]:
+    return transfer.history()
+
+
+@app.get("/api/transfer/runs/{run_id}")
+def transfer_run_get(run_id: str) -> dict[str, object]:
+    job = transfer.get(run_id)
+    if job is None:
+        raise HTTPException(404, "Перенос не найден")
+    return transfer.public(job)
+
+
+@app.post("/api/transfer/runs/{run_id}/upload")
+def transfer_upload(run_id: str, body: dict | None = None) -> dict[str, object]:
+    body = body or {}
+    result = _transfer_call(transfer.upload, run_id, body.get("offer_ids"), bool(body.get("force")))
+    draft_store.audit("transfer_upload", run_id, f"force={bool(body.get('force'))}")
+    return result
+
+
+@app.post("/api/transfer/runs/{run_id}/finalize")
+def transfer_finalize(run_id: str) -> dict[str, object]:
+    return _transfer_call(transfer.finalize, run_id)
+
+
+@app.post("/api/transfer/runs/{run_id}/certificate")
+def transfer_certificate(run_id: str) -> dict[str, object]:
+    result = _transfer_call(transfer.bind_certificate, run_id)
+    draft_store.audit("transfer_certificate", run_id)
+    return result
+
+
+# ---------------------------------------------------------------- репрайсер WB
+def _repricer_catalog() -> dict:
+    out = {}
+    try:
+        for i in nomenclature.items()["items"]:
+            mult = i.get("multiplier") or 1
+            out[i["key"]] = {"name": i.get("name") or "", "brand": i.get("brand") or "", "category": i.get("category") or "",
+                             "stock": i.get("stock"), "cost": i["cost"] * mult if i.get("cost") is not None else None,
+                             "prep": (i.get("prep") or 0) * mult}
+    except Exception:
+        pass
+    return out
+
+
+repricer = Repricer(draft_store, configured_cabinets, lambda: rnp.unit_economics(rnp._dash()), _repricer_catalog)
+
+
+def _repricer_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except RepricerError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/repricer")
+def repricer_table() -> dict[str, object]:
+    stale = [c for c in repricer.wb_cabinets() if not (repricer.cache.get(c.id) or {}).get("at")
+             or time.time() - repricer.cache[c.id]["at"] > 600]
+    if stale:
+        repricer.refresh()
+    return {"rows": repricer.rows(), "state": repricer.state(), "settings": repricer.settings(), "now": time.time(),
+            "cabinets": [{"id": c.id, "name": c.name} for c in repricer.wb_cabinets()]}
+
+
+@app.post("/api/repricer/refresh")
+def repricer_refresh() -> dict[str, object]:
+    return {"result": _repricer_call(repricer.refresh, True), "state": repricer.state()}
+
+
+@app.put("/api/repricer/settings")
+def repricer_settings_put(body: dict) -> dict[str, object]:
+    saved = _repricer_call(repricer.save_settings, body)
+    draft_store.audit("repricer_settings", details=json.dumps(body, ensure_ascii=False)[:300])
+    return saved
+
+
+@app.put("/api/repricer/items")
+def repricer_items_put(body: dict) -> dict[str, object]:
+    ids = [str(x) for x in body.get("ids") or [] if ":" in str(x)]
+    if not ids:
+        raise HTTPException(400, "Нет артикулов")
+    kw = {}
+    if "included" in body:
+        kw["included"] = bool(body["included"])
+    for k in ("min_price", "max_price"):
+        if k in body:
+            v = body[k]
+            kw[k] = None if v in (None, "") else float(v)
+    repricer.set_items(ids, **kw)
+    return {"saved": len(ids)}
+
+
+@app.post("/api/repricer/preview")
+def repricer_preview(body: dict) -> dict[str, object]:
+    return {"items": _repricer_call(repricer.preview, body.get("changes"), body.get("mass"), body.get("ids"))}
+
+
+@app.post("/api/repricer/apply")
+def repricer_apply(body: dict) -> dict[str, object]:
+    changes = [c for c in body.get("changes") or [] if c.get("id")]
+    result = _repricer_call(repricer.apply, changes, bool(body.get("confirm")), current_actor.get() or "Владелец",
+                            str(body.get("action") or "Изменение цены")[:60])
+    draft_store.audit("repricer_apply", str(result["id"]), f"count={len(changes)}")
+    return result
+
+
+@app.get("/api/repricer/ops/{op_id}")
+def repricer_op(op_id: int) -> dict[str, object]:
+    return _repricer_call(repricer.op, op_id)
+
+
+@app.get("/api/repricer/history")
+def repricer_history(author: str = "", status: str = "", since: str = "") -> list[dict[str, object]]:
+    return repricer.history(author, status, since)
+
+
+@app.get("/api/repricer/items/{item_id}/history")
+def repricer_item_history(item_id: str, days: int = 30) -> list[dict[str, object]]:
+    if ":" not in item_id:
+        raise HTTPException(400, "Неверный артикул")
+    return repricer.item_history(item_id, max(1, min(days, 365)))
+
+
+@app.post("/api/repricer/export")
+def repricer_export(body: dict):
+    rows = {r["id"]: r for r in repricer.rows()}
+    ids = body.get("ids") or list(rows)
+    table = [["Магазин", "Артикул МП", "Артикул продавца", "Название", "Бренд", "Цена до скидки", "Скидка, %", "Цена до СПП", "СПП, %",
+              "Цена для клиента", "Маржа, %", "Нет в наличии", "Новая цена до СПП", "Новая цена для клиента"]]
+    for rid in ids:
+        r = rows.get(rid)
+        if r:
+            table.append([r["cabinet"], r["nm_id"], r["vendor"], r["name"], r["brand"], r["price"], r["discount"], r["price_before_spp"],
+                          round(r["spp"], 1) if r["spp"] is not None else "", r["client_wallet"] or "", r.get("margin") if r.get("margin") is not None else "",
+                          "" if r["in_stock"] else "да", "", ""])
+    return _table_download({"Цены": table}, "xlsx", f"prices_wb_{datetime.now():%Y-%m-%d}")
+
+
+@app.post("/api/repricer/import")
+async def repricer_import(file: UploadFile = File(...)) -> dict[str, object]:
+    data = await file.read()
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(400, "Файл больше 10 МБ")
+    name = (file.filename or "").lower()
+    try:
+        if name.endswith(".csv"):
+            import csv as _csv
+            text = data.decode("utf-8-sig")
+            delim = ";" if text.count(";") >= text.count(",") else ","
+            table = list(_csv.reader(text.splitlines(), delimiter=delim))
+        else:
+            import io
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+            table = [list(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
+    except Exception as exc:
+        raise HTTPException(400, f"Не удалось прочитать файл: {exc}")
+    if not table:
+        raise HTTPException(400, "Файл пустой")
+    head = [str(h or "").strip().lower() for h in table[0]]
+    col = lambda name: head.index(name) if name in head else None        # noqa: E731
+    i_shop, i_nm, i_before, i_client = col("магазин"), col("артикул мп"), col("новая цена до спп"), col("новая цена для клиента")
+    if i_nm is None or (i_before is None and i_client is None):
+        raise HTTPException(400, "Нужны колонки «Магазин», «Артикул МП», «Новая цена до СПП» и/или «Новая цена для клиента»")
+    names = {c.name.strip().lower(): c.id for c in repricer.wb_cabinets()}
+    rows = repricer.rows()
+    changes, skipped = [], 0
+    for line in table[1:]:
+        cell = lambda i: (line[i] if i is not None and i < len(line) else None)        # noqa: E731,B023
+        nm = str(cell(i_nm) or "").strip().split(".")[0]
+        before, client = cell(i_before), cell(i_client)
+        if not nm or (before in (None, "") and client in (None, "")):
+            skipped += 1
+            continue
+        shop = str(cell(i_shop) or "").strip().lower()
+        cid = names.get(shop)
+        match = [r for r in rows if str(r["nm_id"]) == nm and (cid is None or r["cabinet_id"] == cid)]
+        if not match:
+            changes.append({"id": f"?:{nm}", "error": "артикул не найден"})
+            continue
+        num = lambda v: float(str(v).replace(" ", "").replace(",", ".")) if v not in (None, "") else None   # noqa: E731
+        try:
+            ch = {"id": match[0]["id"]}
+            if before not in (None, ""):
+                ch["new_price"] = num(before)
+            else:
+                ch["new_client"] = num(client)
+            changes.append(ch)
+        except ValueError:
+            changes.append({"id": match[0]["id"], "error": "цена — не число"})
+    if len(changes) > 1000:
+        raise HTTPException(400, "За раз можно загрузить до 1000 цен")
+    good = [c for c in changes if not c.get("error")]
+    items = _repricer_call(repricer.preview, good) + [{"id": c["id"], "errors": [c["error"]], "warnings": [], "nm_id": c["id"].split(":")[-1]}
+                                                      for c in changes if c.get("error")]
+    return {"items": items, "skipped": skipped}
+
+
+# ---------------------------------------------------------------- остатки FBS
+def _stocks_catalog() -> dict:
+    out = {}
+    try:
+        for i in nomenclature.items()["items"]:
+            out[i["key"]] = {"name": i.get("name") or "", "brand": i.get("brand") or "", "category": i.get("category") or "", "wb_stock": i.get("stock")}
+    except Exception:
+        pass
+    return out
+
+
+stocks = Stocks(draft_store, configured_cabinets, _stocks_catalog)
+
+
+async def _stocks_notify(result: dict) -> int:
+    cfg = notifier.config()
+    if not result.get("messages") or not cfg["events"].get("stocks_low", True):
+        return 0
+    sent = 0
+    for subject, text in result["messages"]:
+        res = await notifier.send(subject, text, cfg)
+        sent += int(any(res.values()))
+    return sent
+
+
+async def stocks_loop() -> None:
+    """Проверять остатки FBS по расписанию и присылать оповещения о заканчивающихся размерах."""
+    await asyncio.sleep(45)
+    while True:
+        cfg = stocks.settings()
+        try:
+            if cfg["monitor"] and stocks.wb_cabinets():
+                await asyncio.to_thread(stocks.refresh)
+                await _stocks_notify(await asyncio.to_thread(stocks.check_alerts))
+        except Exception as exc:
+            draft_store.audit("stocks_monitor_error", details=str(exc)[:300])
+        await asyncio.sleep(max(5, int(cfg.get("interval_min") or 30)) * 60)
+
+
+def _stocks_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except StocksError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/stocks")
+async def stocks_table() -> dict[str, object]:
+    stale = [c.id for c in stocks.wb_cabinets() if not (stocks.state.get(c.id) or {}).get("at") or time.time() - stocks.state[c.id]["at"] > 600]
+    if stale:
+        await asyncio.to_thread(stocks.refresh, stale)
+    ncfg = notifier.config()
+    return {"rows": await asyncio.to_thread(stocks.rows), "state": stocks.state, "settings": stocks.settings(), "now": time.time(),
+            "cabinets": [{"id": c.id, "name": c.name} for c in stocks.wb_cabinets()],
+            "notify": {"telegram": ncfg["telegram"]["enabled"], "email": ncfg["email"]["enabled"], "event": ncfg["events"].get("stocks_low", True)},
+            "orders_sync": {"status": rnp.state.get("status"), "message": rnp.state.get("message", ""), "has_tokens": bool(_rnp_tokens())}}
+
+
+@app.post("/api/stocks/refresh")
+async def stocks_refresh(body: dict | None = None) -> dict[str, object]:
+    return {"result": await asyncio.to_thread(stocks.refresh, None, bool((body or {}).get("reload_cards"))), "state": stocks.state}
+
+
+@app.put("/api/stocks")
+async def stocks_update(body: dict) -> dict[str, object]:
+    changes = [c for c in body.get("changes") or [] if isinstance(c, dict)]
+    if len(changes) > 5000:
+        raise HTTPException(400, "Слишком много изменений за раз")
+    result = await asyncio.to_thread(_stocks_call, stocks.update, changes, current_actor.get() or "Владелец")
+    draft_store.audit("fbs_stocks_updated", details=f"ok={result['ok']};errors={len(result['errors'])}")
+    try:
+        await _stocks_notify(await asyncio.to_thread(stocks.check_alerts))
+    except Exception:
+        pass
+    return result
+
+
+@app.put("/api/stocks/watch")
+def stocks_watch(body: dict) -> dict[str, object]:
+    ids = [str(x) for x in body.get("ids") or [] if str(x).count(":") == 2]
+    if not ids:
+        raise HTTPException(400, "Нет размеров")
+    kw = {}
+    if "threshold" in body:
+        v = body["threshold"]
+        if v not in (None, "") and not (0 <= int(v) <= 10000):
+            raise HTTPException(400, "Порог — от 0 до 10000")
+        kw["threshold"] = None if v in (None, "") else int(v)
+    if "muted" in body:
+        kw["muted"] = bool(body["muted"])
+    stocks.set_watch(ids, **kw)
+    return {"saved": len(ids)}
+
+
+@app.put("/api/stocks/archive")
+def stocks_archive(body: dict) -> dict[str, object]:
+    keys = [str(k) for k in body.get("keys") or [] if str(k).count(":") == 1 and str(k).rsplit(":", 1)[1].isdigit()]
+    if not keys:
+        raise HTTPException(400, "Нет артикулов")
+    stocks.set_archive(keys, bool(body.get("archived", True)), current_actor.get() or "Владелец")
+    draft_store.audit("fbs_archive", details=f"{'в архив' if body.get('archived', True) else 'из архива'}: {', '.join(keys)[:200]}")
+    return {"saved": len(keys)}
+
+
+@app.put("/api/stocks/settings")
+def stocks_settings_put(body: dict) -> dict[str, object]:
+    return _stocks_call(stocks.save_settings, body)
+
+
+@app.get("/api/stocks/history")
+def stocks_history(days: int = 30, item: str = "") -> list[dict[str, object]]:
+    if item and item.count(":") != 2:
+        raise HTTPException(400, "Неверный размер")
+    return stocks.history(max(1, min(days, 365)), item)
+
+
+@app.post("/api/stocks/check")
+async def stocks_check() -> dict[str, object]:
+    """Проверить сейчас и прислать список всех размеров ниже порога (как тест оповещения)."""
+    ncfg = notifier.config()
+    if not (ncfg["telegram"]["enabled"] or ncfg["email"]["enabled"]):
+        raise HTTPException(400, "Сначала подключите Telegram в «Настройках уведомлений»")
+    await asyncio.to_thread(stocks.refresh)
+    result = await asyncio.to_thread(stocks.check_alerts, True)
+    if not result["messages"]:
+        return {"sent": 0, "message": "Все отслеживаемые размеры выше порога — оповещать не о чем"}
+    sent = 0
+    for subject, text in result["messages"]:
+        res = await notifier.send(subject, text, ncfg)
+        sent += int(any(res.values()))
+    return {"sent": sent, "low": result["low"], "zero": result["zero"], "message": "Отправлено" if sent else "Не удалось отправить — проверьте настройки Telegram"}
+
+
+# ---------------------------------------------------------------- аналитика FBS
+fbs = FbsAnalytics(draft_store, configured_cabinets, _stocks_catalog)
+
+
+async def fbs_loop() -> None:
+    """Раз в 30 минут подтягивать сборочные задания, статусы, поставки и выкупы."""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            if fbs.wb_cabinets():
+                await asyncio.to_thread(fbs.sync)
+        except Exception as exc:
+            draft_store.audit("fbs_sync_error", details=str(exc)[:300])
+        await asyncio.sleep(30 * 60)
+
+
+def _fbs_args(date_from: str, date_to: str, cabinet: str, warehouse: str, q: str, brand: str, category: str):
+    from datetime import date as _date
+    try:
+        a, b = _date.fromisoformat(date_from), _date.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(400, "Даты в формате ГГГГ-ММ-ДД")
+    if b < a or (b - a).days > 120:
+        raise HTTPException(400, "Период — от 1 до 120 дней")
+    return a.isoformat(), b.isoformat(), {"cabinet": cabinet, "warehouse": warehouse, "q": q, "brand": brand, "category": category}
+
+
+@app.get("/api/fbs-analytics")
+async def fbs_report(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", warehouse: str = "",
+                     q: str = "", brand: str = "", category: str = "", prev_from: str = "", prev_to: str = "") -> dict[str, object]:
+    a, b, f = _fbs_args(date_from, date_to, cabinet, warehouse, q, brand, category)
+    prev = (prev_from, prev_to) if prev_from and prev_to else None
+    if not draft_store.get_setting("fbs_analytics_synced_at", "") and fbs.state["status"] != "running" and fbs.wb_cabinets():
+        threading.Thread(target=fbs.sync, daemon=True).start()
+    return await asyncio.to_thread(fbs.report, a, b, f, prev)
+
+
+@app.get("/api/fbs-analytics/orders")
+async def fbs_feed(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", warehouse: str = "",
+                   q: str = "", brand: str = "", category: str = "", status: str = "", sort: str = "created_at", desc: bool = True,
+                   limit: int = 100, offset: int = 0) -> dict[str, object]:
+    a, b, f = _fbs_args(date_from, date_to, cabinet, warehouse, q, brand, category)
+    return await asyncio.to_thread(fbs.feed, a, b, f, status, sort, desc, max(1, min(limit, 500)), max(0, offset))
+
+
+@app.get("/api/fbs-analytics/orders.csv")
+async def fbs_feed_csv(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", warehouse: str = "",
+                       q: str = "", brand: str = "", category: str = "", status: str = ""):
+    from app.services.fbs_analytics import STATUS_TITLES
+    a, b, f = _fbs_args(date_from, date_to, cabinet, warehouse, q, brand, category)
+    data = await asyncio.to_thread(fbs.feed, a, b, f, status, "created_at", True, 100000, 0)
+    table = [["Дата заказа", "Задание", "Кабинет", "Склад", "Артикул", "WB ID", "Бренд", "Сумма, ₽", "Поставка", "Статус", "Статус WB",
+              "Приёмка WB (СЦ)", "Часов до СЦ", "Выкуп", "Дней от СЦ до выкупа", "Комиссия, п.п.", "Скидка/штраф, ₽"]]
+    for r in data["items"]:
+        table.append([r["created_at"], r["id"], r["cabinet"], r["warehouse"], r["article"], r["nm_id"], r["brand"], r["price"], r["supply_id"],
+                      STATUS_TITLES.get(r["status"], r["status"]), r["wb_status"], r["scan_dt"] or "", r["hours_to_sc"] if r["hours_to_sc"] is not None else "",
+                      r["sale_dt"] or "", r["days_to_buyout"] if r["days_to_buyout"] is not None else "",
+                      r["effect_pct"] if r["effect_pct"] is not None else "", r["effect_rub"] if r["effect_rub"] is not None else ""])
+    return _table_download({"FBS": table}, "csv", f"fbs_{a}_{b}")
+
+
+@app.post("/api/fbs-analytics/sync")
+def fbs_sync() -> dict[str, object]:
+    if not fbs.wb_cabinets():
+        raise HTTPException(400, "Нет кабинета WB с ключом API")
+    if fbs.state["status"] != "running":
+        threading.Thread(target=fbs.sync, daemon=True).start()
+    return {"status": "running"}
+
+
+@app.get("/api/fbs-analytics/status")
+def fbs_status() -> dict[str, object]:
+    return {**fbs.state, "synced_at": draft_store.get_setting("fbs_analytics_synced_at", "")}
+
+
+# ---------------------------------------------------------------- аналитика штрафов
+def _penalties_cache_dir():
+    try:
+        return finance_project() / "Wildberries" / "cache"
+    except HTTPException:
+        return None
+
+
+penalties = Penalties(draft_store, _penalties_cache_dir, configured_cabinets)
+
+
+async def penalties_loop() -> None:
+    """Переиндексировать штрафы, когда расчёт ОПиУ скачал свежие отчёты реализации."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            if penalties.stale() and penalties._sources():
+                await asyncio.to_thread(penalties.sync)
+        except Exception as exc:
+            draft_store.audit("penalties_sync_error", details=str(exc)[:300])
+        await asyncio.sleep(10 * 60)
+
+
+def _pen_args(date_from: str, date_to: str, cabinet: str, q: str, brand: str, category: str, group: str, reason: str):
+    from datetime import date as _date
+    try:
+        a, b = _date.fromisoformat(date_from), _date.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(400, "Даты в формате ГГГГ-ММ-ДД")
+    if b < a or (b - a).days > 400:
+        raise HTTPException(400, "Период — от 1 до 400 дней")
+    return a.isoformat(), b.isoformat(), {"cabinet": cabinet, "q": q, "brand": brand, "category": category, "group": group, "reason": reason}
+
+
+@app.get("/api/penalties")
+async def penalties_report(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", q: str = "",
+                           brand: str = "", category: str = "", group: str = "", reason: str = "", prev_from: str = "", prev_to: str = "") -> dict[str, object]:
+    a, b, f = _pen_args(date_from, date_to, cabinet, q, brand, category, group, reason)
+    if penalties.state["status"] != "running" and penalties.stale() and penalties._sources():
+        await asyncio.to_thread(penalties.sync)
+    data = await asyncio.to_thread(penalties.report, a, b, f, (prev_from, prev_to) if prev_from and prev_to else None)
+    data["download"] = finance_runner.status()["status"]
+    return data
+
+
+@app.get("/api/penalties/items")
+async def penalties_feed(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", q: str = "",
+                         brand: str = "", category: str = "", group: str = "", reason: str = "", sort: str = "day", desc: bool = True,
+                         limit: int = 100, offset: int = 0) -> dict[str, object]:
+    a, b, f = _pen_args(date_from, date_to, cabinet, q, brand, category, group, reason)
+    return await asyncio.to_thread(penalties.feed, a, b, f, sort, desc, max(1, min(limit, 500)), max(0, offset))
+
+
+@app.get("/api/penalties/items.csv")
+async def penalties_csv(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", q: str = "",
+                        brand: str = "", category: str = "", group: str = "", reason: str = ""):
+    a, b, f = _pen_args(date_from, date_to, cabinet, q, brand, category, group, reason)
+    data = await asyncio.to_thread(penalties.feed, a, b, f, "day", True, 100000, 0)
+    table = [["Дата", "Кабинет", "Причина", "Группа", "Сумма, ₽", "Артикул", "WB ID", "Бренд", "Предмет", "srid", "Отчёт WB",
+              "Задание FBS", "Склад", "Заказ создан", "Статус WB"]]
+    for r in data["items"]:
+        fb = r.get("fbs") or {}
+        table.append([r["day"], r["account"], r["reason"], r["group_title"], r["amount"], r["article"], r["nm_id"], r["brand"], r["subject"],
+                      r["srid"], r["report_id"], fb.get("order_id", ""), fb.get("warehouse", ""), fb.get("created_at", ""), fb.get("wb_status", "")])
+    return _table_download({"Штрафы": table}, "csv", f"penalties_{a}_{b}")
+
+
+@app.post("/api/penalties/sync")
+async def penalties_sync(request: Request) -> dict[str, object]:
+    """download=true — скачать свежие отчёты реализации через расчёт ОПиУ, иначе только перечитать кэш."""
+    payload = await request.json() if await request.body() else {}
+    if (payload or {}).get("download"):
+        project = finance_project()
+        try:
+            finance_runner.start(project, finance_settings()["python"] or finance.default_python(), "full")
+        except finance.FinanceError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        draft_store.audit("finance_update_started", details="full (penalties)")
+        return {"status": "downloading"}
+    if penalties.state["status"] != "running":
+        threading.Thread(target=penalties.sync, kwargs={"force": True}, daemon=True).start()
+    return {"status": "running"}
+
+
+@app.get("/api/penalties/status")
+def penalties_status() -> dict[str, object]:
+    return {**penalties.state, "download": finance_runner.status()["status"], "stale": penalties.stale(),
+            "synced_at": draft_store.get_setting("penalties_synced_at", "")}
+
+
+# ---------------------------------------------------------------- аналитика рекламы
+ads = AdsAnalytics(draft_store, _rnp_tokens, _stocks_catalog)
+
+
+async def ads_loop() -> None:
+    """Раз в час подтягивать кампании, статистику, поисковые кластеры и списания."""
+    await asyncio.sleep(150)
+    while True:
+        try:
+            if _rnp_tokens():
+                await asyncio.to_thread(ads.sync)
+        except Exception as exc:
+            draft_store.audit("ads_sync_error", details=str(exc)[:300])
+        await asyncio.sleep(60 * 60)
+
+
+def _ads_args(date_from: str, date_to: str, **f):
+    from datetime import date as _date
+    try:
+        a, b = _date.fromisoformat(date_from), _date.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(400, "Даты в формате ГГГГ-ММ-ДД")
+    if b < a or (b - a).days > 400:
+        raise HTTPException(400, "Период — от 1 до 400 дней")
+    return a.isoformat(), b.isoformat(), f
+
+
+@app.get("/api/ads")
+async def ads_report(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", campaign: str = "",
+                     status: str = "", payment: str = "", brand: str = "", category: str = "", q: str = "",
+                     prev_from: str = "", prev_to: str = "") -> dict[str, object]:
+    a, b, f = _ads_args(date_from, date_to, cabinet=cabinet, campaign=campaign, status=status, payment=payment, brand=brand, category=category, q=q)
+    if not draft_store.get_setting("ads_synced_at", "") and ads.state["status"] != "running" and _rnp_tokens():
+        threading.Thread(target=ads.sync, daemon=True).start()
+    return await asyncio.to_thread(ads.report, a, b, f, (prev_from, prev_to) if prev_from and prev_to else None)
+
+
+@app.get("/api/ads/export.csv")
+async def ads_export(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), kind: str = "campaigns", cabinet: str = "",
+                     campaign: str = "", status: str = "", payment: str = "", brand: str = "", category: str = "", q: str = ""):
+    a, b, f = _ads_args(date_from, date_to, cabinet=cabinet, campaign=campaign, status=status, payment=payment, brand=brand, category=category, q=q)
+    data = await asyncio.to_thread(ads.report, a, b, f, None)
+    cols = [("views", "Показы"), ("clicks", "Клики"), ("ctr", "CTR, %"), ("cpc", "CPC, ₽"), ("cpm", "CPM, ₽"), ("atbs", "Корзины"), ("orders", "Заказы"),
+            ("cr", "CR клик→заказ, %"), ("spend", "Расход, ₽"), ("cpo", "Цена заказа, ₽"), ("sum_price", "Сумма рекл. заказов, ₽"), ("drr", "ДРР рекл., %")]
+    if kind == "articles":
+        head, rows, key = ["Артикул", "WB ID", "Бренд", "Предмет"], data["articles"], lambda r: [r["article"], r["nm_id"], r["brand"], r["subject"]]
+        cols += [("all_orders", "Все заказы"), ("all_orders_sum", "Сумма всех заказов, ₽"), ("drr_total", "ДРР общий, %")]
+    elif kind == "clusters":
+        head, rows, key = ["Запрос"], data["clusters"], lambda r: [r["query"]]
+        cols += [("avg_pos", "Ср. позиция")]
+    else:
+        head, rows, key = ["Кампания", "ID", "Кабинет", "Статус", "Оплата"], data["campaigns"], lambda r: [r["name"], r["id"], r["account"], r["status_title"], r["payment_type"]]
+        cols += [("budget", "Бюджет, ₽")]
+    table = [head + [t for _k, t in cols]] + [key(r) + [r.get(k) if r.get(k) is not None else "" for k, _t in cols] for r in rows]
+    return _table_download({"Реклама": table}, "csv", f"ads_{kind}_{a}_{b}")
+
+
+@app.post("/api/ads/sync")
+async def ads_sync(request: Request) -> dict[str, object]:
+    payload = await request.json() if await request.body() else {}
+    if not _rnp_tokens():
+        raise HTTPException(400, "Нет кабинета WB с ключом API")
+    if ads.state["status"] != "running":
+        threading.Thread(target=ads.sync, kwargs={"full": bool((payload or {}).get("full"))}, daemon=True).start()
+    return {"status": "running"}
+
+
+@app.get("/api/ads/status")
+def ads_status() -> dict[str, object]:
+    return {**ads.state, "synced_at": draft_store.get_setting("ads_synced_at", "")}
+
+
+@app.get("/api/finance/update")
+def finance_update_status() -> dict[str, object]:
+    return finance_runner.status()
+
+
+@app.post("/api/finance/update")
+async def finance_update(request: Request) -> dict[str, object]:
+    payload = await request.json() if await request.body() else {}
+    mode = (payload or {}).get("mode", "cache")
+    if mode not in ("cache", "full"):
+        raise HTTPException(400, "mode: cache или full")
+    project = finance_project()
+    try:
+        result = finance_runner.start(project, finance_settings()["python"] or finance.default_python(), mode)
+    except finance.FinanceError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    draft_store.audit("finance_update_started", details=mode)
+    return result
 
 
 @app.get("/api/recommendations")

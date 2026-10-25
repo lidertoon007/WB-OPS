@@ -4,6 +4,8 @@ from app.models import InboxItem, PublicationMode, ReplyDraft, OrderStatus
 from app.services.question_knowledge import QuestionKnowledge
 from app.services.product_knowledge import ProductKnowledge
 from app.services.templates import TemplateStore
+from app.services.review_composer import ReviewComposer
+from app.services.question_composer import QuestionComposer
 
 
 class ReplyService:
@@ -62,7 +64,15 @@ class ReplyService:
 
     def draft(self, item: InboxItem) -> ReplyDraft:
         if item.item_type.value == "review":
-            return ReplyDraft(item_id=item.id, text=self._personalize(self._review_reply(item), item), mode=PublicationMode.DRAFT)
+            if self.review_mode in ("individual", "ai"):
+                text = None
+                if self.review_mode == "ai" and self.ai is not None:
+                    text = self.ai.write(item, self.validate)   # None — ИИ недоступен, берём сборщик
+                source = "ai" if text else "individual"
+                if not text:
+                    text, _facts = self.composer.compose(item)
+                return ReplyDraft(item_id=item.id, text=text, mode=PublicationMode.DRAFT, source=source)
+            return ReplyDraft(item_id=item.id, text=self._personalize(self._review_reply(item), item), mode=PublicationMode.DRAFT, source="templates")
         if not item.text.strip():
             return ReplyDraft(
                 item_id=item.id,
@@ -75,7 +85,15 @@ class ReplyService:
             question_topic = self._question_topic(item.text)
             known_answer = self.knowledge.exact_answer(item.text, item.product_id)
             if known_answer:
-                return ReplyDraft(item_id=item.id, text=self._personalize(known_answer, item), mode=PublicationMode.DRAFT)
+                return ReplyDraft(item_id=item.id, text=self._personalize(known_answer, item), mode=PublicationMode.DRAFT, source="knowledge")
+            if self.question_mode in ("individual", "ai"):
+                text = None
+                if self.question_mode == "ai" and self.ai is not None:
+                    text = self.ai.write_answer(item, self.question_composer, self.validate, self._similar_answers(item))
+                source = "ai" if text else "individual"
+                if not text:
+                    text, _facts = self.question_composer.compose(item)
+                return ReplyDraft(item_id=item.id, text=text, mode=PublicationMode.DRAFT, source=source)
             facts = self.products.get(item.product_id) or {}
             fact_text = ""
             if question_topic == "composition" and facts.get("composition"):
@@ -104,7 +122,16 @@ class ReplyService:
             question_templates["details"] = editable.get("question_details", question_templates["details"])
             text = self._personalize(question_templates[question_topic] + fact_text, item)
 
-        return ReplyDraft(item_id=item.id, text=text, mode=PublicationMode.DRAFT)
+        return ReplyDraft(item_id=item.id, text=text, mode=PublicationMode.DRAFT, source="templates")
+
+    def _similar_answers(self, item: InboxItem) -> list[tuple[str, str]]:
+        """Прошлые ответы магазина для тона ИИ: сначала по той же модели, затем по той же теме."""
+        records = getattr(self.knowledge, "records", []) or []
+        topic = self._question_topic(item.text)
+        same = [r for r in records if r.get("nm_id") == item.product_id]
+        similar = [r for r in records if r.get("topic") == topic and r not in same]
+        pairs = [(str(r.get("question", ""))[:200], str(r.get("answer", ""))[:400]) for r in same[:2] + similar[:3]]
+        return [p for p in pairs if p[1]][:3]
 
     def validate(self, text: str, item: InboxItem | None = None) -> list[str]:
         value = (text or "").strip()
@@ -186,7 +213,16 @@ class ReplyService:
             return f"{thanks} Благодарим, что поделились впечатлениями."
         return editable.get("review_positive", "Здравствуйте! Спасибо за высокую оценку и обратную связь!")
 
-    def __init__(self, knowledge: QuestionKnowledge | None = None, products: ProductKnowledge | None = None, templates: TemplateStore | None = None):
+    def __init__(self, knowledge: QuestionKnowledge | None = None, products: ProductKnowledge | None = None, templates: TemplateStore | None = None,
+                 review_mode: str = "individual", composer: ReviewComposer | None = None,
+                 question_mode: str = "individual", question_composer: QuestionComposer | None = None):
         self.knowledge = knowledge or QuestionKnowledge()
         self.products = products or ProductKnowledge()
         self.templates = templates or TemplateStore()
+        # Отзывы: individual — сборщик индивидуальных ответов, ai — ИИ с откатом на сборщик, templates — старые шаблоны
+        self.review_mode = review_mode
+        self.composer = composer or ReviewComposer()
+        # Вопросы: individual — ответы по фактам модели, ai — ИИ с откатом, templates — старые шаблоны
+        self.question_mode = question_mode
+        self.question_composer = question_composer or QuestionComposer(products=self.products)
+        self.ai = None

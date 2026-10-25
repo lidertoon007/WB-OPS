@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from app.models import InboxItem, ItemType, OrderStatus
 from app.services.replies import ReplyService
+from app.services.templates import TemplateStore
 from app.services.wb_client import WBFeedbackClient
 from app.storage import DraftStore
 
@@ -13,8 +14,13 @@ class NoKnowledge:
         return None
 
 class StatusTests(unittest.TestCase):
+    """Режим «Шаблоны» (старое поведение)."""
     def setUp(self):
-        self.service = ReplyService(NoKnowledge())
+        # Isolated default templates: tests must not depend on the operator's edits.
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.service = ReplyService(NoKnowledge(), templates=TemplateStore(str(Path(self.temp.name) / "templates.json")),
+                                    review_mode="templates", question_mode="templates")
 
     def item(self, status="notSpecified", text="Джинсы мужу понравились.", rating=5, id="test"):
         return InboxItem(id=id, cabinet_id="main", item_type="review", text=text, rating=rating, order_status=status)
@@ -35,12 +41,15 @@ class StatusTests(unittest.TestCase):
                         self.assertNotIn("носки", answer)
                         self.assertNotIn("товар вам подош", answer)
 
+    POSITIVE = "высокую оценку"
+
     def test_buyout_positive(self):
-        self.assertIn("носки", self.service.draft(self.item("buyout", "Все отлично")).text)
+        # Positive buyout replies use the editable "review_positive" template.
+        self.assertIn(self.POSITIVE, self.service.draft(self.item("buyout", "Все отлично")).text)
 
     def test_negative_cons_even_with_five_stars(self):
-        self.assertNotIn("носки", self.service.draft(self.item("buyout", "Красивые\nНедостатки: Короткие")).text)
-        self.assertIn("носки", self.service.draft(self.item("buyout", "Все отлично\nНедостатки: Нет")).text)
+        self.assertNotIn(self.POSITIVE, self.service.draft(self.item("buyout", "Красивые\nНедостатки: Короткие")).text)
+        self.assertIn(self.POSITIVE, self.service.draft(self.item("buyout", "Все отлично\nНедостатки: Нет")).text)
 
     def test_buyout_explicit_refusal_return_or_problem(self):
         for text in ("Красивые, но отказ", "Не выкупила", "Вернула", "Отказалась из-за брака", "Не подошел размер", "Товар кривой"):
@@ -102,3 +111,28 @@ class StatusTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IndividualSafetyTests(StatusTests):
+    """Те же правила безопасности для индивидуальных ответов (сборщика)."""
+
+    def setUp(self):
+        super().setUp()
+        self.service.review_mode = "individual"
+        self.service.question_mode = "individual"
+
+    def test_question_unchanged(self):
+        item = InboxItem(id="q", cabinet_id="main", item_type="question", text="Есть размер 50?")
+        self.assertIn("Сообщить о поступлении", self.service.draft(item).text)
+
+    # Тексты благодарности в индивидуальном режиме другие — проверяем смысл, а не формулировку
+    def test_positive_refusal_screenshot(self):
+        text = self.service.draft(self.item("rejected")).text
+        self.assertNotIn("носки", text)
+        self.assertNotIn("вам подош", text)
+
+    def test_buyout_positive(self):
+        self.assertRegex(self.service.draft(self.item("buyout", "Все отлично")).text, "носк|радуют|удовольств")
+
+    def test_negative_cons_even_with_five_stars(self):
+        self.assertNotIn("носки", self.service.draft(self.item("buyout", "Красивые\nНедостатки: Короткие")).text)

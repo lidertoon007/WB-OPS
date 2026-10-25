@@ -14,10 +14,16 @@ class ReviewFilters(BaseModel):
     rating: int | None = Field(default=None, ge=1, le=5)
     order_status: OrderStatus | None = None
     product_id: int | None = Field(default=None, ge=1)
+    cabinet_id: str | None = Field(default=None, max_length=64)
 
 
 class BulkPreviewRequest(BaseModel):
     filters: ReviewFilters = Field(default_factory=ReviewFilters)
+    texts: dict[str, str] = Field(default_factory=dict, max_length=500)
+
+
+class BulkSendRequest(BaseModel):
+    # Final texts edited by the operator in the review dialog.
     texts: dict[str, str] = Field(default_factory=dict, max_length=500)
 
 
@@ -71,7 +77,7 @@ class BulkReplySender:
         self._save(token, data)
         return data
 
-    def start(self, token):
+    def start(self, token, texts=None):
         data = self.get(token)
         if data["status"] != "preview":
             raise HTTPException(409, "Этот пакет уже был запущен")
@@ -79,6 +85,18 @@ class BulkReplySender:
             raise HTTPException(409, "Предпросмотр устарел. Сформируйте список заново.")
         if not data["items"]:
             raise HTTPException(400, "Нет отзывов для отправки")
+        if texts:
+            known = {selected["item_id"]: selected for selected in data["items"]}
+            unknown = [item_id for item_id in texts if item_id not in known]
+            if unknown:
+                raise HTTPException(400, "Отзыв не входит в этот пакет: " + unknown[0])
+            for item_id, raw in texts.items():
+                text = (raw or "").strip()
+                if len(text) < 2 or len(text) > 5000:
+                    raise HTTPException(400, f"Недопустимая длина ответа для отзыва {item_id} (от 2 до 5000 символов)")
+                if text != known[item_id]["text"]:
+                    known[item_id]["text"] = text
+                    known[item_id]["edited_in_dialog"] = True
         key = "review_batch:" + token
         data["status"] = "running"
         encoded = json.dumps(data, ensure_ascii=False)
@@ -117,7 +135,7 @@ class BulkReplySender:
                     result = {"item_id": selected["item_id"], "status": "skipped", "reason": "Черновик изменился после подтверждения списка"}
                 elif item is None or item.item_type.value != "review" or item.cabinet_id != selected["cabinet_id"] or any(
                     expected[name] is not None and str(getattr(item, name)) != str(expected[name])
-                    for name in ("rating", "order_status", "product_id")
+                    for name in ("rating", "order_status", "product_id", "cabinet_id")
                 ):
                     result = {"item_id": selected["item_id"], "status": "skipped", "reason": "Отзыв больше не соответствует подтверждённым фильтрам"}
                 else:
@@ -128,6 +146,13 @@ class BulkReplySender:
                     except HTTPException as exc:
                         result = {"item_id": item.id, "status": "failed", "reason": str(exc.detail)}
                         data["failed"] += 1
+                    except Exception as exc:
+                        # One malformed item or unexpected transport error must
+                        # not discard the rest of an operator-confirmed batch.
+                        reason = f"Внутренняя ошибка отправки: {type(exc).__name__}: {str(exc)[:160]}"
+                        result = {"item_id": item.id, "status": "failed", "reason": reason}
+                        data["failed"] += 1
+                        self.store.audit("review_batch_item_error", item.id, reason)
                 data["results"].append(result)
                 data["processed"] = index + 1
                 self._save(token, data)
@@ -145,10 +170,11 @@ class BulkReplySender:
             data["reason"] = "Сервис остановлен. Пакет не возобновляется автоматически."
             self._save(token, data)
             raise
-        except Exception:
+        except Exception as exc:
             data["status"] = "interrupted"
-            data["reason"] = "Отправка прервана. Проверьте журнал и ответы в WB."
+            data["reason"] = f"Отправка прервана: {type(exc).__name__}. Проверьте журнал и ответы в WB."
             self._save(token, data)
+            self.store.audit("review_batch_interrupted", details=data["reason"])
 
     def recover_interrupted(self):
         with self.store._connect() as c:

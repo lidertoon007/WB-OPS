@@ -70,5 +70,30 @@ class ComplaintTests(unittest.TestCase):
             ComplaintUpdate(status="invalid")
 
 
+class ComplaintGroundsTests(unittest.TestCase):
+    def check(self, text):
+        item = InboxItem(id="r", cabinet_id="main", item_type="review", text=text, rating=1, product_id=1)
+        return ComplaintService().evaluate(item)
+
+    def test_delivery_and_wrong_item_grounds(self):
+        case = self.check("Товар мы даже не увидели, он пришел в отделение Почта России и валяется на полу")
+        self.assertEqual((case.status, case.reason_code), (ComplaintStatus.READY_MANUAL, "delivery"))
+        self.assertEqual(self.check("Подмена товара. Заказала одно, пришло другое").reason_code, "wrong_item")
+        details = ComplaintService().details(self.check("Подмена товара, совсем не то"), InboxItem(id="r", cabinet_id="m", item_type="review", text="Подмена товара, совсем не то", rating=1, product_id=1))
+        self.assertIn("не тот товар", details.complaint_draft)
+
+    def test_quality_or_shade_complaints_are_not_grounds(self):
+        for text in ("Заказывал синие, пришли другого цвета, темно-синие", "Плохое качество, швы кривые", "Маломерят, не подошли"):
+            self.assertEqual(self.check(text).status, ComplaintStatus.NOT_ELIGIBLE, text)
+
+
+class PrepareRequestTests(unittest.TestCase):
+    def test_reason_and_text_rules(self):
+        from app.services.complaint_browser import ComplaintPrepareRequest, radio_selector
+        self.assertEqual(ComplaintPrepareRequest().reason, "Другое")
+        self.assertEqual(ComplaintPrepareRequest(reason="Нецензурная лексика", text="").text, "")
+        self.assertEqual(radio_selector('Отзыв "не о товаре"'), 'input[type=radio][name="Отзыв \\"не о товаре\\""]')
+
+
 if __name__ == "__main__":
     unittest.main()
