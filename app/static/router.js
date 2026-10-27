@@ -12,6 +12,8 @@
     dashboard:       {path: '/dashboard',       title: 'Дашборд', sub: 'Оцифровка: ключевые показатели Wildberries за период', show: ['dashboardPage']},
     transfer:        {path: '/transfer',        title: 'Перенос карточек', sub: 'Перенос товаров между кабинетами Wildberries, Ozon и Яндекс Маркета по артикулу', show: ['transferPage']},
     'fbs-analytics': {path: '/fbs-analytics',   title: 'Аналитика FBS', sub: 'Статусы сборочных заданий, скорость отгрузки, склады, % выкупа и скидки/штрафы WB за сроки', show: ['fbsPage']},
+    ab:              {path: '/ab',              title: 'A/B-тесты', sub: 'Какое главное фото даёт больше кликов и корзин: варианты по очереди на живой карточке', show: ['abPage']},
+    planfact:        {path: '/planfact',        title: 'План-факт', sub: 'Планы на месяц по бизнесу и артикулам, отклонения и прогноз на конец месяца', show: ['planfactPage']},
     ads:             {path: '/ads',             title: 'Аналитика рекламы', sub: 'Расходы, ДРР, кампании, артикулы, поисковые запросы и списания WB за рекламу', show: ['adsPage']},
     penalties:       {path: '/penalties',       title: 'Аналитика штрафов', sub: 'Штрафы Wildberries из отчётов реализации: динамика, причины, артикулы, задания FBS и прочие удержания', show: ['penaltiesPage']},
     stocks:          {path: '/stocks',          title: 'Остатки FBS', sub: 'Быстрое пополнение остатков по размерам и оповещения в Telegram, пока товар не закончился', show: ['stocksPage']},
@@ -195,7 +197,17 @@
     if (window.WBOPSAds) window.WBOPSAds.render(s);
     else s.innerHTML = '<p class="muted">Не загрузился модуль ads.js.</p>';
   };
-  const rendered = {ads: adsPage, penalties: penaltiesPage, 'fbs-analytics': fbsPage, stocks: stocksPage, repricer: repricerPage, transfer: transferPage, rnp: rnpPage, dashboard: dashboardPage, nomenclature: nomenclaturePage, complaints: complaintsPage, reviews: reviewsPage, cabinets: settingsPage('cabinets', 'cabinets'), notifications: settingsPage('notificationsSettings', 'notifications'), team: settingsPage('team', 'team'), analytics: renderAnalytics, import: renderImport, profile: renderProfile, messengers: renderMessengers, finances: renderFinances};
+  const planfactPage = () => {
+    const s = section('planfactPage', '');
+    if (window.WBOPSPlanFact) window.WBOPSPlanFact.render(s);
+    else s.innerHTML = '<p class="muted">Не загрузился модуль planfact.js.</p>';
+  };
+  const abPage = () => {
+    const s = section('abPage', '');
+    if (window.WBOPSAB) window.WBOPSAB.render(s);
+    else s.innerHTML = '<p class="muted">Не загрузился модуль ab.js.</p>';
+  };
+  const rendered = {ab: abPage, planfact: planfactPage, ads: adsPage, penalties: penaltiesPage, 'fbs-analytics': fbsPage, stocks: stocksPage, repricer: repricerPage, transfer: transferPage, rnp: rnpPage, dashboard: dashboardPage, nomenclature: nomenclaturePage, complaints: complaintsPage, reviews: reviewsPage, cabinets: settingsPage('cabinets', 'cabinets'), notifications: settingsPage('notificationsSettings', 'notifications'), team: settingsPage('team', 'team'), analytics: renderAnalytics, import: renderImport, profile: renderProfile, messengers: renderMessengers, finances: renderFinances};
   const done = new Set();
   let applying = false;
   function apply() {

@@ -53,6 +53,8 @@ from app.services.stocks import Stocks, StocksError
 from app.services.fbs_analytics import FbsAnalytics
 from app.services.penalties import Penalties
 from app.services.ads import AdsAnalytics
+from app.services.planfact import PlanFact, PlanFactError
+from app.services.abtests import ABError, ABTests
 from app.services.transfer.service import TransferService
 from pydantic import BaseModel, Field
 from app.storage import DraftStore
@@ -60,7 +62,7 @@ from app.storage import DraftStore
 settings = get_settings()
 STATIC_DIR = Path(__file__).parent / "static"
 DASHBOARD_FILE = STATIC_DIR / "dashboard.html"
-DASHBOARD_PAGES = ("products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "notifications", "team", "complaints", "nomenclature", "dashboard", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads")
+DASHBOARD_PAGES = ("products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "notifications", "team", "complaints", "nomenclature", "dashboard", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads", "planfact", "ab")
 DASHBOARD_PATHS = {"/", *(f"/{page}" for page in DASHBOARD_PAGES)}
 app = FastAPI(
     title=settings.app_name,
@@ -334,7 +336,7 @@ def process_auto_question(item: InboxItem) -> dict[str, object]:
 
 LOCAL_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
 # Только владельцу (на компьютере с WB OPS): команда, токены, ключи, финансы, резервные копии
-OWNER_ONLY = ("/api/team", "/api/admin", "/api/notifications", "/api/finance", "/api/nomenclature", "/api/dashboard", "/api/rnp", "/api/transfer", "/api/repricer", "/api/penalties", "/api/ads", "/api/settings/modules/telegram", "/docs", "/openapi.json",
+OWNER_ONLY = ("/api/team", "/api/admin", "/api/notifications", "/api/finance", "/api/nomenclature", "/api/dashboard", "/api/rnp", "/api/transfer", "/api/repricer", "/api/penalties", "/api/ads", "/api/planfact", "/api/ab", "/api/settings/modules/telegram", "/docs", "/openapi.json",
               "/api/complaint-browser")
 OWNER_ONLY_WRITE = ("/api/cabinets", "/api/ai/settings", "/api/account", "/api/settings/auto-sync")
 MEMBER_OPEN = ("/api/team/me", "/api/team/logout")
@@ -343,7 +345,7 @@ MEMBER_OPEN = ("/api/team/me", "/api/team/logout")
 def is_owner_only(path: str, method: str) -> bool:
     if path.startswith(MEMBER_OPEN):
         return False
-    if path.startswith(OWNER_ONLY) or path in ("/finances", "/nomenclature", "/dashboard", "/rnp", "/transfer", "/repricer", "/penalties", "/ads"):
+    if path.startswith(OWNER_ONLY) or path in ("/finances", "/nomenclature", "/dashboard", "/rnp", "/transfer", "/repricer", "/penalties", "/ads", "/planfact", "/ab"):
         return True
     return method not in ("GET", "HEAD") and path.startswith(OWNER_ONLY_WRITE)
 
@@ -386,7 +388,7 @@ async def inject_knowledge_workspace(request: Request, call_next):
     body = b"".join([chunk async for chunk in response.body_iterator])
     html = body.decode("utf-8")
     if request.url.path in DASHBOARD_PATHS:
-        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "penalties.js", "ads.js", "router.js", "knowledge.js"))
+        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "router.js", "knowledge.js"))
         html = html.replace("</body>", scripts + "</body>")
     return Response(content=html, status_code=response.status_code, headers={"content-type": "text/html; charset=utf-8"})
 
@@ -463,6 +465,8 @@ async def start_scheduler() -> None:
     asyncio.create_task(fbs_loop())
     asyncio.create_task(penalties_loop())
     asyncio.create_task(ads_loop())
+    asyncio.create_task(planfact_loop())
+    asyncio.create_task(ab_loop())
     try:
         cabinets = configured_cabinets()
         for cabinet in cabinets:
@@ -2959,6 +2963,234 @@ async def ads_sync(request: Request) -> dict[str, object]:
 @app.get("/api/ads/status")
 def ads_status() -> dict[str, object]:
     return {**ads.state, "synced_at": draft_store.get_setting("ads_synced_at", "")}
+
+
+# ---------------------------------------------------------------- план-факт
+planfact = PlanFact(draft_store, rnp)
+
+
+async def planfact_loop() -> None:
+    """Каждое утро (в выбранный час по Москве) — сводка план-факта в Telegram, если включено."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    await asyncio.sleep(180)
+    while True:
+        try:
+            cfg = planfact.settings()
+            now = _dt.now(_tz(_td(hours=3)))
+            if cfg["notify"] and now.hour >= cfg["hour"] and draft_store.get_setting("planfact_sent_day", "") != now.date().isoformat():
+                msg = await asyncio.to_thread(planfact.digest)
+                draft_store.set_setting("planfact_sent_day", now.date().isoformat())
+                if msg:
+                    await notifier.send(msg[0], msg[1], notifier.config())
+        except Exception as exc:
+            draft_store.audit("planfact_notify_error", details=str(exc)[:300])
+        await asyncio.sleep(15 * 60)
+
+
+@app.get("/api/planfact")
+async def planfact_report(month: str = "", brand: str = "", category: str = "") -> dict[str, object]:
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    month = month or _dt.now(_tz(_td(hours=3))).strftime("%Y-%m")
+    try:
+        data = await asyncio.to_thread(planfact.report, month, brand or None, category or None)
+    except PlanFactError as exc:
+        raise HTTPException(400, str(exc))
+    try:
+        data["options"] = kpi_dashboard.options()
+    except Exception:
+        data["options"] = {}
+    data["has_tokens"] = bool(_rnp_tokens())
+    return data
+
+
+class PlanFactPlanItem(BaseModel):
+    scope: str = ""
+    metric: str
+    value: float | None = Field(default=None, ge=-1e12, le=1e12)
+
+
+class PlanFactPlanRequest(BaseModel):
+    month: str
+    items: list[PlanFactPlanItem] = Field(min_length=1, max_length=5000)
+
+
+@app.put("/api/planfact/plan")
+def planfact_set_plan(body: PlanFactPlanRequest) -> dict[str, object]:
+    try:
+        for it in body.items:
+            planfact.set_plan(body.month, it.scope, it.metric, it.value)
+    except PlanFactError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("planfact_plan", details=f"{body.month}: {len(body.items)}")
+    return {"saved": len(body.items)}
+
+
+class PlanFactAutofill(BaseModel):
+    month: str
+    growth: float = Field(default=0, ge=-90, le=500)
+    target: str = "all"
+    overwrite: bool = False
+
+
+@app.post("/api/planfact/autofill")
+def planfact_autofill(body: PlanFactAutofill) -> dict[str, object]:
+    if body.target not in ("all", "total", "articles"):
+        raise HTTPException(400, "target: all, total или articles")
+    try:
+        result = planfact.autofill(body.month, body.growth, body.target, body.overwrite)
+    except PlanFactError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("planfact_autofill", details=f"{body.month}: {result['written']}")
+    return result
+
+
+class PlanFactSettings(BaseModel):
+    notify: bool = False
+    hour: int = Field(default=10, ge=0, le=23)
+
+
+@app.put("/api/planfact/settings")
+def planfact_settings(body: PlanFactSettings) -> dict[str, object]:
+    return planfact.save_settings(body.notify, body.hour)
+
+
+@app.post("/api/planfact/test")
+async def planfact_test() -> dict[str, object]:
+    ncfg = notifier.config()
+    if not (ncfg["telegram"]["enabled"] or ncfg["email"]["enabled"]):
+        raise HTTPException(400, "Сначала подключите Telegram в «Настройках уведомлений»")
+    msg = await asyncio.to_thread(planfact.digest)
+    if not msg:
+        raise HTTPException(400, "Сначала задайте планы на текущий месяц")
+    res = await notifier.send(msg[0], msg[1], ncfg)
+    return {"sent": any(res.values())}
+
+
+# ---------------------------------------------------------------- A/B-тесты главного фото
+abtests = ABTests(draft_store, _rnp_tokens, Path(__file__).resolve().parent.parent / "data" / "ab")
+
+
+def _campaign_status(advert_id):
+    with draft_store._connect() as c:
+        try:
+            r = c.execute("SELECT status FROM ads_campaigns WHERE id=?", (advert_id,)).fetchone()
+        except Exception:
+            return None
+    return r[0] if r else None
+
+
+async def ab_loop() -> None:
+    """Каждые 10 минут: статистика вариантов, вердикт, смена главного фото по расписанию."""
+    await asyncio.sleep(200)
+    while True:
+        try:
+            await asyncio.to_thread(abtests.tick, _campaign_status)
+        except Exception as exc:
+            draft_store.audit("ab_tick_error", details=str(exc)[:300])
+        await asyncio.sleep(10 * 60)
+
+
+def _ab(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except ABError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/ab")
+def ab_list() -> dict[str, object]:
+    with draft_store._connect() as c:
+        try:
+            camps = [{"id": r[0], "name": r[1], "status": r[2], "payment_type": r[3], "nms": [n.get("nm_id") for n in json.loads(r[4] or "[]")]}
+                     for r in c.execute("SELECT id, name, status, payment_type, nms FROM ads_campaigns WHERE status IN (9, 11) ORDER BY name")]
+        except Exception:
+            camps = []
+    return {"tests": abtests.list(), "campaigns": camps, "has_tokens": bool(_rnp_tokens()), "ads_synced_at": draft_store.get_setting("ads_synced_at", "")}
+
+
+@app.get("/api/ab/card")
+async def ab_card(nm: int) -> dict[str, object]:
+    return await asyncio.to_thread(_ab, abtests.card, nm)
+
+
+class ABCreate(BaseModel):
+    nm_id: int
+    advert_id: int
+    photos: list[int] = Field(default_factory=list, max_length=30)
+    mode: str = "timer"
+    interval_hours: float = Field(default=6, ge=2, le=72)
+    views_per_step: float = Field(default=1000, ge=300, le=1000000)
+    metric: str = "ctr"
+    max_days: float = Field(default=14, ge=1, le=90)
+
+
+@app.post("/api/ab/tests")
+async def ab_create(body: ABCreate) -> dict[str, object]:
+    result = await asyncio.to_thread(_ab, abtests.create, body.nm_id, body.advert_id, body.photos, body.mode, body.interval_hours, body.views_per_step,
+                                     body.metric, body.max_days)
+    draft_store.audit("ab_create", str(body.nm_id), f"test={result['id']}")
+    return result
+
+
+@app.get("/api/ab/tests/{test_id}")
+def ab_detail(test_id: int) -> dict[str, object]:
+    return _ab(abtests.detail, test_id)
+
+
+@app.post("/api/ab/tests/{test_id}/upload")
+async def ab_upload(test_id: int, file: UploadFile = File(...)) -> dict[str, object]:
+    content = await file.read()
+    return _ab(abtests.add_upload, test_id, file.filename or "photo.jpg", content)
+
+
+@app.delete("/api/ab/tests/{test_id}/variants/{variant_id}")
+def ab_remove_variant(test_id: int, variant_id: int) -> dict[str, object]:
+    return _ab(abtests.remove_variant, test_id, variant_id)
+
+
+@app.get("/api/ab/file/{variant_id}")
+def ab_file(variant_id: int):
+    with draft_store._connect() as c:
+        r = c.execute("SELECT local_file FROM ab_variants WHERE id=?", (variant_id,)).fetchone()
+    path = Path(r[0]) if r and r[0] else None
+    if not path or not path.exists() or abtests.files_dir.resolve() not in path.resolve().parents:
+        raise HTTPException(404, "Файл не найден")
+    return FileResponse(path)
+
+
+@app.post("/api/ab/tests/{test_id}/start")
+async def ab_start(test_id: int) -> dict[str, object]:
+    result = await asyncio.to_thread(_ab, abtests.start, test_id)
+    draft_store.audit("ab_start", details=f"test={test_id}")
+    return result
+
+
+@app.post("/api/ab/tests/{test_id}/pause")
+async def ab_pause(test_id: int) -> dict[str, object]:
+    return await asyncio.to_thread(_ab, abtests.pause, test_id)
+
+
+@app.post("/api/ab/tests/{test_id}/variants/{variant_id}/exclude")
+async def ab_exclude(test_id: int, variant_id: int) -> dict[str, object]:
+    return await asyncio.to_thread(_ab, abtests.exclude, test_id, variant_id)
+
+
+class ABFinish(BaseModel):
+    winner_id: int | None = None
+    remove_uploaded: bool = True
+
+
+@app.post("/api/ab/tests/{test_id}/finish")
+async def ab_finish(test_id: int, body: ABFinish) -> dict[str, object]:
+    result = await asyncio.to_thread(_ab, abtests.finish, test_id, body.winner_id, body.remove_uploaded)
+    draft_store.audit("ab_finish", details=f"test={test_id}; winner={result.get('winner')}")
+    return result
+
+
+@app.delete("/api/ab/tests/{test_id}")
+def ab_delete(test_id: int) -> dict[str, object]:
+    _ab(abtests.delete, test_id)
+    return {"deleted": True}
 
 
 @app.get("/api/finance/update")
