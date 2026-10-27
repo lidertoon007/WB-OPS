@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 from collections import defaultdict
 from datetime import date
@@ -22,6 +23,7 @@ import httpx
 COST_COL, PREP_COL = "сс_за_ед", "подготовка_за_ед"
 PRICE_HEADER = ["артикул", "кратность", COST_COL, PREP_COL, "действует_с", "название (справочно)",
                 "бренд", "категория", "маркетплейсы (справочно)", "продано шт. с 01.2026 (справочно)"]
+RETRO_FILE, RETRO_COL = "retro_bonus.csv", "ретро_бонус_%"   # ретро-бонусы производителей по брендам (как в opiu_all.py)
 CARDS_URL = "https://content-api.wildberries.ru/content/v2/get/cards/list"
 ALL_MP = "Все маркетплейсы"
 
@@ -30,9 +32,26 @@ class NomenclatureError(Exception):
     pass
 
 
+def _read_csv(path: Path) -> tuple[list[str], list[dict]]:
+    """Заголовок и строки CSV (разделитель «;» или «,»); ключи строк — в нижнем регистре."""
+    with open(path, encoding="utf-8-sig", newline="") as fh:
+        sample = fh.read(4096)
+        fh.seek(0)
+        delimiter = ";" if sample.count(";") >= sample.count(",") else ","
+        reader = csv.DictReader(fh, delimiter=delimiter)
+        header = [(h or "").strip() for h in (reader.fieldnames or [])]
+        rows = [{(k or "").strip().lower(): (v or "").strip() for k, v in r.items() if k} for r in reader]
+    return header, rows
+
+
 def art_key(value) -> str:
     """Как в opiu_all.py: рт-00028973 и РТ-00028973 — один товар."""
     return re.sub(r"\s+", "", str(value or "")).upper()
+
+
+def brand_key(value) -> str:
+    """Как в opiu_all.py: бренд без лишних пробелов и регистра."""
+    return re.sub(r"\s+", " ", str(value or "")).strip().upper()
 
 
 def num(value) -> float | None:
@@ -76,22 +95,66 @@ class Nomenclature:
         self.models = models
         self.product_names = product_names
         self._report_cache: tuple | None = None
+        self._missing_lock = threading.Lock()
+        self._missing_stamp: float | None = None   # mtime cost_missing.csv, уже перенесённого в cost.csv
+        self.missing_absorbed = 0
 
     # ------------------------------------------------------------------ cost.csv
     def cost_path(self) -> Path:
         return Path(self.project_dir()) / "cost.csv"
 
     def read_cost_rows(self) -> tuple[list[str], list[dict]]:
+        self.absorb_missing()
+        return self._read_cost_file()
+
+    def absorb_missing(self) -> int:
+        """Цены, вписанные в cost_missing.csv (его выписывает расчёт ОПиУ), — в cost.csv. Сам расчёт переносит их
+        только при сборке, а «Оцифровка», РНП и номенклатура читают cost.csv — поэтому переносим и здесь, по тем же
+        правилам: дописываются только пустые ячейки, цену, уже стоящую в cost.csv, меняют в самом cost.csv.
+        Файл перечитывается, только если изменился. Возвращает число дополненных артикулов."""
+        try:
+            path = Path(self.project_dir()) / "cost_missing.csv"
+            stamp = path.stat().st_mtime
+        except Exception:
+            return 0
+        with self._missing_lock:
+            if stamp == self._missing_stamp:
+                return 0
+            columns = (COST_COL, PREP_COL, "бренд", "категория")
+            try:
+                filled = [r for r in _read_csv(path)[1] if r.get("артикул") and any(r.get(c) for c in columns)]
+                header, rows = self._read_cost_file()
+                index = {(art_key(r.get("артикул")), r.get("действует_с", "")): r for r in rows}
+                changed = 0
+                for m in filled:
+                    key = (art_key(m["артикул"]), m.get("действует_с", ""))
+                    target = index.get(key)
+                    if target is None:
+                        target = {"артикул": m["артикул"], "кратность": m.get("кратность") or "1",
+                                  "действует_с": m.get("действует_с", ""),
+                                  "маркетплейсы (справочно)": m.get("маркетплейс (справочно)", ""),
+                                  "продано шт. с 01.2026 (справочно)": m.get("продано шт. (справочно)", "")}
+                        rows.append(target)
+                        index[key] = target
+                    updated = False
+                    for col in columns:
+                        if m.get(col) and not target.get(col):
+                            target[col] = m[col]
+                            updated = True
+                    changed += updated
+                if changed:
+                    self.write_cost_rows(header, rows)
+            except (OSError, NomenclatureError, csv.Error):
+                return 0                    # cost.csv открыт в Excel и т. п. — перенесём при следующем чтении
+            self._missing_stamp = stamp
+            self.missing_absorbed = changed
+            return changed
+
+    def _read_cost_file(self) -> tuple[list[str], list[dict]]:
         path = self.cost_path()
         if not path.exists():
             return list(PRICE_HEADER), []
-        with open(path, encoding="utf-8-sig", newline="") as fh:
-            sample = fh.read(4096)
-            fh.seek(0)
-            delimiter = ";" if sample.count(";") >= sample.count(",") else ","
-            reader = csv.DictReader(fh, delimiter=delimiter)
-            header = [(h or "").strip() for h in (reader.fieldnames or [])]
-            rows = [{(k or "").strip().lower(): (v or "").strip() for k, v in r.items() if k} for r in reader]
+        header, rows = _read_csv(path)
         header = [h for h in header if h] or list(PRICE_HEADER)
         for col in PRICE_HEADER:
             if col not in [h.lower() for h in header]:
@@ -124,6 +187,62 @@ class Nomenclature:
             if not r.get("действует_с") or r["действует_с"][:7] <= month:
                 chosen = r
         return chosen
+
+    # ------------------------------------------------------------------ retro_bonus.csv
+    def retro_path(self) -> Path:
+        return Path(self.project_dir()) / RETRO_FILE
+
+    def retro_rows(self) -> list[dict]:
+        """Ретро-бонусы производителей: [{brand, pct, since}] — % от себестоимости проданного по бренду, с даты."""
+        path = self.retro_path()
+        if not path.exists():
+            return []
+        out = []
+        for r in _read_csv(path)[1]:
+            pct = num(r.get(RETRO_COL))
+            if r.get("бренд") and pct is not None:
+                out.append({"brand": r["бренд"], "pct": pct, "since": r.get("действует_с", "")})
+        return sorted(out, key=lambda r: (brand_key(r["brand"]), r["since"]))
+
+    def retro_at(self, rows: list[dict] | None = None, day: str | None = None) -> dict[str, float]:
+        """{бренд (brand_key): %}, действующие на дату (по умолчанию — сегодня)."""
+        month = (day or date.today().isoformat())[:7]
+        out = {}
+        for r in rows if rows is not None else self.retro_rows():
+            if not r["since"] or r["since"][:7] <= month:
+                out[brand_key(r["brand"])] = r["pct"]
+        return {k: v for k, v in out.items() if v}
+
+    def set_retro(self, brand: str, pct: float | None, effective_from: str | None = None) -> list[dict]:
+        """Задать % ретро-бонуса бренда (с даты или действующий). pct=None — убрать строку этой даты."""
+        brand = re.sub(r"\s+", " ", str(brand or "")).strip()
+        if not brand:
+            raise NomenclatureError("Не указан бренд")
+        if pct is not None and not 0 <= pct <= 100:
+            raise NomenclatureError("Ретро-бонус: процент от 0 до 100")
+        since = norm_date(effective_from) if effective_from else ""
+        rows = self.retro_rows()
+        own = [r for r in rows if brand_key(r["brand"]) == brand_key(brand)]
+        if not effective_from and own:          # без даты — правим действующую строку
+            current = [r for r in own if not r["since"] or r["since"][:7] <= date.today().isoformat()[:7]]
+            since = (current or own)[-1]["since"]
+        rows = [r for r in rows if not (brand_key(r["brand"]) == brand_key(brand) and r["since"] == since)]
+        if pct is not None:
+            rows.append({"brand": brand, "pct": pct, "since": since})
+        rows.sort(key=lambda r: (brand_key(r["brand"]), r["since"]))
+        buf = io.StringIO()
+        writer = csv.writer(buf, delimiter=";", lineterminator="\r\n")
+        writer.writerow(["бренд", RETRO_COL, "действует_с"])
+        writer.writerows([r["brand"], fmt(r["pct"]), r["since"]] for r in rows)
+        path = self.retro_path()
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(buf.getvalue(), encoding="utf-8-sig", newline="")
+        try:
+            os.replace(tmp, path)
+        except PermissionError as exc:
+            tmp.unlink(missing_ok=True)
+            raise NomenclatureError(f"{RETRO_FILE} открыт в другой программе (например, Excel) — закройте его и повторите") from exc
+        return [r for r in rows if brand_key(r["brand"]) == brand_key(brand)]
 
     def update_price(self, article: str, *, cost=None, prep=None, multiplier=None, effective_from=None,
                      brand=None, category=None, name=None) -> dict:
@@ -417,4 +536,4 @@ class Nomenclature:
             })
         out.sort(key=lambda r: (-(r["sold"] or 0), r["article"].lower()))
         return {"items": out, "report": report.get("file"), "cards_at": cards.get("updated_at"), "cards_errors": cards.get("errors") or [],
-                "goods_at": goods["at"], "cost_file": str(self.cost_path())}
+                "goods_at": goods["at"], "cost_file": str(self.cost_path()), "retro": self.retro_rows()}

@@ -6,7 +6,10 @@ window.WBOPSProducts = (() => {
   const num = v => { const t = String(v ?? '').replace(/\s/g, '').replace(',', '.'); return t === '' ? null : Number(t); };
   const monthLabel = d => { if (!d) return 'всегда'; const [y, m] = d.split('-'); return `с ${['янв', 'фев', 'мар', 'апр', 'мая', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'][+m - 1]} ${y}`; };
   const FILTERS = [['all', 'Все'], ['nocost', 'Без себестоимости'], ['sold', 'Продавались'], ['stock', 'Есть остаток']];
-  const st = {data: null, filter: 'all', search: '', brand: '', category: '', mp: '', selected: new Set(), open: null, saved: {}, dirty: false};
+  const st = {data: null, filter: 'all', search: '', brand: '', category: '', mp: '', selected: new Set(), open: null, saved: {}, dirty: false,
+              retroOpen: false, retroQ: ''};
+  const brandKey = v => String(v ?? '').replace(/\s+/g, ' ').trim().toUpperCase();
+  const pctText = v => String(Math.round(v * 100) / 100).replace('.', ',') + '%';
   let root = null, timer = null;
 
   async function api(url, options = {}) {
@@ -32,6 +35,7 @@ window.WBOPSProducts = (() => {
           <div class="rv-menu-wrap"><button type="button" class="rv-dark rv-sq" data-export aria-label="Скачать" title="Скачать номенклатуру">⇩</button>
           <div class="rv-menu" role="menu" hidden><a role="menuitem" href="/api/nomenclature/export?format=xlsx">Excel (.xlsx)</a><a role="menuitem" href="/api/nomenclature/export?format=csv">CSV</a></div></div></div></div>
       <div data-banner></div>
+      <div data-retro></div>
       <div class="pr-filters"><label class="rv-search"><span class="sr">Поиск</span><input type="search" data-search placeholder="Поиск по артикулу, названию или WB ID…"><span aria-hidden="true">⌕</span></label>
         <label class="rv-select"><span class="sr">Бренд</span><select data-f="brand"></select></label>
         <label class="rv-select"><span class="sr">Категория</span><select data-f="category"></select></label>
@@ -78,13 +82,14 @@ window.WBOPSProducts = (() => {
     root.querySelectorAll('[data-filter]').forEach(b => b.onclick = () => { st.filter = b.dataset.filter; draw(); });
     const d = st.data;
     root.querySelector('[data-banner]').innerHTML = `
-      ${st.dirty ? `<div class="pr-rebuild">Себестоимость изменена. Чтобы «Финансы» учли новые цены, пересоберите ОПиУ — из кэша это быстро и без запросов к маркетплейсам.
+      ${st.dirty ? `<div class="pr-rebuild">Себестоимость или ретро-бонусы изменены. Чтобы «Финансы» учли новые значения, пересоберите ОПиУ — из кэша это быстро и без запросов к маркетплейсам.
         <button type="button" class="btn" data-rebuild ${d.finance === 'running' ? 'disabled' : ''}>${d.finance === 'running' ? 'Пересобирается…' : 'Пересобрать ОПиУ'}</button></div>` : ''}
       <p class="muted pr-sources">Источники: карточки WB — ${d.cards_at ? `обновлены ${esc(d.cards_at)}` : '<b>не загружены</b> (нажмите «Обновить из WB», чтобы появились названия и фото)'};
         продажи — ${d.report ? esc(d.report) : 'отчёт ОПиУ ещё не собран'}; остатки и цены WB — ${d.goods_at ? esc(d.goods_at) : 'нет данных'}.
         Себестоимость и подготовка хранятся в <code>opiu/cost.csv</code> — их же использует расчёт ОПиУ.</p>
       ${(d.cards_errors || []).length ? `<div class="rv-banner">Не все кабинеты отдали карточки: ${esc(d.cards_errors.join('; '))}</div>` : ''}`;
     root.querySelector('[data-rebuild]')?.addEventListener('click', rebuild);
+    drawRetro();
     const list = visible();
     const box = root.querySelector('[data-list]');
     if (!list.length) { box.innerHTML = `<div class="rv-empty"><b>Ничего не найдено</b><p class="muted">Измените фильтры или поиск.</p></div>`; drawBulk(); return; }
@@ -203,6 +208,63 @@ window.WBOPSProducts = (() => {
     };
   }
 
+  // Ретро-бонусы производителей: % от себестоимости проданного по бренду (opiu/retro_bonus.csv)
+  function retroBrands() {
+    const rows = st.data.retro || [], today = new Date().toISOString().slice(0, 7), out = new Map();
+    for (const i of st.data.items) {
+      if (!i.brand) continue;
+      const k = brandKey(i.brand);
+      if (!out.has(k)) out.set(k, {brand: i.brand, count: 0, rows: []});
+      out.get(k).count++;
+    }
+    for (const r of rows) {
+      const k = brandKey(r.brand);
+      if (!out.has(k)) out.set(k, {brand: r.brand, count: 0, rows: []});
+      out.get(k).rows.push(r);
+    }
+    for (const b of out.values()) {
+      const cur = b.rows.filter(r => !r.since || r.since.slice(0, 7) <= today);
+      b.current = cur.length ? cur[cur.length - 1].pct : null;
+      b.future = b.rows.filter(r => r.since && r.since.slice(0, 7) > today);
+    }
+    return [...out.values()].sort((a, b) => (b.current > 0) - (a.current > 0) || b.count - a.count || a.brand.localeCompare(b.brand, 'ru'));
+  }
+
+  function drawRetro() {
+    const box = root.querySelector('[data-retro]'), brands = retroBrands(), active = brands.filter(b => b.current > 0);
+    const q = st.retroQ.toLowerCase(), shown = brands.filter(b => !q || b.brand.toLowerCase().includes(q));
+    box.innerHTML = `<div class="pr-retro">
+      <button type="button" class="pr-retro-head" data-retro-toggle aria-expanded="${st.retroOpen}">
+        <b>Ретро-бонусы производителей</b><span class="muted">${active.length ? active.map(b => `${esc(b.brand)} ${pctText(b.current)}`).slice(0, 4).join(' · ') + (active.length > 4 ? ` и ещё ${active.length - 4}` : '') : 'не заданы'}</span><i aria-hidden="true">${st.retroOpen ? '▴' : '▾'}</i></button>
+      ${st.retroOpen ? `<div class="pr-retro-body">
+        <p class="muted">Процент от себестоимости проданного, который производитель возвращает за бренд. В ОПиУ, дашборде и РНП — отдельной строкой дохода «Ретро-бонусы производителей»; себестоимость не меняется. «С месяца» — новый процент с этой даты (пусто — изменить действующий).</p>
+        ${brands.length > 8 ? `<input type="search" class="pr-retro-q" data-retro-q placeholder="Найти бренд…" value="${esc(st.retroQ)}">` : ''}
+        <div class="pr-retro-table" role="table"><div class="pr-retro-row pr-th" role="row"><div>Бренд</div><div class="r">Товаров</div><div class="r">Ретро-бонус, %</div><div>С месяца</div><div>История</div></div>
+        ${shown.map(b => `<div class="pr-retro-row" role="row" data-brand="${esc(b.brand)}"><div><b>${esc(b.brand)}</b></div><div class="r muted">${b.count || '—'}</div>
+          <div><input class="pr-in" data-retro-pct inputmode="decimal" value="${b.current != null ? String(b.current).replace('.', ',') : ''}" placeholder="0" aria-label="Ретро-бонус ${esc(b.brand)}, %"></div>
+          <div><input class="pr-in pr-month" data-retro-from type="month" aria-label="С месяца"></div>
+          <div class="muted pr-retro-hist">${b.rows.map(r => `${pctText(r.pct)} ${monthLabel(r.since)}${r.since && r.since.slice(0, 7) > new Date().toISOString().slice(0, 7) ? ' <span class="pr-future">будет</span>' : ''}`).join('; ') || '—'}</div></div>`).join('')
+          || '<p class="muted pr-retro-empty">Бренды не найдены. Бренды берутся из карточек WB и отчёта ОПиУ.</p>'}</div></div>` : ''}</div>`;
+    box.querySelector('[data-retro-toggle]').onclick = () => { st.retroOpen = !st.retroOpen; drawRetro(); };
+    const qi = box.querySelector('[data-retro-q]');
+    if (qi) qi.oninput = () => { st.retroQ = qi.value; const pos = qi.selectionStart; drawRetro(); const n = root.querySelector('[data-retro-q]'); n.focus(); n.setSelectionRange(pos, pos); };
+    box.querySelectorAll('[data-brand]').forEach(row => {
+      const input = row.querySelector('[data-retro-pct]');
+      const save = async () => {
+        const raw = input.value.trim(), pct = raw === '' ? null : num(raw), from = row.querySelector('[data-retro-from]').value;
+        if (raw !== '' && !(pct >= 0 && pct <= 100)) { input.classList.add('bad'); toast('Ретро-бонус — процент от 0 до 100'); return; }
+        input.classList.remove('bad');
+        try {
+          await api('/api/nomenclature/retro', {method: 'PUT', body: {brand: row.dataset.brand, pct, effective_from: from ? from + '-01' : null}});
+          toast(pct == null ? `Ретро-бонус ${row.dataset.brand} убран` : `Ретро-бонус ${row.dataset.brand}: ${pctText(pct)}${from ? ' ' + monthLabel(from + '-01') : ''}`);
+          st.dirty = true; await load();
+        } catch (e) { toast(e.message); }
+      };
+      input.onchange = save;
+      input.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } };
+    });
+  }
+
   async function refreshCards(e) {
     const b = e.currentTarget; b.disabled = true; b.textContent = 'Загрузка карточек…';
     try { const r = await api('/api/nomenclature/refresh', {method: 'POST'}); toast(`Карточек загружено: ${r.cards}${r.errors.length ? `. Ошибки: ${r.errors.join('; ')}` : ''}`); await load(); }
@@ -238,6 +300,15 @@ window.WBOPSProducts = (() => {
 .pr-hist table{width:100%;font-size:12px;margin-top:6px}.pr-hist th,.pr-hist td{padding:6px 8px;text-transform:none;letter-spacing:0}
 .pr-new p{font-size:12px;margin:4px 0 8px}.pr-new-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.pr-new-grid label{display:grid;gap:4px;font-size:12px;font-weight:600;color:#374151}
 .pr-new-grid input{height:34px;border:1px solid #dfe2e8;border-radius:8px;padding:0 8px;font:inherit;min-width:0}
+.pr-retro{background:#fff;border:1px solid #e7e9ee;border-radius:12px;margin-bottom:12px}
+.pr-retro-head{display:flex;gap:10px;align-items:baseline;width:100%;border:0;background:none;padding:12px 14px;font:inherit;font-size:14px;text-align:left;cursor:pointer;color:#1f2328}
+.pr-retro-head span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.pr-retro-head i{font-style:normal;color:#6b7280}
+.pr-retro-head:focus-visible{outline:3px solid #ede9fe;border-radius:12px}
+.pr-retro-body{padding:0 14px 14px}.pr-retro-body>p{font-size:12px;margin:0 0 10px}.pr-retro-q{width:100%;max-width:320px;height:34px;border:1px solid #dfe2e8;border-radius:8px;padding:0 10px;font:inherit;margin-bottom:8px}
+.pr-retro-table{border:1px solid #eef0f5;border-radius:10px;overflow:hidden;max-height:420px;overflow-y:auto}
+.pr-retro-row{display:grid;grid-template-columns:minmax(140px,1.4fr) 70px 120px 150px minmax(140px,2fr);gap:10px;align-items:center;padding:8px 12px;border-bottom:1px solid #f0f1f5;font-size:13px}
+.pr-retro-row:last-child{border-bottom:0}.pr-retro-row .r{text-align:right}.pr-retro-hist{font-size:12px}.pr-month{text-align:left}.pr-retro-empty{padding:12px;margin:0}
+@media(max-width:760px){.pr-retro-row{grid-template-columns:minmax(0,1fr) 90px 130px}.pr-retro-row>:nth-child(2),.pr-retro-row>:nth-child(5){display:none}}
 .pr-bulk label{display:flex;align-items:center;gap:6px;font-size:13px}.pr-bulk input{width:110px;height:32px;border:0;border-radius:7px;padding:0 8px;font:inherit}.pr-bulk input[type=month]{width:140px}
 @media(max-width:1200px){.pr-row{grid-template-columns:34px minmax(180px,2fr) 80px 80px 110px 100px 90px}.pr-row>:nth-child(4),.pr-row>:nth-child(5){display:none}}
 @media(max-width:760px){.pr-filters{grid-template-columns:1fr}.pr-row{grid-template-columns:30px minmax(0,1fr) 90px 80px}.pr-row>:nth-child(3),.pr-row>:nth-child(8),.pr-row>:nth-child(9){display:none}.pr-detail{grid-template-columns:1fr}.pr-new-grid{grid-template-columns:1fr 1fr}}`;

@@ -277,6 +277,26 @@ class AdsAnalytics:
                 pass
         return out
 
+    def spend(self, start: str, end: str, account: str | None = None) -> dict | None:
+        """Затраты на рекламу для дашборда: {"by_day": {день: ₽ по истории затрат WB}, "by_article": {(день, артикул): ₽
+        по статистике кампаний}}. None — история затрат не загружена или не покрывает начало периода."""
+        where, args = "", []
+        if account:
+            where, args = " AND account=?", [account]
+        with self.store._connect() as c:
+            first = c.execute(f"SELECT MIN(substr(upd_time,1,10)) FROM ads_upd WHERE 1=1{where}", args).fetchone()[0]
+            if not first or first > start:
+                return None
+            # Один продавец под двумя ключами — одно и то же списание не считаем дважды
+            by_day = dict(c.execute("SELECT substr(upd_time,1,10), SUM(amount) FROM (SELECT DISTINCT advert_id, upd_time, upd_num, amount "
+                                    f"FROM ads_upd WHERE substr(upd_time,1,10) BETWEEN ? AND ?{where}) GROUP BY 1", [start, end, *args]).fetchall())
+            stats = c.execute("SELECT s.day, s.nm_id, SUM(s.spend) FROM ads_stats s LEFT JOIN ads_campaigns k ON k.id=s.advert_id "
+                              f"WHERE s.day BETWEEN ? AND ?{where.replace('account', 'k.account')} GROUP BY 1, 2", [start, end, *args]).fetchall()
+        meta, by_article = self._meta(), defaultdict(float)
+        for day, nm, value in stats:
+            by_article[(day, art_key((meta.get(nm) or {}).get("article") or f"nmId {nm}"))] += value or 0
+        return {"by_day": by_day, "by_article": dict(by_article)}
+
     def _campaigns(self) -> dict:
         with self.store._connect() as c:
             rows = c.execute("SELECT account, id, name, status, payment_type, bid_type, placements, created, started, updated, nms, budget FROM ads_campaigns").fetchall()

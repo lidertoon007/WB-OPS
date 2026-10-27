@@ -71,6 +71,42 @@ class NomenclatureTests(unittest.TestCase):
         self.assertEqual(norm_date("01.11.2026"), "2026-11-01")
         self.assertEqual(norm_date("2026-11"), "2026-11-01")
 
+    def test_retro_bonus_by_brand(self):
+        self.assertEqual(self.n.retro_rows(), [])
+        self.n.set_retro("Deemivis", 5)
+        self.n.set_retro(" deemivis ", 7.5, "2099-01")                    # новый процент с даты; бренд — без учёта регистра
+        rows = self.n.retro_rows()
+        self.assertEqual([(r["pct"], r["since"]) for r in rows], [(5.0, ""), (7.5, "2099-01-01")])
+        self.assertEqual(self.n.retro_at(rows), {"DEEMIVIS": 5.0})
+        self.assertEqual(self.n.retro_at(rows, "2099-02-01"), {"DEEMIVIS": 7.5})
+        self.n.set_retro("Deemivis", 6)                                    # без даты — правится действующий
+        self.assertEqual([(r["pct"], r["since"]) for r in self.n.retro_rows()], [(6.0, ""), (7.5, "2099-01-01")])
+        self.n.set_retro("Deemivis", None, "2099-01")                      # убрать будущий
+        self.assertEqual(len(self.n.retro_rows()), 1)
+        self.assertEqual(self.n.items()["retro"][0]["pct"], 6.0)
+        with self.assertRaises(NomenclatureError):
+            self.n.set_retro("Deemivis", 150)
+        text = (self.dir / "retro_bonus.csv").read_text(encoding="utf-8-sig")
+        self.assertTrue(text.startswith("бренд;ретро_бонус_%;действует_с"))
+
+    def test_filled_missing_prices_go_to_cost_csv(self):
+        """Цены, вписанные в cost_missing.csv, видны панели без пересборки ОПиУ."""
+        (self.dir / "cost_missing.csv").write_text(
+            "артикул;кратность;сс_за_ед;подготовка_за_ед;действует_с;бренд;категория;маркетплейс (справочно);продано шт. (справочно)\n"
+            "NEW-1;1;163;10;;;;Wildberries;3465\n"
+            "de-90;1;999;;;;;Wildberries;1\n"          # цену из cost.csv не перетираем
+            "empty;1;;;;;;Wildberries;5\n", encoding="utf-8-sig")
+        rows = {r["артикул"]: r for r in self.n.read_cost_rows()[1]}
+        self.assertEqual((rows["NEW-1"]["сс_за_ед"], rows["NEW-1"]["подготовка_за_ед"]), ("163", "10"))
+        self.assertEqual(rows["NEW-1"]["маркетплейсы (справочно)"], "Wildberries")
+        self.assertEqual(rows["de-90"]["сс_за_ед"], "1091,00")
+        self.assertNotIn("empty", rows)
+        self.assertEqual(self.n.missing_absorbed, 1)
+        self.assertTrue(self.by_key()["NEW-1"]["has_cost"])
+        mtime = (self.dir / "cost.csv").stat().st_mtime_ns
+        self.n.read_cost_rows()                                  # файл не менялся — повторно не переносим
+        self.assertEqual((self.dir / "cost.csv").stat().st_mtime_ns, mtime)
+
 
 if __name__ == "__main__":
     unittest.main()

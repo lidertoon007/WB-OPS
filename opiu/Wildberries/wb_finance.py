@@ -212,9 +212,29 @@ def fetch_reports(client, date_from, date_to, period="weekly"):
         offset += len(batch)
 
 
-def load_account(acc, d_from, d_to, cache_dir, from_cache):
+def closed_weeks(data, d_to):
+    """Из прошлой загрузки — закрытые еженедельные отчёты (WB их больше не меняет) и их строки.
+    Ежедневные отчёты не берём: их WB заменяет недельным, они загружаются заново.
+    Возвращает (rows, reports) или None, если догружать не от чего."""
+    reports = data.get("reports") or []
+    daily_ids = set(data.get("daily_ids") or [])
+    daily = data.get("daily")
+    if not daily_ids and daily:
+        # кэш до появления daily_ids: ежедневные отчёты — однодневные, начиная с первого ежедневного дня
+        daily_ids = {r.get("reportId") for r in reports
+                     if str(r.get("dateFrom"))[:10] == str(r.get("dateTo"))[:10] >= daily[0]}
+    weekly = [r for r in reports if r.get("reportId") not in daily_ids and str(r.get("dateTo") or "")[:10]
+              and str(r.get("dateTo"))[:10] <= d_to.isoformat()]
+    if not weekly:
+        return None
+    ids = {r.get("reportId") for r in weekly}
+    return [r for r in data.get("rows") or [] if r.get("reportId") in ids], weekly
+
+
+def load_account(acc, d_from, d_to, cache_dir, from_cache, reload=False):
     """Строки и список отчётов кабинета: закрытые недели — из еженедельных отчётов WB,
     дни после последней закрытой недели (по вчерашний) — из ежедневных отчётов.
+    Закрытые недели прошлой загрузки берутся из кэша, из API — только новые (reload — загрузить всё заново).
     Возвращает (rows, reports, daily), daily = [первый день, последний день] ежедневных отчётов или None."""
     name = acc.get("name") or "Магазин"
 
@@ -222,9 +242,9 @@ def load_account(acc, d_from, d_to, cache_dir, from_cache):
         print(f"[{name}] {text}", flush=True)
 
     cache_file = cache_dir / f"{safe_name(name)}_{d_from}_{d_to}.json"
+    candidates = sorted(cache_dir.glob(f"{safe_name(name)}_{d_from}_*.json"))
     if from_cache:
         if not cache_file.exists():
-            candidates = sorted(cache_dir.glob(f"{safe_name(name)}_{d_from}_*.json"))
             if not candidates:
                 raise RuntimeError(f"нет кэша {cache_file.name} — запустите без --from-cache")
             cache_file = candidates[-1]
@@ -234,21 +254,47 @@ def load_account(acc, d_from, d_to, cache_dir, from_cache):
         return rows, reports, data.get("daily")
 
     client = WBClient(acc["token"], log)
-    log("загрузка еженедельных отчётов реализации...")
-    rows = fetch_rows(client, d_from, d_to)
-    log("загрузка списка отчётов для сверки...")
-    try:
-        reports = fetch_reports(client, d_from, d_to)
-    except RuntimeError as e:
-        log(f"  список отчётов не получен, сверки не будет: {e}")
-        reports = []
+    base = None
+    if candidates and not reload:
+        prev = cache_file if cache_file.exists() else candidates[-1]
+        try:
+            base = closed_weeks(json.loads(prev.read_text(encoding="utf-8")), d_to)
+        except (OSError, ValueError, KeyError) as e:
+            log(f"кэш {prev.name} не прочитан ({e}), загружаю всё заново")
+    if base:
+        rows, reports = base
+        last = max(str(r.get("dateTo"))[:10] for r in reports)
+        week_from = date.fromisoformat(last) + timedelta(days=1)
+        log(f"из кэша: {len(reports)} закрытых отчётов по {last}, {len(rows)} строк")
+        # Недельный отчёт WB формирует после воскресенья: пока неделя не прошла, спрашивать о нём незачем
+        # (лимит — 1 запрос в минуту)
+        if week_from + timedelta(days=7) <= d_to:
+            known = {r.get("reportId") for r in reports}
+            log(f"догрузка еженедельных отчётов {week_from} — {d_to}...")
+            new_rows = [r for r in fetch_rows(client, week_from, d_to) if r.get("reportId") not in known]
+            try:
+                new_reports = [r for r in fetch_reports(client, week_from, d_to) if r.get("reportId") not in known]
+            except RuntimeError as e:
+                log(f"  список отчётов не получен, сверки новых недель не будет: {e}")
+                new_reports = []
+            log(f"  новых отчётов: {len(new_reports)}, строк: {len(new_rows)}")
+            rows, reports = rows + new_rows, reports + new_reports
+    else:
+        log("загрузка еженедельных отчётов реализации...")
+        rows = fetch_rows(client, d_from, d_to)
+        log("загрузка списка отчётов для сверки...")
+        try:
+            reports = fetch_reports(client, d_from, d_to)
+        except RuntimeError as e:
+            log(f"  список отчётов не получен, сверки не будет: {e}")
+            reports = []
 
     # Еженедельный отчёт WB формирует в понедельник за прошлую неделю. Дни после него есть
     # только в ежедневных отчётах — берём их, чтобы видеть данные по вчерашний день.
     ends = [str(r.get("dateTo") or "")[:10] for r in reports] or [str(r.get("rrDate") or "")[:10] for r in rows]
     ends = [e for e in ends if e]
     weekly_end = date.fromisoformat(max(ends)) if ends else d_from - timedelta(days=1)
-    daily = None
+    daily, daily_ids = None, []
     if weekly_end < d_to:
         day_from = weekly_end + timedelta(days=1)
         log(f"загрузка ежедневных отчётов {day_from} — {d_to} (неделя ещё не закрыта)...")
@@ -261,6 +307,7 @@ def load_account(acc, d_from, d_to, cache_dir, from_cache):
                         and r.get("reportId") not in weekly_ids]
             rows = rows + day_rows
             reports = reports + day_reports
+            daily_ids = [r.get("reportId") for r in day_reports]
             days = sorted(str(r.get("rrDate") or "")[:10] for r in day_rows if r.get("rrDate"))
             if days:
                 daily = [days[0], days[-1]]
@@ -270,8 +317,11 @@ def load_account(acc, d_from, d_to, cache_dir, from_cache):
             log(f"  ежедневные отчёты не получены, данные только по {weekly_end}: {e}")
 
     cache_dir.mkdir(exist_ok=True)
-    cache_file.write_text(json.dumps({"rows": rows, "reports": reports, "daily": daily}, ensure_ascii=False),
-                          encoding="utf-8")
+    # Через временный файл: оборванная запись не испортит кэш, от которого догружается следующий запуск
+    tmp = cache_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"rows": rows, "reports": reports, "daily": daily, "daily_ids": daily_ids},
+                              ensure_ascii=False), encoding="utf-8")
+    tmp.replace(cache_file)
     # Старые выгрузки этого кабинета за тот же период не нужны: новая их полностью заменяет
     for old in cache_dir.glob(f"{safe_name(name)}_{d_from}_*.json"):
         if old != cache_file:
@@ -570,8 +620,9 @@ def split_row(r):
     add("penalty", G_PENALTY, bonus or "Штрафы")
     add("paidStorage", G_STORAGE, "Хранение")
     add("paidAcceptance", G_STORAGE, "Операции на приёмке")
-    add("cashbackAmount", G_ADS, "Баллы программы лояльности")
-    add("cashbackCommissionChange", G_ADS, "Стоимость участия в программе лояльности")
+    # При возврате WB отдаёт удержанные баллы и плату за участие обратно (сверено с bankPaymentSum)
+    add("cashbackAmount", G_ADS, "Баллы программы лояльности", -sign)
+    add("cashbackCommissionChange", G_ADS, "Стоимость участия в программе лояльности", -sign)
 
     deduction = num(r.get("deduction"))
     if deduction:
@@ -981,6 +1032,8 @@ def main():
                     help="Разрез выгрузки: month — по месяцам (по умолчанию), day — по дням")
     ap.add_argument("--from-cache", action="store_true",
                     help="Не обращаться к API, собрать отчёт из данных прошлой загрузки (папка cache)")
+    ap.add_argument("--reload", action="store_true",
+                    help="Загрузить все недели заново (по умолчанию закрытые недели берутся из кэша)")
     args = ap.parse_args()
     global GRAIN
     GRAIN = args.grain
@@ -1027,7 +1080,7 @@ def main():
 
     def load(acc):
         try:
-            result = load_account(acc, d_from, d_to, cache_dir, args.from_cache)
+            result = load_account(acc, d_from, d_to, cache_dir, args.from_cache, args.reload)
         except RuntimeError as e:
             return None, e
         name = acc.get("name") or "Магазин"

@@ -333,8 +333,14 @@ def load_account(acc, client, d_from, d_to, cache_dir, args):
         campaigns = client.campaigns()
         cache_dir.mkdir(parents=True, exist_ok=True)
         campaigns_file.write_text(json.dumps(campaigns, ensure_ascii=False), encoding="utf-8")
+    ids = sorted({(c.get("business") or {}).get("id") for c in campaigns if (c.get("business") or {}).get("id")})
+    if business_id and int(business_id) not in ids:
+        # В кабинетах WB OPS «ID кабинета» может быть ID магазина (кампании), а не бизнеса
+        shop = next((c for c in campaigns if c.get("id") == int(business_id)), None)
+        if shop and (shop.get("business") or {}).get("id"):
+            campaign_ids = campaign_ids or [shop["id"]]
+            business_id = shop["business"]["id"]
     if not business_id:
-        ids = sorted({(c.get("business") or {}).get("id") for c in campaigns if (c.get("business") or {}).get("id")})
         if len(ids) != 1:
             raise RuntimeError(f"укажите business_id в конфиге — ключ видит кабинеты: {ids}")
         business_id = ids[0]

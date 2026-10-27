@@ -295,6 +295,9 @@
     // База знаний — подпункт «Личного кабинета», после «Моя команда»
     const team = nav.querySelector('a[data-nav="team"]'), kb = nav.querySelector('a[data-nav="knowledge"]');
     if (team && kb && !kb.classList.contains('sub')) team.after(sub(kb, 'База знаний'));
+    // Кабинеты маркетплейсов — подпункт «Личного кабинета», после «Учётной записи»
+    const profile = nav.querySelector('a[data-nav="profile"]'), cab = nav.querySelector('a[data-nav="cabinets"]');
+    if (profile && cab && !cab.classList.contains('sub')) profile.after(sub(cab, 'Кабинеты маркетплейсов'));
   }
   const groupKey = t => (t.querySelector('span') || t).textContent.trim();
   const groupSubs = t => { const out = []; let n = t.nextElementSibling; while (n && n.classList.contains('sub')) { out.push(n); n = n.nextElementSibling; } return out; };

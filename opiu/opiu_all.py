@@ -22,6 +22,8 @@
 Запуск (из папки проекта):
   python opiu_all.py                         # обновить данные всех МП и собрать сводный Excel
   python opiu_all.py --from-cache            # без запросов к API — только уже скачанные данные
+  python opiu_all.py --from-cache --fill-missing   # из кэша, а кабинеты без кэша — загрузить из API
+  python opiu_all.py --reload                # WB: загрузить все недели заново, а не только новые к кэшу
   python opiu_all.py --from 2026-01 --to 2026-08
   python opiu_all.py --only wb,ym            # только выбранные маркетплейсы (ozon, wb, ym)
   python opiu_all.py --grain week            # ОПиУ по неделям (пн-вс) за весь период свода
@@ -88,6 +90,9 @@ GROSS = "ВАЛОВАЯ ПРИБЫЛЬ (после себестоимости)"
 PREP = "Подготовка товара"
 TAX = "Налог с выручки"
 PROFIT = "ПРИБЫЛЬ (после себестоимости, подготовки и налога)"
+RETRO = "Ретро-бонусы производителей"
+RETRO_FILE = "retro_bonus.csv"   # ретро-бонусы по брендам: бренд;ретро_бонус_%;действует_с (заполняется в WB OPS)
+RETRO_COL = "ретро_бонус_%"
 
 REVENUE_ARTICLES = [REV_SALES, REV_RETURNS]
 EXPENSE_ARTICLES = [COMMISSION, LOGISTICS, RETURNS, PAYMENTS, ADS, STORAGE, PENALTY, OTHER]
@@ -106,6 +111,7 @@ ARTICLE_DESCRIPTIONS = {
     ADVANCE: "Авансы за услуги и возврат неиспользованного остатка (WB «Баллы за отзывы») — движение денег",
     COGS: "Себестоимость проданных товаров из cost.csv: штук × кратность × себестоимость за единицу; возвраты сторнируются",
     PREP: "Подготовка товара из cost.csv (подготовка_за_ед): штук × кратность × стоимость подготовки за единицу",
+    RETRO: "Ретро-бонусы производителей из retro_bonus.csv: себестоимость проданного × % бренда; возвраты сторнируются",
     TAX: "Налог с выручки: ставка tax_percent × фактическая цена покупки после скидок маркетплейса, за вычетом возвратов",
 }
 
@@ -332,6 +338,61 @@ def cost_for(costs, article, month):
     return chosen
 
 
+def brand_key(value):
+    """Бренд для сопоставления: без лишних пробелов и регистра."""
+    return re.sub(r"\s+", " ", str(value or "")).strip().upper()
+
+
+def read_retro(path):
+    """retro_bonus.csv -> {бренд: [(действует_с, %)]} по возрастанию даты."""
+    out = defaultdict(list)
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8-sig", newline="") as fh:
+        sample = fh.read(4096)
+        fh.seek(0)
+        delimiter = ";" if sample.count(";") >= sample.count(",") else ","
+        for raw in csv.DictReader(fh, delimiter=delimiter):
+            row = {(k or "").strip().lower(): (v or "").strip() for k, v in raw.items()}
+            brand = brand_key(row.get("бренд"))
+            try:
+                pct = float((row.get(RETRO_COL) or "").replace(" ", "").replace(",", "."))
+            except ValueError:
+                continue
+            if brand:
+                out[brand].append((row.get("действует_с", ""), pct))
+    for rows in out.values():
+        rows.sort(key=lambda x: x[0])
+    return dict(out)
+
+
+def retro_for(retro, brand, month):
+    """% ретро-бонуса бренда, действующий в этом месяце (дне): строка с наибольшей датой «действует_с» не позже."""
+    chosen = None
+    for date_from, pct in retro.get(brand_key(brand)) or []:
+        if not date_from or date_from[:7] <= month:
+            chosen = pct
+    return chosen
+
+
+def apply_retro(entities, costs, retro, catalog, months):
+    """(мп, кабинет) -> месяц -> ретро-бонус (доход, «+»): себестоимость проданного × % бренда артикула.
+    Возвраты уменьшают бонус так же, как себестоимость; без себестоимости бонуса нет."""
+    out = defaultdict(lambda: defaultdict(float))
+    if not retro:
+        return out
+    for e in entities:
+        for mon, article, qty, _revenue in e.get("sales", []):
+            if mon not in months:
+                continue
+            pct = retro_for(retro, (catalog.get(art_key(article)) or ("", ""))[0], mon)
+            found = cost_for(costs, article, mon) if pct else None
+            if found:
+                mult, cost = found
+                out[(e["mp"], e["cabinet"])][mon] += qty * mult * cost * pct / 100.0
+    return out
+
+
 def apply_costs(entities, costs, preps, months):
     """Себестоимость и подготовка по месяцам, строки листа «Товары» и артикулы без цены."""
     cogs = defaultdict(lambda: defaultdict(float))         # (мп, кабинет) -> месяц -> себестоимость (минус)
@@ -451,14 +512,14 @@ def apply_tax(entities, rates, months):
 NO_ARTICLE = "Без артикула"
 QTY_SOLD, QTY_RETURNED = "Продано, шт", "Возвращено, шт"
 SECTIONS = {REV_SALES: "Выручка", REV_RETURNS: "Выручка", COMP: "Компенсации", ADVANCE: "Авансы",
-            COGS: "Себестоимость", PREP: "Подготовка", TAX: "Налог",
+            COGS: "Себестоимость", RETRO: "Ретро-бонусы", PREP: "Подготовка", TAX: "Налог",
             QTY_SOLD: "Количество", QTY_RETURNED: "Количество",
             **{a: "Расходы МП" for a in EXPENSE_ARTICLES}}
 REGISTRY_HEADER = ["Маркетплейс", "Кабинет", "Месяц", "Артикул", "Название", "Раздел", "Статья",
                    "Исходная строка отчёта МП", "Отнесение", "Сумма, ₽", "Кол-во, шт"]
 
 
-def unit_registry(entities, costs, preps, rates, months, names):
+def unit_registry(entities, costs, preps, rates, months, names, retro=None, catalog=None):
     """Строки реестра юнит-экономики: МП × кабинет × месяц × артикул × статья × исходная строка.
     Сумма: доходы «+», расходы «−»; по кабинету сумма реестра = прибыль в ОПиУ."""
     rows = []
@@ -510,6 +571,11 @@ def unit_registry(entities, costs, preps, rates, months, names):
                 if found:
                     mult, price = found
                     add(e, mon, article, statya, label, -q * mult * price)
+            pct = retro_for(retro, (catalog or {}).get(art_key(article), ("", ""))[0], mon) if retro else None
+            found = cost_for(costs, article, mon) if pct else None
+            if found:
+                mult, price = found
+                add(e, mon, article, RETRO, f"{RETRO_FILE}: {pct:g}% бренда от себестоимости", q * mult * price * pct / 100.0)
     rows.sort(key=lambda r: (r[0], r[1], r[2], r[3] == NO_ARTICLE, r[3]))
     return rows
 
@@ -728,16 +794,23 @@ ERROR_LINE = re.compile(r"ОШИБКА|не получен|не удалось|�
 CABINET_LINE = re.compile(r"^\s*\[([^\]]+)\]")
 
 
-def script_cmd(mp, dump, from_cache, grain="month", to_current=None):
+RELOAD = False   # --reload: WB загружает все недели заново, а не только недостающие
+
+
+def script_cmd(mp, dump, from_cache, grain="month", to_current=None, config=None):
     """Команда запуска скрипта маркетплейса. to_current — загрузка до текущего месяца (по умолчанию — когда
     данные берутся из API); кэш скриптов привязан к периоду загрузки, поэтому повторный запуск из кэша
     должен получить тот же --to, что и запуск, который этот кэш записал."""
     script = HERE / mp["script"]
     cmd = [sys.executable, str(script), "--dump", str(dump), "--no-excel"]
+    if config:
+        cmd += ["--config", str(config)]
     if grain != "month":
         cmd += ["--grain", "day"]   # недели и дни свод собирает из дневной выгрузки
     if from_cache:
         cmd.append("--from-cache")
+    elif RELOAD and mp["key"] == "wb":
+        cmd.append("--reload")   # WB по умолчанию догружает только новые недели к кэшу
     if to_current is None:
         # WB OPS: и из кэша тоже до текущего месяца. Иначе при period.to в конфиге раньше текущего месяца
         # «Собрать из кэша» отрезал последние месяцы (строки есть в кэше, но «вне периода»). Кэш с другой
@@ -749,10 +822,10 @@ def script_cmd(mp, dump, from_cache, grain="month", to_current=None):
     return cmd
 
 
-def run_script(mp, dump, from_cache, grain="month"):
+def run_script(mp, dump, from_cache, grain="month", config=None):
     """Запускает скрипт маркетплейса, показывает его вывод и собирает строки с ошибками."""
     script = HERE / mp["script"]
-    cmd = script_cmd(mp, dump, from_cache, grain)
+    cmd = script_cmd(mp, dump, from_cache, grain, config=config)
     print(f"\n========== {mp['name']}{' (из кэша)' if from_cache else ''} ==========\n"
           f"> {' '.join(Path(c).name if i < 2 else c for i, c in enumerate(cmd))}", flush=True)
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
@@ -777,6 +850,31 @@ def run_script(mp, dump, from_cache, grain="month"):
     return data, proc.returncode, errors
 
 
+def merge_cabinets(data, extra, mark):
+    """Добавляет в выгрузку data кабинеты из extra, которых в ней нет; помечает их на листе «Контроль».
+    Возвращает (выгрузка, список добавленных кабинетов)."""
+    added = []
+    for cab, c in ((extra or {}).get("cabinets") or {}).items():
+        if data and cab in data["cabinets"]:
+            continue
+        c["checks"] = [[mark, "да"]] + (c.get("checks") or [])
+        if data is None:
+            data = {**extra, "cabinets": {}}
+        else:
+            data["months"] = sorted(set(data["months"]) | set(extra["months"]))
+        data["cabinets"][cab] = c
+        added.append(cab)
+    return data, added
+
+
+def missing_config(mp, names):
+    """Конфиг маркетплейса только с перечисленными кабинетами (период и ставка налога — как в исходном)."""
+    cfg = json.loads((HERE / mp["config"]).read_text(encoding="utf-8"))
+    cfg["accounts"] = [a for a in cfg.get("accounts") or []
+                       if a.get("enabled", True) and str(a.get("name") or a.get("client_id") or "") in names]
+    return cfg
+
+
 def run_marketplace(mp, args, tmpdir):
     """(данные, пометка для «Контроля», строки ошибок из вывода скрипта)."""
     if not (HERE / mp["script"]).exists():
@@ -797,19 +895,27 @@ def run_marketplace(mp, args, tmpdir):
               "недостающие беру из кэша", flush=True)
         cached, _, cache_errors = run_script(mp, Path(tmpdir) / f"{mp['key']}_cache.json", True, args.grain)
         errors += [f"(кэш) {e}" for e in cache_errors]
-        restored = []
-        for cab, c in ((cached or {}).get("cabinets") or {}).items():
-            if data and cab in data["cabinets"]:
-                continue
-            c["checks"] = [["Данные из кэша: API не ответил при обновлении", "да"]] + (c.get("checks") or [])
-            if data is None:
-                data = {**cached, "cabinets": {}}
-            else:
-                data["months"] = sorted(set(data["months"]) | set(cached["months"]))
-            data["cabinets"][cab] = c
-            restored.append(cab)
+        data, restored = merge_cabinets(data, cached, "Данные из кэша: API не ответил при обновлении")
         if restored:
             notes.insert(0, "API не ответил, из кэша: " + ", ".join(restored))
+    elif from_cache and args.fill_missing:
+        missing = [a for a in accounts if a and a not in ((data or {}).get("cabinets") or {})]
+        if missing:
+            # Кэша по кабинету нет (новый кабинет, первая сборка на этом компьютере) — загружаем его из API.
+            # Скрипту отдаём копию конфига только с этими кабинетами: кэш остальных не трогаем.
+            print(f"\n  {mp['name']}: нет в кэше кабинетов {len(missing)} из {len(accounts)} — "
+                  "загружаю из API: " + ", ".join(missing), flush=True)
+            config = Path(tmpdir) / f"{mp['key']}_missing.json"
+            config.write_text(json.dumps(missing_config(mp, missing), ensure_ascii=False), encoding="utf-8")
+            fresh, _, fresh_errors = run_script(mp, Path(tmpdir) / f"{mp['key']}_api.json", False, args.grain,
+                                                config=config)
+            data, loaded = merge_cabinets(data, fresh, "Данные из API: кабинета не было в кэше")
+            # Ошибки «нет кэша» по догруженным кабинетам больше не актуальны
+            errors = [e for e in errors if not any(cab in e for cab in loaded)] + [f"(API) {e}" for e in fresh_errors]
+            if loaded:
+                notes.insert(0, "не было в кэше, загружено из API: " + ", ".join(loaded))
+                if code != 0 and not [a for a in accounts if a and a not in data["cabinets"]]:
+                    notes = [n for n in notes if not n.startswith("скрипт завершился")]
     lost = [a for a in accounts if a and a not in ((data or {}).get("cabinets") or {})]
     if data is None:
         notes.append("нет данных (подробности в выводе выше)")
@@ -878,7 +984,7 @@ def article_totals(table, months):
 # ---------------------------------------------------------------------------
 FORECAST_WINDOW = {"month": 14, "week": 7}   # темп считается не меньше чем за столько последних дней
 FORECAST_DAYS_BACK = 45                       # сколько дней дневной выгрузки хранить для прогноза
-FORECAST_KEYS = ("revenue", "net", "cogs", "prep", "tax")
+FORECAST_KEYS = ("revenue", "net", "cogs", "retro", "prep", "tax")
 
 
 def day_slice(data, first_day):
@@ -920,13 +1026,14 @@ def load_daily_dumps(args, first_day):
     return dumps
 
 
-def forecast_series(day_dumps, costs, preps, rates):
+def forecast_series(day_dumps, costs, preps, rates, retro=None, catalog=None):
     """(мп, кабинет) -> {показатель: {день: сумма}, "last": последний день с данными маркетплейса}.
     Себестоимость, подготовка и налог считаются по дням теми же функциями, что и в ОПиУ.
     Последний день — по всем кабинетам МП: у маленького кабинета день без продаж — это ноль, а не нет данных."""
     entities, _ = build(day_dumps)
     days = sorted({d for data in day_dumps for d in data["months"]})
     cogs, prep = apply_costs(entities, costs, preps, set(days))[:2]
+    bonus = apply_retro(entities, costs, retro or {}, catalog or {}, set(days))
     tax = apply_tax(entities, rates, set(days))[0]
     series, last = {}, {}
     for e in entities:
@@ -937,7 +1044,8 @@ def forecast_series(day_dumps, costs, preps, rates):
             last[e["mp"]] = max(last.get(e["mp"], ""), max(seen))
         series[key] = {"revenue": sum_vals([tot[a] for a in REVENUE_ARTICLES], days),
                        "net": sum_vals(list(tot.values()), days),
-                       "cogs": dict(cogs.get(key, {})), "prep": dict(prep.get(key, {})), "tax": dict(tax.get(key, {}))}
+                       "cogs": dict(cogs.get(key, {})), "retro": dict(bonus.get(key, {})),
+                       "prep": dict(prep.get(key, {})), "tax": dict(tax.get(key, {}))}
     for (mp, _cab), s in series.items():
         s["last"] = date.fromisoformat(last[mp]) if mp in last else None
     return series
@@ -975,7 +1083,7 @@ def period_forecast(series, keys, start, end, window):
                 cutoffs[cutoff].append(key[0])
     if not cutoffs:
         return None
-    vals["gross"] = vals["net"] + vals["cogs"]
+    vals["gross"] = vals["net"] + vals["cogs"] + vals["retro"]
     vals["profit"] = vals["gross"] + vals["prep"] + vals["tax"]
     vals["margin"] = vals["profit"] / vals["revenue"] if vals["revenue"] else 0.0
     unit = "месяца" if window == FORECAST_WINDOW["month"] else "недели"
@@ -1205,7 +1313,7 @@ def sum_vals(list_of_vals, months):
 
 
 def write_pnl(ws, table, months, title, subtitle="", info=None, detail_order=None, cogs=None, prep=None, tax=None,
-              forecast=None):
+              forecast=None, retro=None):
     """ОПиУ в единых статьях. table: {статья: {строка: {месяц: сумма}}}.
     forecast — прогноз на конец последнего периода (period_forecast): отдельная колонка справа."""
     sh = Sheet(ws, months, title, subtitle, forecast)
@@ -1256,7 +1364,10 @@ def write_pnl(ws, table, months, title, subtitle="", info=None, detail_order=Non
     if cogs:
         sh.line(COGS, cogs, indent=1, font=BOLD, fill=F_ARTICLE)
         sh.forecast(fc.get("cogs"))
-        gross = sum_vals([net, cogs], months)
+        if retro:
+            sh.line(RETRO, retro, indent=1, font=BOLD, fill=F_ARTICLE)
+            sh.forecast(fc.get("retro"))
+        gross = sum_vals([net, cogs, retro or {}], months)
         sh.line(GROSS, gross, fill=F_RESULT, font=Font(bold=True, size=12))
         sh.forecast(fc.get("gross"))
         sh.blank()
@@ -1279,17 +1390,17 @@ def write_pnl(ws, table, months, title, subtitle="", info=None, detail_order=Non
     share_lines = [("Все расходы маркетплейсов", expenses)] + [(a, tot[a]) for a in EXPENSE_ARTICLES if table.get(a)] \
         + [("Результат", net)]
     if cogs:
-        share_lines += [(COGS, cogs), ("Валовая маржа", gross)]
+        share_lines += [(COGS, cogs)] + ([(RETRO, retro)] if retro else []) + [("Валовая маржа", gross)]
     share_lines += [(PREP, prep), (TAX, tax), ("Рентабельность после себестоимости, подготовки и налога", profit)]
     for label, vals in share_lines:
-        sign = 1 if label in ("Результат", "Валовая маржа",
+        sign = 1 if label in ("Результат", "Валовая маржа", RETRO,
                               "Рентабельность после себестоимости, подготовки и налога") else -1
         ratio = {m: (sign * vals.get(m, 0.0) / revenue[m] if revenue.get(m) else 0.0) for m in months}
         total_ratio = sign * sum(vals.values()) / sh.revenue_total if sh.revenue_total else 0.0
         sh.line(label, ratio, indent=1 if label in ("Все расходы маркетплейсов", "Результат", "Валовая маржа",
                 "Рентабельность после себестоимости, подготовки и налога") else 2,
                 pct=False, fmt=PCT, total=total_ratio)
-        fc_key = {"Результат": "net", COGS: "cogs", "Валовая маржа": "gross", PREP: "prep", TAX: "tax",
+        fc_key = {"Результат": "net", COGS: "cogs", RETRO: "retro", "Валовая маржа": "gross", PREP: "prep", TAX: "tax",
                   "Рентабельность после себестоимости, подготовки и налога": "profit"}.get(label)
         if fc_key:
             sh.forecast(fc_share(fc_key, sign), PCT)
@@ -1303,7 +1414,7 @@ def write_pnl(ws, table, months, title, subtitle="", info=None, detail_order=Non
     return net
 
 
-def write_comparison(ws, per_mp, months, cogs_by_mp=None, prep_by_mp=None, tax_by_mp=None):
+def write_comparison(ws, per_mp, months, cogs_by_mp=None, prep_by_mp=None, tax_by_mp=None, retro_by_mp=None):
     """Статьи за период: сумма и % выручки по каждому маркетплейсу и всего."""
     names = list(per_mp) + ["Все маркетплейсы"]
     all_table = merge_tables([per_mp[n] for n in per_mp])
@@ -1336,8 +1447,11 @@ def write_comparison(ws, per_mp, months, cogs_by_mp=None, prep_by_mp=None, tax_b
     if cogs_by_mp:
         cogs_vals = [sum(cogs_by_mp.get(n, {}).values()) for n in names[:-1]]
         cogs_vals.append(sum(cogs_vals))
-        gross = [net[i] + cogs_vals[i] for i in range(len(tables))]
-        lines += [(COGS, cogs_vals, None), (GROSS, gross, F_RESULT)]
+        retro_vals = [sum((retro_by_mp or {}).get(n, {}).values()) for n in names[:-1]]
+        retro_vals.append(sum(retro_vals))
+        gross = [net[i] + cogs_vals[i] + retro_vals[i] for i in range(len(tables))]
+        lines += ([(COGS, cogs_vals, None)] + ([(RETRO, retro_vals, None)] if any(retro_vals) else [])
+                  + [(GROSS, gross, F_RESULT)])
         result = gross
     extra = []
     for title, source in ((PREP, prep_by_mp), (TAX, tax_by_mp)):
@@ -1567,7 +1681,7 @@ UNIT_HEADER = [
     ("Реклама", 12, NUM), ("Хранение", 12, NUM), ("Штрафы", 11, NUM), ("Прочие услуги", 11, NUM),
     ("Расходы МП итого, ₽", 14, NUM), ("Расходы МП, % выручки", 11, PCT),
     ("Компенсации", 12, NUM), ("Авансы", 10, NUM), ("К перечислению от МП, ₽", 14, NUM),
-    ("Себестоимость", 14, NUM), ("Подготовка", 12, NUM), ("Налог", 12, NUM),
+    ("Себестоимость", 14, NUM), ("Ретро-бонус", 12, NUM), ("Подготовка", 12, NUM), ("Налог", 12, NUM),
     ("Прибыль, ₽", 14, NUM), ("Маржа, % выручки", 10, PCT),
     ("Цена за 1 шт", 11, NUM), ("Расходы МП на 1 шт", 11, NUM), ("Себестоимость на 1 шт", 12, NUM),
     ("Прибыль на 1 шт", 11, NUM),
@@ -1606,7 +1720,8 @@ def unit_values(agg):
     mp_total = sum(expenses)
     payout = revenue + mp_total + agg.get(COMP, 0.0) + agg.get(ADVANCE, 0.0)
     cogs, prep, tax = agg.get(COGS, 0.0), agg.get(PREP, 0.0), agg.get(TAX, 0.0)
-    profit = payout + cogs + prep + tax
+    retro = agg.get(RETRO, 0.0)
+    profit = payout + cogs + retro + prep + tax
 
     def per(v):
         return round(v / net_qty, 2) if net_qty > 0 else None
@@ -1636,7 +1751,8 @@ def unit_values(agg):
     money = ([round(sold, 2), round(-returned, 2), round(net_qty, 2), round(sales, 2), round(returns, 2),
               round(revenue, 2)] + [round(v, 2) for v in expenses] +
              [round(mp_total, 2), -mp_total / revenue if revenue else None, round(agg.get(COMP, 0.0), 2),
-              round(agg.get(ADVANCE, 0.0), 2), round(payout, 2), round(cogs, 2), round(prep, 2), round(tax, 2),
+              round(agg.get(ADVANCE, 0.0), 2), round(payout, 2), round(cogs, 2), round(retro, 2), round(prep, 2),
+              round(tax, 2),
               round(profit, 2), profit / revenue if revenue else None,
               per(revenue), per(mp_total), per(cogs), per(profit)])
     out = dict(zip(UNIT_MONEY, money))
@@ -2271,6 +2387,8 @@ def main():
                     help=f"Первый месяц свода, ГГГГ-ММ (по умолчанию {DEFAULT_FROM})")
     ap.add_argument("--to", dest="date_to", help="Последний месяц свода, ГГГГ-ММ (по умолчанию — последний с данными)")
     ap.add_argument("--from-cache", action="store_true", help="Не обращаться к API — только скачанные данные")
+    ap.add_argument("--fill-missing", action="store_true",
+                    help="Вместе с --from-cache: кабинеты, которых нет в кэше, загрузить из API")
     ap.add_argument("--only", help="Через запятую: ozon, wb, ym")
     ap.add_argument("--cache-for", help="Для этих маркетплейсов взять данные только из кэша (через запятую: ozon, wb, ym), "
                                         "остальные обновить из API — например, --cache-for ozon при включённом VPN")
@@ -2289,7 +2407,12 @@ def main():
                          "неделя × маркетплейс × кабинет × артикул, колонки Год, Месяц, Неделя")
     ap.add_argument("--unit-month", help="Месяц юнит-экономики ГГГГ-ММ (по умолчанию — весь период свода; "
                                          "«0» или «все» — тоже весь период)")
+    ap.add_argument("--reload", action="store_true",
+                    help="WB: загрузить все недели заново (по умолчанию закрытые недели берутся из кэша, "
+                         "из API — только новые)")
     args = ap.parse_args()
+    global RELOAD
+    RELOAD = args.reload
     if args.only_unit and args.no_unit:
         sys.exit("\n--only-unit и --no-unit вместе не имеют смысла: собирать будет нечего.")
     if args.only_unit and args.grain != "month":
@@ -2375,6 +2498,8 @@ def main():
 
     cogs_map, prep_map, goods, missing_costs, missing_prep, covered = apply_costs(
         entities, costs, preps, set(months))
+    retro = read_retro(HERE / RETRO_FILE)
+    retro_map = apply_retro(entities, costs, retro, catalog, set(months))
     rates = tax_rates(MARKETPLACES)
 
     # Прогноз на конец текущего месяца (недели) — если последний период отчёта ещё не закончился
@@ -2391,7 +2516,7 @@ def main():
             start = date.fromisoformat(months[-1])
             fc_args = (start, start + timedelta(days=6), FORECAST_WINDOW["week"])
         if fc_args and day_dumps:
-            fc_series = forecast_series(day_dumps, costs, preps, rates)
+            fc_series = forecast_series(day_dumps, costs, preps, rates, retro, catalog)
 
     def forecast_for(keys):
         return period_forecast(fc_series, keys, *fc_args) if fc_series else None
@@ -2405,6 +2530,9 @@ def main():
         print(f"Подготовка товара: {len(preps)} артикулов в {COST_FILE}")
     elif costs:
         print(f"В {COST_FILE} не заполнена колонка {PREP_COL} — статья «Подготовка товара» пустая")
+    if retro:
+        total = sum(v for vals in retro_map.values() for v in vals.values())
+        print(f"Ретро-бонусы: {len(retro)} брендов в {RETRO_FILE}, за период " + f"{total:,.0f} ₽".replace(",", " "))
     if tax_used:
         print("Налог с фактической цены покупки: " + ", ".join(f"{mp} / {cab} — {rate:g}%" for (mp, cab), rate in tax_used.items()))
     else:
@@ -2452,6 +2580,8 @@ def main():
     cogs_by_mp = {mp: sum_by(cogs_map, [(mp, e["cabinet"]) for e in ents]) for mp, ents in by_mp.items()}
     prep_by_mp = {mp: sum_by(prep_map, [(mp, e["cabinet"]) for e in ents]) for mp, ents in by_mp.items()}
     tax_by_mp = {mp: sum_by(tax_map, [(mp, e["cabinet"]) for e in ents]) for mp, ents in by_mp.items()}
+    retro_by_mp = {mp: sum_by(retro_map, [(mp, e["cabinet"]) for e in ents]) for mp, ents in by_mp.items()}
+    retro_all = sum_by(retro_map, list(retro_map)) or None
     cogs_all = cogs_for(list(cogs_map))
     prep_all = sum_by(prep_map, list(prep_map)) or None
     tax_all = sum_by(tax_map, list(tax_map)) or None
@@ -2479,9 +2609,9 @@ def main():
     write_pnl(ws, summary, months, f"ОПиУ маркетплейсов — свод{grain_txt}",
               f"{period}. Кабинеты — {cabinets_txt}.{cogs_note}",
               detail_order=lambda rows: [n for n in mp_names if n in rows], cogs=cogs_all,
-              prep=prep_all, tax=tax_all, forecast=summary_fc)
+              prep=prep_all, tax=tax_all, forecast=summary_fc, retro=retro_all)
     write_comparison(wb.create_sheet(safe_name("Сравнение МП", used)), per_mp, months, cogs_by_mp,
-                     prep_by_mp, tax_by_mp)
+                     prep_by_mp, tax_by_mp, retro_by_mp)
 
     unified_net = {}
     for mp in mp_names:
@@ -2491,7 +2621,8 @@ def main():
         net = write_pnl(wb.create_sheet(safe_name(mp, used)), per_mp[mp], months, f"ОПиУ {title}{grain_txt}",
                         f"{period}. Строки — исходные статьи отчёта маркетплейса", info=per_mp_info[mp],
                         cogs=cogs_by_mp.get(mp) or None, prep=prep_by_mp.get(mp) or None,
-                        tax=tax_by_mp.get(mp) or None, forecast=forecast_for([(mp, e["cabinet"]) for e in ents]))
+                        tax=tax_by_mp.get(mp) or None, forecast=forecast_for([(mp, e["cabinet"]) for e in ents]),
+                        retro=retro_by_mp.get(mp) or None)
         if len(ents) == 1:
             unified_net[(mp, ents[0]["cabinet"])] = net
         else:
@@ -2502,7 +2633,7 @@ def main():
                     f"{period}. Строки — исходные статьи отчёта маркетплейса",
                     info=e["info"], cogs=cogs_map.get((mp, e["cabinet"])) or None,
                     prep=prep_map.get((mp, e["cabinet"])) or None, tax=tax_map.get((mp, e["cabinet"])) or None,
-                    forecast=forecast_for([(mp, e["cabinet"])]))
+                    forecast=forecast_for([(mp, e["cabinet"])]), retro=retro_map.get((mp, e["cabinet"])) or None)
     net_by_month = dict(unified_net)   # (МП, кабинет) -> {месяц: итог} — для юнит-экономики за выбранный месяц
     unified_net = {k: sum(v.values()) for k, v in unified_net.items()}
 
@@ -2583,12 +2714,13 @@ def main():
     elif not args.no_unit:
         step(f"Юнит-экономика по артикулам ({month_title(unit_months[0])}"
              + (f" — {month_title(unit_months[-1])}" if len(unit_months) > 1 else "") + "): реестр")
-        rows = unit_registry(entities, costs, preps, rates, set(unit_months), cost_names)
+        rows = unit_registry(entities, costs, preps, rates, set(unit_months), cost_names, retro, catalog)
         expected = {}
         for e in entities:
             key = (e["mp"], e["cabinet"])
             expected[key] = sum(v for m, v in net_by_month.get(key, {}).items() if m in unit_months) + sum(
-                v for src in (cogs_map, prep_map, tax_map) for m, v in src.get(key, {}).items() if m in unit_months)
+                v for src in (cogs_map, retro_map, prep_map, tax_map) for m, v in src.get(key, {}).items()
+                if m in unit_months)
         unit_period = (month_title(unit_months[0]) if len(unit_months) == 1
                        else f"{month_title(unit_months[0])} — {month_title(unit_months[-1])}")
         if GRAIN == "unitweek":
@@ -2614,9 +2746,11 @@ def main():
         cogs_sum = sum(cogs_map.get((e["mp"], e["cabinet"]), {}).values())
         prep_sum = sum(prep_map.get((e["mp"], e["cabinet"]), {}).values())
         tax_sum = sum(tax_map.get((e["mp"], e["cabinet"]), {}).values())
+        retro_sum = sum(retro_map.get((e["mp"], e["cabinet"]), {}).values())
         print(f"  {e['mp']} / {e['cabinet']}: итог {own:,.0f} ₽, себестоимость {-cogs_sum:,.0f} ₽, "
-              f"подготовка {-prep_sum:,.0f} ₽, налог {-tax_sum:,.0f} ₽, "
-              f"прибыль {own + cogs_sum + prep_sum + tax_sum:,.0f} ₽ (расхождение с отчётом МП {diff:,.2f} ₽)")
+              + (f"ретро-бонусы {retro_sum:,.0f} ₽, " if retro_sum else "")
+              + f"подготовка {-prep_sum:,.0f} ₽, налог {-tax_sum:,.0f} ₽, "
+              f"прибыль {own + cogs_sum + retro_sum + prep_sum + tax_sum:,.0f} ₽ (расхождение с отчётом МП {diff:,.2f} ₽)")
     if uncovered:
         print("  Себестоимость не по всем товарам: " + "; ".join(uncovered))
     if summary_fc:

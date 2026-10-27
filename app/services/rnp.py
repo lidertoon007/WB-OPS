@@ -18,7 +18,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
-from app.services.nomenclature import COST_COL, PREP_COL, art_key, num
+from app.services.nomenclature import COST_COL, PREP_COL, art_key, brand_key, num
 
 ORDERS_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
 ADV_COUNT_URL = "https://advert-api.wildberries.ru/adv/v1/promotion/count"
@@ -45,11 +45,13 @@ class _Limiter:
 
 
 class RNP:
-    def __init__(self, store, tokens, economics, cost_rows):
+    def __init__(self, store, tokens, economics, cost_rows, retro_rows=lambda: []):
         self.store = store
         self.tokens = tokens            # callable -> [(название кабинета, токен[, токен рекламы])]
         self.economics = economics      # callable -> данные дашборда (дневная выгрузка ОПиУ) или None
         self.cost_rows = cost_rows      # callable -> строки cost.csv
+        self.retro_rows = retro_rows    # callable -> ретро-бонусы производителей [{brand, pct, since}]
+        self._manual_brands = {}        # артикул -> бренд из cost.csv (как в ОПиУ — приоритетнее данных WB)
         self.state = {"status": "idle", "message": "", "at": None, "errors": []}
         self._lock = threading.Lock()
         self.limiter = _Limiter()
@@ -227,6 +229,8 @@ class RNP:
             for day, arts in cab["days"].items():
                 if s <= day <= e:
                     for art, m in arts.items():
+                        # «ads_promo» — удержание «WB Продвижение»: дашборд выделяет его отдельно, здесь это та же реклама
+                        m = {**m, "ads": m.get("ads", 0) + m.get("ads_promo", 0)}
                         for k in ("revenue_sales", "revenue_returns", "commission", "acquiring", "logistics", "storage", "net_qty", "orders_qty", "paid", "ads"):
                             per[art][k] += m.get(k, 0)
                             total[k] += m.get(k, 0)
@@ -255,13 +259,33 @@ class RNP:
 
     def _costs(self):
         out = defaultdict(list)
+        self._manual_brands = {}
         for r in self.cost_rows():
             key = art_key(r.get("артикул"))
             if key:
                 out[key].append((r.get("действует_с", ""), num(r.get("кратность")) or 1.0, num(r.get(COST_COL)), num(r.get(PREP_COL)) or 0.0))
+                if r.get("бренд"):
+                    self._manual_brands[key] = r["бренд"]
         for v in out.values():
             v.sort(key=lambda x: x[0])
         return out
+
+    def _retro(self) -> dict:
+        """{бренд: [(действует_с, %)]} — ретро-бонусы производителей по возрастанию даты."""
+        out = defaultdict(list)
+        for r in self.retro_rows() or []:
+            out[brand_key(r["brand"])].append((r.get("since") or "", r["pct"]))
+        for v in out.values():
+            v.sort(key=lambda x: x[0])
+        return out
+
+    @staticmethod
+    def _retro_at(rows, day):
+        chosen = None
+        for since, pct in rows or []:
+            if not since or since[:7] <= day[:7]:
+                chosen = pct
+        return chosen
 
     @staticmethod
     def _cost_at(rows, day):
@@ -319,8 +343,9 @@ class RNP:
                         x["finished_sum"] += m.get("orders_sum", 0)
                         x["cancels"] += m.get("cancel_qty", 0)
                         cache_days.add(day)
-                    if not has_ads and m.get("ads"):
-                        out[(day, art)]["ads"] += -m["ads"]
+                    withheld = m.get("ads", 0) + m.get("ads_promo", 0)     # удержания за рекламу из отчёта реализации
+                    if not has_ads and withheld:
+                        out[(day, art)]["ads"] += -withheld
         return {"rows": out, "info": info,
                 "sources": {"orders": "api" if own_days and not cache_days else ("mixed" if own_days else ("cache" if cache_days else "none")),
                             "ads": "api" if has_ads else "report"}}
@@ -352,6 +377,7 @@ class RNP:
         f = self.facts(start, end, d)
         econ = self.unit_economics(d)
         costs = self._costs()
+        retro = self._retro()
         catalog = (d or {}).get("catalog", {})
         stocks, prices, stocks_at = defaultdict(float), {}, None
         for cab in (d or {}).get("cabinets", {}).values():
@@ -396,7 +422,11 @@ class RNP:
                     "prep": sales_qty * price[0] * (price[2] or 0) if price else 0.0,
                     "tax": revenue * (e.get("paid_share") or 1) * econ["tax_rate"] / 100,
                     "no_cost": m["orders"] if (m["orders"] and not has_cost) else 0}
-            calc["profit"] = revenue - calc["commission"] - calc["acquiring"] - calc["logistics"] - m.get("ads", 0) - calc["cogs"] - calc["prep"] - calc["tax"]
+            # Ретро-бонус производителя: % бренда от себестоимости проданного — доход, увеличивает прибыль
+            pct = self._retro_at(retro.get(brand_key(self._manual_brands.get(key) or meta(key)["brand"])), day) if has_cost else None
+            calc["retro"] = calc["cogs"] * pct / 100 if pct else 0.0
+            calc["profit"] = (revenue - calc["commission"] - calc["acquiring"] - calc["logistics"] - m.get("ads", 0) - calc["cogs"]
+                              + calc["retro"] - calc["prep"] - calc["tax"])
             for target in (by_day[day], by_art[key]):
                 for k, v in list(m.items()) + list(calc.items()):
                     target[k] += v

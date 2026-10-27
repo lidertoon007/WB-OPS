@@ -98,7 +98,8 @@ window.WBOPSFinance = (() => {
     root.querySelectorAll('[data-f-update]').forEach(b => b.disabled = running);
     if (st.status === 'idle') { out.hidden = true; return; }
     out.hidden = false;
-    const title = running ? `Собираю отчёт${st.mode === 'full' ? ' с загрузкой данных маркетплейсов' : ' из кэша'}…`
+    const how = {full: ' с догрузкой новых данных маркетплейсов', reload: ' с полной перезагрузкой данных маркетплейсов'};
+    const title = running ? `Собираю отчёт${how[st.mode] || ' из кэша'}…`
       : st.status === 'done' ? 'Отчёт собран.' : `Сборка завершилась с ошибкой (код ${st.code}).`;
     out.innerHTML = `<b>${esc(title)}</b><pre>${esc((st.log || []).slice(-15).join('\n'))}</pre>`;
   }
@@ -114,7 +115,8 @@ window.WBOPSFinance = (() => {
   }
 
   async function startUpdate(mode) {
-    if (mode === 'full' && !confirm('Обновить данные всех маркетплейсов через API? Для Ozon отключите VPN. Это может занять от нескольких минут до часа (Яндекс Маркет).')) return;
+    if (mode === 'full' && !confirm('Обновить данные всех маркетплейсов через API? Для Ozon отключите VPN. Wildberries догрузит только новые недели к уже скачанным; Ozon и Яндекс Маркет загружаются целиком — это может занять до часа.')) return;
+    if (mode === 'reload' && !confirm('Загрузить все данные Wildberries заново за весь период? Нужно, только если в кэше что-то не так: при ~200 тыс. строк это несколько минут с паузами из-за лимита WB.')) return;
     try { const st = await api('/api/finance/update', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode})}); root.dataset.waiting = '1'; showRun(st); poll(); }
     catch (e) { root.querySelector('[data-f-run]').hidden = false; root.querySelector('[data-f-run]').textContent = e.message; }
   }
@@ -139,10 +141,11 @@ window.WBOPSFinance = (() => {
     root = section;
     root.className = 'panel';
     root.innerHTML = `<div class="r-head"><h2>ОПиУ маркетплейсов</h2><div class="toolbar">
-        <button class="btn" data-f-update="cache" title="Без запросов к API — 1–2 минуты">Собрать из кэша</button>
-        <button class="btn secondary" data-f-update="full" title="Загрузить свежие данные всех маркетплейсов">Обновить данные МП</button>
+        <button class="btn" data-f-update="cache" title="Из кэша — 1–2 минуты; кабинеты, которых нет в кэше, загрузятся из API">Собрать из кэша</button>
+        <button class="btn secondary" data-f-update="full" title="Загрузить из API только новые данные: закрытые недели WB берутся из кэша">Обновить данные МП</button>
+        <button class="btn secondary" data-f-update="reload" title="Загрузить все недели WB заново за весь период — если в кэше что-то не так">Полная перезагрузка</button>
         <a class="btn secondary" href="/api/finance/report/download">⇩ Excel</a></div></div>
-      <p class="muted">Расчёт ОПиУ — в папке <b>WB OPS\\opiu</b> (opiu_all.py); здесь — последний собранный отчёт. Налог считается от фактической цены покупки.</p>
+      <p class="muted">Расчёт ОПиУ — в папке <b>WB OPS\\opiu</b> (opiu_all.py); здесь — последний собранный отчёт. Ключи API берутся из кабинетов панели. Налог считается от фактической цены покупки.</p>
       <div data-f-run class="f-run" role="status" aria-live="polite" hidden></div>
       <details class="f-settings"><summary>Настройки источника</summary><form data-f-settings class="r-form">
         <label>Папка проекта ОПиУ<input name="dir" placeholder="Пусто — папка opiu внутри WB OPS"></label>

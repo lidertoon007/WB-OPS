@@ -23,6 +23,7 @@ class Cabinet:
     enabled: bool = True         # выключенный кабинет не загружается и не попадает в РНП
     country: str = "RU"          # страна регистрации продавца
     ads_token: str = ""          # отдельный ключ API для рекламы (если пусто — основной)
+    stats: bool = True           # собирать статистику и продажи: ОПиУ, дашборд, РНП
 
     def public(self) -> dict:
         """Данные для интерфейса — без токена."""
@@ -31,13 +32,15 @@ class Cabinet:
                 "client_id": self.client_id, "token_configured": bool(self.token), "ads_token_configured": bool(self.ads_token),
                 "enabled": self.enabled, "country": self.country, "country_title": COUNTRIES.get(self.country, (self.country,))[0],
                 "currency": COUNTRIES.get(self.country, ("", "", ""))[1], "currency_title": COUNTRIES.get(self.country, ("", "", ""))[2],
-                "reviews": self.reviews, "questions": self.questions, "chats": self.chats, "tax_percent": self.tax_percent,
+                "reviews": self.reviews, "questions": self.questions, "chats": self.chats, "stats": self.stats,
+                "tax_percent": self.tax_percent,
                 "supported": self.marketplace == "wildberries"}
 
     def to_json(self) -> dict:
         return {"id": self.id, "name": self.name, "token": self.token, "marketplace": self.marketplace, "legal_name": self.legal_name,
                 "client_id": self.client_id, "reviews": self.reviews, "questions": self.questions, "chats": self.chats,
-                "tax_percent": self.tax_percent, "enabled": self.enabled, "country": self.country, "ads_token": self.ads_token}
+                "tax_percent": self.tax_percent, "enabled": self.enabled, "country": self.country, "ads_token": self.ads_token,
+                "stats": self.stats}
 
     def with_changes(self, **changes) -> "Cabinet":
         return replace(self, **changes)
@@ -74,7 +77,7 @@ def load_cabinets(raw: str) -> list[Cabinet]:
             reviews=_flag(value.get("reviews"), True), questions=_flag(value.get("questions"), True),
             chats=_flag(value.get("chats"), False), tax_percent=_rate(value.get("tax_percent")),
             enabled=_flag(value.get("enabled"), True), country=str(value.get("country") or "RU").upper()[:2],
-            ads_token=str(value.get("ads_token") or "")))
+            ads_token=str(value.get("ads_token") or ""), stats=_flag(value.get("stats"), True)))
     return cabinets
 
 

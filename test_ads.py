@@ -104,6 +104,19 @@ class AdsTests(unittest.TestCase):
         self.assertEqual(self.fake.calls.count("/adv/v1/promotion/count"), 2)
         self.assertEqual(self.fake.calls.count("/adv/v3/fullstats"), 3)   # 90 дней = 3 запроса; второй кабинет — те же кампании, повторно не грузим
 
+    def test_spend_for_dashboard(self):
+        """Затраты для дашборда: по дням — история затрат WB, по артикулам — статистика кампаний."""
+        self.assertIsNone(self.ads.spend(D1, D2))                          # ничего не загружено
+        self.ads.sync()
+        with self.store._connect() as c:                                   # то же списание под вторым ключом продавца
+            c.execute("INSERT INTO ads_upd VALUES ('МИП', 10, ?, 1, 'Поиск джинсы', 800, 'Баланс')", (D1 + "T10:00:00+03:00",))
+        s = self.ads.spend(D1, D2)
+        self.assertEqual(s["by_day"], {D1: 800.0})
+        self.assertEqual(s["by_article"], {(D1, "3140-D1"): 800.0, (D2, "NMID222"): 1200.0})
+        self.assertEqual(self.ads.spend(D1, D2, "ИП")["by_day"], {D1: 800.0})
+        self.assertIsNone(self.ads.spend(D1, D2, "Другой"))                # у кабинета нет истории затрат
+        self.assertIsNone(self.ads.spend((TODAY - timedelta(days=400)).isoformat(), D2))   # история не покрывает начало периода
+
 
 if __name__ == "__main__":
     unittest.main()

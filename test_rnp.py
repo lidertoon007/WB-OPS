@@ -61,6 +61,17 @@ class RNPTests(unittest.TestCase):
         self.assertEqual((art["article"], art["brand"], art["stock"], art["current_price"]), ("a-1", "Br", 30, 1100))
         self.assertAlmostEqual(art["stock_days"], 7.5)
 
+    def test_retro_bonus_in_forecast(self):
+        """Ретро-бонус бренда (% от себестоимости проданного) увеличивает прогноз прибыли."""
+        base = self.r.table(D(1), D(1))["by_day"][D(1)]
+        retro = [{"brand": "BR", "pct": 10.0, "since": ""}]
+        r = RNP(self.store, lambda: self.tokens, economics, lambda: COSTS, lambda: retro)
+        row = r.table(D(1), D(1))["by_day"][D(1)]
+        self.assertAlmostEqual(row["retro"], 2 * 200 * 0.10)        # 2 проданные шт × себестоимость 200 × 10%
+        self.assertAlmostEqual(row["profit"], base["profit"] + 40, places=2)
+        retro[0]["since"] = (TODAY + timedelta(days=40)).isoformat()   # бонус начнёт действовать позже
+        self.assertAlmostEqual(r.table(D(1), D(1))["by_day"][D(1)]["profit"], base["profit"], places=2)
+
     def test_sync_orders_and_ads(self):
         calls = []
 

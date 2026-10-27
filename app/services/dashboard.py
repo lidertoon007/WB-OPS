@@ -17,7 +17,7 @@ from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
 
-from app.services.nomenclature import COST_COL, PREP_COL, art_key, num
+from app.services.nomenclature import COST_COL, PREP_COL, art_key, brand_key, num
 
 DUMP_NAME = "_wbops_dashboard_day.json"
 REVENUE, COMMISSION, ACQUIRING = "Выручка", "Вознаграждение Wildberries", "Эквайринг"
@@ -25,19 +25,29 @@ LOGISTICS, ADS, STORAGE_GROUP = "Логистика", "Реклама и про�
 PENALTY, OTHER, COMPENSATION, ADVANCE, INFO = "Штрафы", "Прочие удержания", "Компенсации и доплаты", "Авансы за услуги WB и их возврат", "Справочно"
 
 
+PROMOTION_LABEL = "WB Продвижение"      # «Оказание услуг «WB Продвижение»» в отчёте реализации
+FUNNEL_URL ="https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products"
+FUNNEL_TIMEOUT = 30
+FUNNEL_TTL, FUNNEL_TTL_CLOSED = 3600, 24 * 3600
+
+
 class DashboardError(Exception):
     pass
 
 
 class Dashboard:
-    def __init__(self, project_dir, python_path, cost_rows):
+    def __init__(self, project_dir, python_path, cost_rows, ad_spend=lambda start, end, cabinet: None, retro_rows=lambda: []):
         self.project_dir = project_dir      # callable -> папка opiu
         self.python_path = python_path      # callable -> python для скриптов ОПиУ
         self.cost_rows = cost_rows          # callable -> строки cost.csv
+        self.retro_rows = retro_rows        # callable -> ретро-бонусы по брендам [{brand, pct, since}] (Nomenclature.retro_rows)
+        self.ad_spend = ad_spend            # callable -> затраты рекламного кабинета (AdsAnalytics.spend) или None
         self.state = {"status": "idle", "message": "", "started_at": None, "finished_at": None}
         self._lock = threading.Lock()
         self._data = None
         self._data_key = None
+        self._manual_brands: dict = {}      # артикул -> бренд из cost.csv (как в ОПиУ — приоритетнее данных WB)
+        self._funnel_cache: dict = {}       # (кабинет, начало, конец) -> (время загрузки, воронка)
 
     # ------------------------------------------------------------------ выгрузка
     def wb_dir(self) -> Path:
@@ -141,6 +151,7 @@ class Dashboard:
         d["last_day"] = max(last) if last else None
         d["first_day"] = min(last) if last else None
         d["costs"] = self._costs()
+        d["brands"] = dict(self._manual_brands)
         d["built_at"] = path.stat().st_mtime
         self._data, self._data_key = d, key
         return d
@@ -153,6 +164,8 @@ class Dashboard:
             return "revenue_returns" if label.startswith("Возврат") else "revenue_sales"
         if group == STORAGE_GROUP:
             return "acceptance" if "приёмк" in label.lower() else "storage"
+        if group == ADS and PROMOTION_LABEL in label:
+            return "ads_promo"          # удержание за рекламные кампании — на дашборде заменяется затратами кабинета
         return {COMMISSION: "commission", ACQUIRING: "acquiring", LOGISTICS: "logistics", ADS: "ads", PENALTY: "penalty",
                 OTHER: "other", COMPENSATION: "compensation", ADVANCE: "advance"}.get(group, "other")
 
@@ -166,13 +179,38 @@ class Dashboard:
     def _costs(self) -> dict:
         """{артикул: [(действует_с, кратность, себестоимость, подготовка)]} по возрастанию даты."""
         out = defaultdict(list)
+        self._manual_brands = {}
         for r in self.cost_rows():
             key = art_key(r.get("артикул"))
             if key:
                 out[key].append((r.get("действует_с", ""), num(r.get("кратность")) or 1.0, num(r.get(COST_COL)), num(r.get(PREP_COL))))
+                if r.get("бренд"):
+                    self._manual_brands[key] = r["бренд"]
         for v in out.values():
             v.sort(key=lambda x: x[0])
         return dict(out)
+
+    def _retro(self) -> dict:
+        """{бренд: [(действует_с, %)]} — ретро-бонусы производителей по возрастанию даты."""
+        out = defaultdict(list)
+        for r in self.retro_rows() or []:
+            out[brand_key(r["brand"])].append((r.get("since") or "", r["pct"]))
+        for v in out.values():
+            v.sort(key=lambda x: x[0])
+        return dict(out)
+
+    @staticmethod
+    def _retro_at(rows, day) -> float | None:
+        """% ретро-бонуса, действующий в месяце дня: строка с наибольшей датой «действует_с» не позже."""
+        chosen = None
+        for since, pct in rows or []:
+            if not since or since[:7] <= day[:7]:
+                chosen = pct
+        return chosen
+
+    def _brand(self, d, art) -> str:
+        """Бренд артикула как в ОПиУ: заполненный вручную в cost.csv, иначе из данных WB."""
+        return d.get("brands", {}).get(art) or (d["catalog"].get(art) or {}).get("brand") or ""
 
     @staticmethod
     def _cost_at(rows, day):
@@ -222,6 +260,7 @@ class Dashboard:
         t = defaultdict(float)
         has_cost_for_all = True
         filtered = bool(brand or category or articles)
+        retro = self._retro()
         for cab, c in d["cabinets"].items():
             if cabinet and cab != cabinet:
                 continue
@@ -240,6 +279,9 @@ class Dashboard:
                         if price and price[1] is not None:
                             t["cogs"] += m["net_qty"] * price[0] * price[1]
                             t["prep"] += m["net_qty"] * price[0] * (price[2] or 0)
+                            pct = self._retro_at(retro.get(brand_key(self._brand(d, art))), key_day)
+                            if pct:
+                                t["retro"] += m["net_qty"] * price[0] * price[1] * pct / 100
                         elif m["net_qty"] > 0:
                             has_cost_for_all = False
                             t["no_cost_qty"] += m["net_qty"]
@@ -254,15 +296,32 @@ class Dashboard:
                 t["stock_retail"] += qty * (c["prices"].get(art) or 0)
         t["days"] = (end - start).days + 1
         t["has_cost_for_all"] = has_cost_for_all
+        # Реклама — по истории затрат рекламного кабинета (как «Затраты за период» в ЛК WB), а не по удержаниям
+        # в отчёте реализации: WB удерживает за продвижение пачками со сдвигом, на неделе суммы не совпадают.
+        # С фильтром по товарам — затраты кампаний по артикулам. Удержания (t["ads"]) остаются в «К перечислению».
+        spend = self.ad_spend(start.isoformat(), end.isoformat(), cabinet)
+        if spend is not None:
+            if filtered:
+                t["ads_spend"] = -sum(v for (_, art), v in spend["by_article"].items() if self._match(art, brand, category, articles))
+            else:
+                t["ads_spend"] = -sum(spend["by_day"].values())
         return dict(t)
 
     @staticmethod
     def derive(t: dict) -> dict:
         revenue = t.get("revenue_sales", 0) + t.get("revenue_returns", 0)
-        expenses = sum(t.get(k, 0) for k in ("commission", "acquiring", "logistics", "storage", "acceptance", "ads", "penalty", "other"))
-        net = revenue + expenses + t.get("compensation", 0) + t.get("advance", 0)
+        withheld = sum(t.get(k, 0) for k in ("commission", "acquiring", "logistics", "storage", "acceptance", "ads", "ads_promo",
+                                             "penalty", "other"))
+        net = revenue + withheld + t.get("compensation", 0) + t.get("advance", 0)      # к перечислению — по удержаниям WB
+        # Реклама — затраты рекламного кабинета (если загружены; иначе удержание «WB Продвижение»). Прочие строки
+        # группы «Реклама и продвижение» (баллы и участие в программе лояльности, подписка «Джем») — в «Прочие удержания»
+        promo = t.get("ads_spend", t.get("ads_promo", 0))
+        ads = promo
+        other = t.get("other", 0) + t.get("advance", 0) + t.get("ads", 0)
+        expenses = withheld - t.get("ads_promo", 0) + promo
         cogs, prep, tax = -t.get("cogs", 0), -t.get("prep", 0), -t.get("tax", 0)
-        profit = net + cogs + prep + tax
+        retro = t.get("retro", 0)                       # ретро-бонусы производителей — доход, «+»
+        profit = net - t.get("ads_promo", 0) + promo + cogs + retro + prep + tax
         sold = t.get("sold_qty", 0)
         days = max(1, t.get("days", 1))
         pct = lambda v, base: (v / base * 100) if base else None
@@ -273,8 +332,9 @@ class Dashboard:
             "orders_sum": t.get("orders_sum", 0), "orders_qty": t.get("orders_qty", 0), "cancel_qty": t.get("cancel_qty", 0),
             "revenue": revenue, "sold_qty": sold, "return_qty": t.get("return_qty", 0), "net_qty": t.get("net_qty", 0),
             "paid": t.get("paid", 0),
-            "ads": t.get("ads", 0), "drr": pct(-t.get("ads", 0), revenue), "drr_orders": pct(-t.get("ads", 0), t.get("orders_sum", 0)),
-            "cost_per_order": (-t.get("ads", 0) / t["orders_qty"]) if t.get("orders_qty") else None,
+            "ads": ads, "ads_source": "spend" if "ads_spend" in t else "withheld", "ads_withheld": t.get("ads_promo", 0),
+            "drr": pct(-ads, revenue), "drr_orders": pct(-ads, t.get("orders_sum", 0)),
+            "cost_per_order": (-ads / t["orders_qty"]) if t.get("orders_qty") else None,
             "logistics": t.get("logistics", 0), "logistics_pct": pct(-t.get("logistics", 0), revenue),
             "logistics_unit": (-t.get("logistics", 0) / sold) if sold else None,
             "buyout": pct(t.get("net_qty", 0), t.get("orders_qty", 0)),
@@ -283,9 +343,10 @@ class Dashboard:
             "commission": t.get("commission", 0), "commission_pct": pct(-t.get("commission", 0), revenue),
             "acquiring": t.get("acquiring", 0), "acquiring_pct": pct(-t.get("acquiring", 0), revenue),
             "penalty": t.get("penalty", 0), "penalty_pct": pct(-t.get("penalty", 0), revenue),
-            "other": t.get("other", 0) + t.get("advance", 0), "other_pct": pct(-(t.get("other", 0) + t.get("advance", 0)), revenue),
+            "other": other, "other_pct": pct(-other, revenue),
             "compensation": t.get("compensation", 0), "compensation_pct": pct(t.get("compensation", 0), revenue),
             "cogs": cogs, "cogs_pct": pct(-cogs, revenue), "prep": prep, "prep_pct": pct(-prep, revenue),
+            "retro": retro, "retro_pct": pct(retro, revenue),
             "tax": tax, "tax_pct": pct(-tax, revenue), "mp_expenses": expenses, "mp_expenses_pct": pct(-expenses, revenue),
             "roi": pct(profit, -(cogs + prep)) if (cogs + prep) else None,
             "avg_price_seller": (t.get("revenue_sales", 0) / sold) if sold else None,
@@ -295,6 +356,71 @@ class Dashboard:
             "turnover_orders": (t.get("stock_qty", 0) / per_day_orders) if per_day_orders > 0 else None,
             "no_cost_qty": t.get("no_cost_qty", 0), "net_to_pay": net,
         }
+
+    # ------------------------------------------------------------------ процент выкупа — из воронки продаж WB
+    def _funnel_tokens(self) -> dict[str, str]:
+        """{кабинет: ключ API} включённых кабинетов из конфига расчёта (туда их пишет панель)."""
+        try:
+            cfg = json.loads((self.wb_dir() / "wb_accounts.json").read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return {}
+        return {a.get("name") or "Магазин": a["token"] for a in cfg.get("accounts") or []
+                if a.get("enabled", True) and a.get("token")}
+
+    @staticmethod
+    def fetch_funnel(token: str, start: date, end: date) -> dict[str, tuple[float, float]]:
+        """Воронка WB за период: {артикул: (выкуплено шт, отменено шт)}. Лимит WB — 3 запроса в минуту."""
+        import httpx
+        out, offset = defaultdict(lambda: [0.0, 0.0]), 0
+        with httpx.Client(timeout=FUNNEL_TIMEOUT) as client:
+            for _ in range(50):
+                response = client.post(FUNNEL_URL, headers={"Authorization": token},
+                                       json={"selectedPeriod": {"start": start.isoformat(), "end": end.isoformat()},
+                                             "limit": 1000, "offset": offset})
+                response.raise_for_status()
+                products = (response.json().get("data") or {}).get("products") or []
+                for pr in products:
+                    info, st = pr.get("product") or {}, (pr.get("statistic") or {}).get("selected") or {}
+                    row = out[art_key(info.get("vendorCode") or f"nmId {info.get('nmId')}")]
+                    row[0] += num(st.get("buyoutCount")) or 0
+                    row[1] += num(st.get("cancelCount")) or 0
+                offset += len(products)
+                if len(products) < 1000:
+                    break
+        return {k: (v[0], v[1]) for k, v in out.items()}
+
+    def _funnel(self, cabinet: str, token: str, start: date, end: date):
+        """Воронка кабинета за период с кэшем: закрытые периоды — на сутки, текущий — на час. None — WB не ответил."""
+        key = (cabinet, start, end)
+        cached = self._funnel_cache.get(key)
+        ttl = FUNNEL_TTL_CLOSED if end < date.today() - timedelta(days=7) else FUNNEL_TTL
+        if cached and time.time() - cached[0] < ttl:
+            return cached[1]
+        try:
+            rows = self.fetch_funnel(token, start, end)
+        except Exception:
+            return cached[1] if cached else None     # лимит запросов, сеть, нет доступа к «Аналитике»
+        self._funnel_cache[key] = (time.time(), rows)
+        return rows
+
+    def funnel_buyout(self, start: date, end: date, cabinet=None, brand=None, category=None, articles=None) -> float | None:
+        """Процент выкупа как в воронке продаж WB: выкуплено / (выкуплено + отменено) по заказам периода.
+        None — воронку получить не удалось хотя бы по одному кабинету."""
+        tokens, bought, cancelled = self._funnel_tokens(), 0.0, 0.0
+        filtered = bool(brand or category or articles)
+        cabinets = [cab for cab in self.data()["cabinets"] if not cabinet or cab == cabinet]
+        if not cabinets or any(cab not in tokens for cab in cabinets):
+            return None
+        for cab in cabinets:
+            rows = self._funnel(cab, tokens[cab], start, end)
+            if rows is None:
+                return None
+            for art, (b, c) in rows.items():
+                if filtered and not self._match(art, brand, category, articles):
+                    continue
+                bought += b
+                cancelled += c
+        return bought / (bought + cancelled) * 100 if bought + cancelled else None
 
     def summary(self, start: date, end: date, previous: tuple[date, date] | None = None, **filters) -> dict:
         if start > end:
@@ -307,5 +433,9 @@ class Dashboard:
             prev_start = prev_end - timedelta(days=span - 1)
         cur = self.derive(self.totals(start, end, **filters))
         prev = self.derive(self.totals(prev_start, prev_end, **filters))
+        # Выкуп по отчёту реализации (продано за период / заказано за период) на коротком периоде уходит за 100%:
+        # выкупают заказы прошлых недель. Берём воронку WB — как в личном кабинете.
+        for values, (a, b) in ((cur, (start, end)), (prev, (prev_start, prev_end))):
+            values["buyout"] = self.funnel_buyout(a, b, **filters)
         return {"current": cur, "previous": prev, "period": [start.isoformat(), end.isoformat()],
                 "previous_period": [prev_start.isoformat(), prev_end.isoformat()], "options": self.options()}

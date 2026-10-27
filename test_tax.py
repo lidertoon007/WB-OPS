@@ -102,6 +102,35 @@ class TaxApiTests(unittest.TestCase):
             self.assertNotIn("PANEL", json.dumps(listed))
             self.assertNotIn("OPIU", json.dumps(listed))
 
+    def test_stats_toggle_and_key_check(self):
+        from fastapi.testclient import TestClient
+        root = Path(self.temp.name) / "opiu_stats"
+        client = TestClient(self.m.app)
+        with mock.patch.object(self.m, "_tax_project", lambda: root), \
+                mock.patch.object(self.m, "_opiu_wb_tokens", lambda: []):
+            self.m.save_configured_cabinets([])
+            c = client.post("/api/cabinets", json={"name": "Еврозоо", "token": "KEY1"}).json()
+            self.assertEqual((c["stats"], c["key_check"]), (True, None))
+            self.assertEqual([t[1] for t in self.m._rnp_tokens()], ["KEY1"])
+            c = client.patch(f"/api/cabinets/{c['id']}/channels", json={"stats": False}).json()
+            self.assertFalse(c["stats"])
+            self.assertEqual(self.m._rnp_tokens(), [])                        # без статистики — не в РНП
+            self.assertEqual(self.m.sync_opiu_keys(root), {"wildberries": 0})
+            account = json.loads((root / "Wildberries" / "wb_accounts.json").read_text(encoding="utf-8"))["accounts"][0]
+            self.assertEqual((account["token"], account["enabled"]), ("KEY1", False))
+
+            async def fake_check(cabinet):
+                return {"status": "ok", "scopes": [{"title": "Финансы", "ok": False, "need": "stats"}],
+                        "checked_at": "2026-10-27T08:00:00+00:00", "fingerprint": self.m.keycheck.fingerprint(cabinet)}
+            with mock.patch.object(self.m.keycheck, "check", fake_check):
+                c = client.post(f"/api/cabinets/{c['id']}/check-key").json()
+            self.assertEqual(c["key_check"]["status"], "ok")                 # статистика выключена — «Финансы» не нужны
+            c = client.patch(f"/api/cabinets/{c['id']}/channels", json={"stats": True}).json()
+            self.assertEqual((c["key_check"]["status"], c["key_check"]["missing"]), ("partial", ["Финансы"]))
+            c = client.put(f"/api/cabinets/{c['id']}", json={"id": c["id"], "name": "Еврозоо", "token": "KEY2"}).json()
+            self.assertIsNone(c["key_check"])                                # ключ заменили — нужна новая проверка
+            self.assertTrue(c["stats"])
+
 
 if __name__ == "__main__":
     unittest.main()

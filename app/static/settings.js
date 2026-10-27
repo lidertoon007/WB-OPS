@@ -2,7 +2,7 @@
 window.WBOPSSettings = (() => {
   const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
   const MP = {
-    wildberries: {title: 'Wildberries', cls: 'wb', token: 'API-токен', tokenHint: 'ЛК Wildberries → Профиль → Настройки → Доступ к API → «Создать токен». Категории: «Вопросы и отзывы» (и «Чат с покупателями»), уровень доступа — чтение и запись. Для РНП добавьте категорию «Статистика».',
+    wildberries: {title: 'Wildberries', cls: 'wb', token: 'API-токен', tokenHint: 'ЛК Wildberries → Профиль → Настройки → Доступ к API → «Создать токен». Категории: «Вопросы и отзывы» (и «Чат с покупателями»), уровень доступа — чтение и запись. Для статистики и продаж (ОПиУ, дашборд, РНП) добавьте «Финансы», «Статистика», «Аналитика», «Контент», «Цены и скидки» и «Маркетплейс».',
       adsHint: 'Отдельный токен WB с категорией «Продвижение» (достаточно «только чтение»). Нужен РНП для показов, кликов, CTR и расходов на рекламу. Если не задан — используется основной ключ.'},
     ozon: {title: 'Ozon', cls: 'ozon', token: 'API-ключ', client: 'Client ID', tokenHint: 'ЛК Ozon Seller → Настройки → API-ключи → «Сгенерировать ключ» (роль Admin или «Отзывы и вопросы»). Client ID — на той же странице.', adsHint: 'Ключ Performance API рекламного кабинета Ozon. Сохраняется заранее — подключим, когда появится загрузка Ozon.'},
     yandex: {title: 'Яндекс.Маркет', cls: 'ym', token: 'API-ключ (Api-Key)', client: 'ID кабинета', tokenHint: 'Кабинет Маркета → Настройки → API и модули → «Создать токен» с доступом к отзывам и чатам. ID кабинета — в адресе страницы кабинета.', adsHint: 'Отдельный ключ для статистики продвижения, если используете. Сохраняется заранее.'},
@@ -45,7 +45,58 @@ window.WBOPSSettings = (() => {
   }
 
   // ======================================================================== Кабинеты
-  const cab = {list: [], filter: 'all', open: null, adding: null};
+  const cab = {list: [], filter: 'all', open: null, adding: null, keyOpen: null, checking: new Set()};
+  const CHANNELS = ['reviews', 'questions', 'chats', 'stats'];
+  const KEY_STALE_MS = 24 * 3600 * 1000;   // ключ перепроверяется сам раз в сутки
+  const day = s => s ? new Date(s).toLocaleDateString('ru-RU') : '';
+
+  // Статус ключа API в строке кабинета
+  function keyPill(c) {
+    if (!c.token_configured) return '<span class="st-key bad">✕ нет ключа</span>';
+    if (cab.checking.has(c.id)) return '<span class="st-key wait">проверяю ключ…</span>';
+    const k = c.key_check;
+    if (!k) return `<button type="button" class="st-key wait" data-key="${esc(c.id)}">ключ не проверен — проверить</button>`;
+    const until = k.expires_at ? ` · до ${day(k.expires_at)}` : '';
+    const text = {ok: `✓ ключ работает${until}`, partial: `⚠ нет доступа: ${(k.missing || []).join(', ')}`,
+                  error: `✕ ${k.message || 'ключ не работает'}`, unknown: k.message || 'проверить не удалось'}[k.status] || k.status;
+    const cls = {ok: 'ok', partial: 'warn', error: 'bad'}[k.status] || 'wait';
+    return `<button type="button" class="st-key ${cls}" data-key="${esc(c.id)}" aria-expanded="${cab.keyOpen === c.id}" title="Подробнее о доступах ключа">${esc(text)}</button>`;
+  }
+
+  function keyDetails(c) {
+    const k = c.key_check;
+    if (cab.keyOpen !== c.id || !k) return '';
+    const mark = s => s.ok === true ? 'ok' : s.ok === false ? (s.needed ? 'bad' : 'off') : 'wait';
+    const rows = (k.scopes || []).map(s => `<li class="${mark(s)}"><span>${s.ok === true ? '✓' : s.ok === false ? '✕' : '?'}</span><b>${esc(s.title)}</b>`
+      + `${s.purpose ? ` — ${esc(s.purpose)}` : ''}${s.note ? ` <i>(${esc(s.note)})</i>` : ''}${s.ok === false && s.needed ? ' <em>нужен</em>' : ''}</li>`).join('');
+    return `<div class="st-key-box">${k.status === 'partial' ? '<p><b>Ключ действует, но не даёт доступа к нужным разделам.</b></p>' : ''}
+      ${k.expires_at ? `<p>Ключ действует до ${day(k.expires_at)}.</p>` : ''}${rows ? `<ul>${rows}</ul>` : ''}
+      ${k.read_only ? `<p class="muted">Ключ только для чтения${c.reviews || c.questions ? ' — ответы на отзывы и вопросы с ним не отправятся, нужен уровень «чтение и запись»' : ''}.</p>` : ''}
+      ${k.status === 'partial' || k.status === 'error' ? '<p class="muted">Создайте в ЛК маркетплейса новый ключ с нужными разделами и вставьте его в настройках кабинета (⚙).</p>' : ''}
+      <p class="muted">Проверено ${dateTime(k.checked_at)} · <button type="button" class="st-link" data-recheck="${esc(c.id)}">проверить снова</button></p></div>`;
+  }
+
+  async function checkKey(section, id) {
+    if (cab.checking.has(id)) return;
+    cab.checking.add(id); drawCabinets(section);
+    try {
+      const updated = await api(`/api/cabinets/${encodeURIComponent(id)}/check-key`, {method: 'POST'});
+      cab.list = cab.list.map(c => c.id === updated.id ? updated : c);
+    } catch (e) { toast(e.message); }
+    cab.checking.delete(id);
+    if (section.isConnected) drawCabinets(section);
+  }
+
+  // Ключи без свежей проверки (новые, заменённые, проверенные больше суток назад) проверяются сами, по одному
+  async function autoCheckKeys(section) {
+    if (me.role !== 'owner') return;
+    const stale = cab.list.filter(c => c.token_configured && c.enabled !== false
+      && (!c.key_check || Date.now() - new Date(c.key_check.checked_at) > KEY_STALE_MS));
+    for (const c of stale) {
+      if (!section.isConnected) return;
+      await checkKey(section, c.id);
+    }
+  }
 
   async function renderCabinets(section) {
     section.className = 'panel st-page';
@@ -53,6 +104,7 @@ window.WBOPSSettings = (() => {
     section.innerHTML = '<p class="muted">Загрузка…</p>';
     try { cab.list = await api('/api/cabinets'); } catch (e) { section.innerHTML = `<p class="st-error">${esc(e.message)}</p>`; return; }
     drawCabinets(section);
+    autoCheckKeys(section);
   }
 
   function drawCabinets(section) {
@@ -66,15 +118,18 @@ window.WBOPSSettings = (() => {
       <div data-add-form></div>` : '<p class="muted">Подключать кабинеты и менять настройки может только владелец панели.</p>'}
       <div class="st-box"><div class="st-tabs">${[['all', 'Все'], ['wildberries', 'Wildberries'], ['ozon', 'Ozon'], ['yandex', 'Yandex Market']].map(([k, t]) =>
         `<button type="button" data-filter="${k}" class="${cab.filter === k ? 'on' : ''}">${t}</button>`).join('')}</div>
-      <div class="st-table-wrap"><table class="st-table"><thead><tr><th>Кабинет</th><th class="c">Отзывы</th><th class="c">Вопросы</th><th class="c">✉ Чаты</th><th></th></tr></thead><tbody>
+      <div class="st-table-wrap"><table class="st-table"><thead><tr><th>Кабинет</th><th class="c">Отзывы</th><th class="c">Вопросы</th><th class="c">✉ Чаты</th><th class="c" title="ОПиУ, дашборд, РНП">Статистика и продажи</th><th></th></tr></thead><tbody>
       ${rows.map(c => `<tr data-row="${esc(c.id)}" class="${c.enabled === false ? 'st-disabled' : ''}"><td><span class="st-badge ${MP[c.marketplace]?.cls || ''}">${esc(MP[c.marketplace]?.title || c.marketplace)}</span> <b>${esc(c.name)}</b>${c.enabled === false ? ' <span class="st-off">выключен</span>' : ''}
-          <div class="muted st-legal">${[c.country && c.country !== 'RU' ? esc(`${c.country_title} · ${c.currency}`) : '', c.legal_name ? esc(c.legal_name) : '', c.tax_effective != null ? `налог ${String(c.tax_effective).replace('.', ',')}%${c.tax_percent == null ? ' (как в ОПиУ)' : ''}` : '', c.token_configured ? '' : '<span class="st-warn">нет ключа</span>', c.supported ? '' : 'загрузка пока не поддерживается'].filter(Boolean).join(' · ')}</div></td>
-        ${['reviews', 'questions', 'chats'].map(k => `<td class="c">${toggle(`data-channel="${k}" data-id="${esc(c.id)}"`, c[k], `${k} ${c.name}`, !owner)}</td>`).join('')}
+          <div class="muted st-legal">${[c.country && c.country !== 'RU' ? esc(`${c.country_title} · ${c.currency}`) : '', c.legal_name ? esc(c.legal_name) : '', c.tax_effective != null ? `налог ${String(c.tax_effective).replace('.', ',')}%${c.tax_percent == null ? ' (как в ОПиУ)' : ''}` : '', c.supported ? '' : 'загрузка пока не поддерживается'].filter(Boolean).join(' · ')}</div>
+          <div class="st-key-line">${keyPill(c)}</div></td>
+        ${CHANNELS.map(k => `<td class="c">${toggle(`data-channel="${k}" data-id="${esc(c.id)}"`, c[k], `${k} ${c.name}`, !owner)}</td>`).join('')}
         <td class="r">${owner ? `<button type="button" class="st-icon" data-edit="${esc(c.id)}" aria-label="Настроить ${esc(c.name)}" title="Настроить">⚙</button>` : ''}</td></tr>
-        ${cab.open === c.id ? `<tr class="st-edit-row"><td colspan="5">${cabinetForm(c.marketplace, c)}</td></tr>` : ''}`).join('')
-        || `<tr><td colspan="5" class="muted st-empty">${cab.list.length ? 'В этой группе кабинетов нет.' : 'Кабинеты ещё не добавлены — нажмите «+ Wildberries».'}</td></tr>`}
+        ${keyDetails(c) ? `<tr class="st-key-row"><td colspan="6">${keyDetails(c)}</td></tr>` : ''}
+        ${cab.open === c.id ? `<tr class="st-edit-row"><td colspan="6">${cabinetForm(c.marketplace, c)}</td></tr>` : ''}`).join('')
+        || `<tr><td colspan="6" class="muted st-empty">${cab.list.length ? 'В этой группе кабинетов нет.' : 'Кабинеты ещё не добавлены — нажмите «+ Wildberries».'}</td></tr>`}
       </tbody></table></div></div>
-      <p class="muted st-note">Отзывы и Вопросы — что загружать и обрабатывать в кабинете при синхронизации. Чаты — отмечает кабинеты, где ведём чаты с покупателями (загрузка чатов из маркетплейсов появится позже).</p>`;
+      <p class="muted st-note">Отзывы и Вопросы — что загружать и обрабатывать в кабинете при синхронизации. Чаты — отмечает кабинеты, где ведём чаты с покупателями (загрузка чатов из маркетплейсов появится позже). Статистика и продажи — собирать данные кабинета в ОПиУ, дашборд и РНП.
+        Под названием кабинета — статус ключа API; нажмите на него, чтобы увидеть, к каким разделам маркетплейса у ключа есть доступ.</p>`;
     bindCabinets(section);
   }
 
@@ -126,6 +181,12 @@ window.WBOPSSettings = (() => {
       bindForm(section, host.querySelector('form'), null);
       host.querySelector('input').focus();
     });
+    section.querySelectorAll('[data-key]').forEach(b => b.onclick = () => {
+      const c = cab.list.find(x => x.id === b.dataset.key);
+      if (!c.key_check) { checkKey(section, c.id); return; }
+      cab.keyOpen = cab.keyOpen === c.id ? null : c.id; drawCabinets(section);
+    });
+    section.querySelectorAll('[data-recheck]').forEach(b => b.onclick = () => checkKey(section, b.dataset.recheck));
     section.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => { cab.open = cab.open === b.dataset.edit ? null : b.dataset.edit; drawCabinets(section); });
     section.querySelectorAll('[data-channel]').forEach(sw => sw.onclick = async () => {
       const on = sw.getAttribute('aria-checked') !== 'true';
@@ -162,6 +223,7 @@ window.WBOPSSettings = (() => {
         cab.list = await api('/api/cabinets');
         drawCabinets(section);
         toast(current ? 'Кабинет сохранён' : 'Кабинет добавлен');
+        autoCheckKeys(section);   // новый или заменённый ключ проверится сразу
       } catch (err) { state.textContent = err.message; button.disabled = false; }
     };
     const del = form.querySelector('[data-delete]');
@@ -429,7 +491,15 @@ window.WBOPSSettings = (() => {
 .st-table td{padding:14px;border-bottom:1px solid #f0f1f5;vertical-align:middle}.st-table .c{text-align:center}.st-table .r{text-align:right;white-space:nowrap}.st-legal{font-size:13px;margin-top:3px}
 .st-badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:12px;font-weight:600;border:1px solid;margin-right:4px}
 .st-badge.wb{background:#fbe8f6;border-color:#eba6d8;color:#b0127f}.st-badge.ozon{background:#e6f0fd;border-color:#a9c6f0;color:#1d5fc4}.st-badge.ym{background:#fdecea;border-color:#f0b2a9;color:#c8372a}
-.st-warn{color:#b45309}.st-empty{text-align:center;padding:24px}
+.st-warn{color:#b45309}
+.st-key-line{margin-top:6px}.st-key{display:inline-block;border:0;border-radius:8px;padding:3px 10px;font:inherit;font-size:12px;font-weight:600;line-height:1.4;cursor:pointer;text-align:left}
+.st-key.ok{background:#dcfce7;color:#166534}.st-key.warn{background:#fef3c7;color:#92400e}.st-key.bad{background:#fee2e2;color:#991b1b}.st-key.wait{background:#f3f4f6;color:#4b5563}
+span.st-key{cursor:default}.st-key:focus-visible{outline:3px solid #c4b5fd;outline-offset:2px}
+.st-key-row>td{padding-top:0}.st-key-box{border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;background:#fafbfc;font-size:13px;max-width:560px}
+.st-key-box ul{list-style:none;margin:0 0 6px;padding:0}.st-key-box li{padding:2px 0;color:#374151}.st-key-box li span{display:inline-block;width:18px;font-weight:700}
+.st-key-box li.ok span{color:#15803d}.st-key-box li.bad span,.st-key-box li.bad em{color:#b91c1c}.st-key-box li.off{color:#9ca3af}
+.st-key-box li em{font-style:normal;font-weight:700;font-size:11px;margin-left:4px}.st-key-box li i{color:#6b7280}.st-key-box p{margin:4px 0}
+.st-link{border:0;background:none;padding:0;font:inherit;color:#6d28d9;cursor:pointer;text-decoration:underline}.st-empty{text-align:center;padding:24px}
 .st-switch{position:relative;width:44px;height:24px;border-radius:999px;border:0;background:#e5e7eb;cursor:pointer;padding:0;transition:background .15s;vertical-align:middle;flex:none}
 .st-switch i{position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 2px #0003;transition:left .15s}
 .st-switch.on{background:#1f2328}.st-switch.on i{left:23px}.st-switch:disabled{opacity:.55;cursor:default}.st-switch:focus-visible{outline:3px solid #c4b5fd;outline-offset:2px}

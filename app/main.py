@@ -43,6 +43,7 @@ from app.services.chats import ChatStore
 from app.services.knowledge_groups import KnowledgeGroupStore
 from app.services.wb_client import WBApiError, WBFeedbackClient
 from app.services import finance
+from app.services import keycheck
 from app.services import analytics as analytics_module
 from app.services.analytics import Analytics
 from app.services.rnp import RNP, RNPError
@@ -584,8 +585,16 @@ def _cabinet_public(cabinet, cabinets=None, project=...) -> dict[str, object]:
     opiu = tax_module.opiu_rate(project, cabinet, same)
     data = cabinet.public()
     data.update({"tax_effective": cabinet.tax_percent if cabinet.tax_percent is not None else opiu["rate"],
-                 "tax_opiu_rate": opiu["rate"], "tax_opiu_account": opiu["account"], "tax_opiu_found": project is not None})
+                 "tax_opiu_rate": opiu["rate"], "tax_opiu_account": opiu["account"], "tax_opiu_found": project is not None,
+                 "key_check": keycheck.present(_stored_key_check(cabinet.id), cabinet)})
     return data
+
+
+def _stored_key_check(cabinet_id: str) -> dict | None:
+    try:
+        return json.loads(draft_store.get_setting(f"key_check:{cabinet_id}", "") or "null")
+    except ValueError:
+        return None
 
 
 def _apply_tax(cabinet, cabinets) -> None:
@@ -673,14 +682,24 @@ def update_cabinet(cabinet_id: str, payload: CabinetCreate) -> dict[str, object]
 @app.patch("/api/cabinets/{cabinet_id}/channels")
 def update_cabinet_channels(cabinet_id: str, value: dict) -> dict[str, object]:
     cabinets, current = _find_cabinet(cabinet_id)
-    changes = {k: bool(value[k]) for k in ("reviews", "questions", "chats") if k in value}
+    changes = {k: bool(value[k]) for k in ("reviews", "questions", "chats", "stats") if k in value}
     if not changes:
-        raise HTTPException(400, "Укажите reviews, questions или chats")
+        raise HTTPException(400, "Укажите reviews, questions, chats или stats")
     updated = current.with_changes(**changes)
     cabinets[cabinets.index(current)] = updated
     save_configured_cabinets(cabinets)
     draft_store.audit("cabinet_channels_updated", cabinet_id, ";".join(f"{k}={int(v)}" for k, v in changes.items()))
     return _cabinet_public(updated, cabinets)
+
+
+@app.post("/api/cabinets/{cabinet_id}/check-key")
+async def check_cabinet_key(cabinet_id: str) -> dict[str, object]:
+    """Проверить ключ API кабинета у маркетплейса; результат хранится до замены ключа."""
+    cabinets, current = _find_cabinet(cabinet_id)
+    result = await keycheck.check(current)
+    draft_store.set_setting(f"key_check:{cabinet_id}", json.dumps(result, ensure_ascii=False))
+    draft_store.audit("cabinet_key_checked", cabinet_id, result.get("status", ""))
+    return await asyncio.to_thread(_cabinet_public, current, cabinets)
 
 
 @app.delete("/api/cabinets/{cabinet_id}")
@@ -1981,6 +2000,22 @@ def finance_project():
     return project
 
 
+def sync_opiu_keys(project) -> dict[str, int]:
+    """Ключи API кабинетов панели — в конфиги расчёта ОПиУ (их же читают дашборд и номенклатура)."""
+    return finance.sync_accounts(project, configured_cabinets())
+
+
+def start_finance_report(project, mode: str) -> dict[str, object]:
+    """Пересборка ОПиУ: сначала ключи API из кабинетов панели — в конфиги расчёта, потом запуск."""
+    synced = sync_opiu_keys(project)
+    titles = {"wildberries": "WB", "ozon": "Ozon", "yandex": "Я.Маркет"}
+    note = ("Ключи API из кабинетов панели: " + ", ".join(f"{titles[k]} — {n}" for k, n in synced.items())
+            if synced else "В кабинетах панели нет ключей API — расчёт возьмёт ключи из своих конфигов")
+    if synced and not any(synced.values()):
+        note += " (сбор статистики и продаж выключен во всех кабинетах)"
+    return finance_runner.start(project, finance_settings()["python"] or finance.default_python(), mode, note)
+
+
 @app.get("/api/finance/settings")
 def get_finance_settings() -> dict[str, object]:
     values = finance_settings()
@@ -2004,15 +2039,17 @@ async def update_finance_settings(request: Request) -> dict[str, object]:
 
 
 @app.get("/api/finance/report")
-def finance_report() -> dict[str, object]:
+def finance_report(cabinet: str = "") -> dict[str, object]:
+    """cabinet: "" — все кабинеты, «Ozon» — площадка, «Ozon|Еврозоо» — кабинет (ключи из cabinets)."""
     project = finance_project()
     path = finance.latest_report(project)
     if path is None:
         raise HTTPException(404, "Отчёт ещё не собран: нажмите «Собрать из кэша» или «Обновить данные».")
     try:
-        data = finance.read_report(path)
+        data = finance.report_view(finance.read_report(path), cabinet)
     except finance.FinanceError as exc:
         raise HTTPException(500, str(exc)) from exc
+    data["cabinets"] = finance.cabinet_options(data["cabinets"], project, configured_cabinets())
     return {**data, "project_dir": str(project)}
 
 
@@ -2074,6 +2111,24 @@ def nomenclature_price(value: dict) -> dict[str, object]:
     return {"saved": row}
 
 
+@app.put("/api/nomenclature/retro")
+def nomenclature_retro(value: dict) -> dict[str, object]:
+    """Ретро-бонус производителя по бренду: % от себестоимости проданного (pct=null — убрать)."""
+    _nomenclature_guard()
+    brand = str(value.get("brand") or "").strip()
+    raw = value.get("pct")
+    try:
+        pct = None if raw in (None, "") else float(str(raw).replace(",", "."))
+    except ValueError:
+        raise HTTPException(400, "Ретро-бонус — число, например 5")
+    try:
+        rows = nomenclature.set_retro(brand, pct, value.get("effective_from") or None)
+    except NomenclatureError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("retro_bonus_updated", brand, f"pct={pct};from={value.get('effective_from') or ''}")
+    return {"brand": brand, "rows": rows}
+
+
 @app.post("/api/nomenclature/bulk")
 def nomenclature_bulk(value: dict) -> dict[str, object]:
     _nomenclature_guard()
@@ -2115,8 +2170,9 @@ def _opiu_wb_tokens() -> list[tuple[str, str]]:
 @app.post("/api/nomenclature/refresh")
 async def nomenclature_refresh() -> dict[str, object]:
     try:
+        sync_opiu_keys(finance_project())
         result = await asyncio.to_thread(nomenclature.refresh_cards, _opiu_wb_tokens())
-    except NomenclatureError as exc:
+    except (NomenclatureError, finance.FinanceError) as exc:
         raise HTTPException(400, str(exc))
     draft_store.audit("wb_cards_refreshed", details=f"cards={result['cards']}")
     return result
@@ -2136,7 +2192,9 @@ def nomenclature_export(format: str = "xlsx"):
 
 # ---------------------------------------------------------------- дашборд
 kpi_dashboard = Dashboard(lambda: finance_project(), lambda: finance_settings()["python"] or finance.default_python(),
-                      lambda: nomenclature.read_cost_rows()[1])
+                      lambda: nomenclature.read_cost_rows()[1],
+                      ad_spend=lambda start, end, cabinet: ads.spend(start, end, cabinet),   # ads создаётся ниже
+                      retro_rows=lambda: nomenclature.retro_rows())
 
 
 @app.get("/api/dashboard")
@@ -2176,8 +2234,9 @@ def dashboard_project_ok() -> bool:
 @app.post("/api/dashboard/refresh")
 def dashboard_refresh() -> dict[str, object]:
     try:
+        sync_opiu_keys(finance_project())
         return kpi_dashboard.refresh()
-    except DashboardError as exc:
+    except (DashboardError, finance.FinanceError) as exc:
         raise HTTPException(400, str(exc))
 
 
@@ -2185,9 +2244,9 @@ def dashboard_refresh() -> dict[str, object]:
 def _rnp_tokens() -> list[tuple[str, str, str]]:
     """(кабинет, ключ API, ключ API рекламы) — включённые кабинеты WB панели и кабинеты из расчёта ОПиУ."""
     cabinets = [c for c in configured_cabinets() if c.marketplace == "wildberries"]
-    seen = {c.token for c in cabinets if not c.enabled}          # выключенные — не загружаем
+    seen = {c.token for c in cabinets if not (c.enabled and c.stats)}   # выключенные и без статистики — не загружаем
     out = []
-    for name, token, ads in [(c.name, c.token, c.ads_token) for c in cabinets if c.enabled and c.token] + [(n, t, "") for n, t in _opiu_wb_tokens()]:
+    for name, token, ads in [(c.name, c.token, c.ads_token) for c in cabinets if c.enabled and c.stats and c.token] + [(n, t, "") for n, t in _opiu_wb_tokens()]:
         if token and token not in seen:
             seen.add(token)
             out.append((name, token, ads or token))
@@ -2200,7 +2259,7 @@ def _rnp_economics():
     return kpi_dashboard.data()
 
 
-rnp = RNP(draft_store, _rnp_tokens, _rnp_economics, lambda: nomenclature.read_cost_rows()[1])
+rnp = RNP(draft_store, _rnp_tokens, _rnp_economics, lambda: nomenclature.read_cost_rows()[1], lambda: nomenclature.retro_rows())
 RNP_SYNC_HOURS = 2
 
 
@@ -2877,7 +2936,7 @@ async def penalties_sync(request: Request) -> dict[str, object]:
     if (payload or {}).get("download"):
         project = finance_project()
         try:
-            finance_runner.start(project, finance_settings()["python"] or finance.default_python(), "full")
+            start_finance_report(project, "full")
         except finance.FinanceError as exc:
             raise HTTPException(409, str(exc)) from exc
         draft_store.audit("finance_update_started", details="full (penalties)")
@@ -3202,11 +3261,11 @@ def finance_update_status() -> dict[str, object]:
 async def finance_update(request: Request) -> dict[str, object]:
     payload = await request.json() if await request.body() else {}
     mode = (payload or {}).get("mode", "cache")
-    if mode not in ("cache", "full"):
-        raise HTTPException(400, "mode: cache или full")
+    if mode not in ("cache", "full", "reload"):
+        raise HTTPException(400, "mode: cache, full или reload")
     project = finance_project()
     try:
-        result = finance_runner.start(project, finance_settings()["python"] or finance.default_python(), mode)
+        result = start_finance_report(project, mode)
     except finance.FinanceError as exc:
         raise HTTPException(409, str(exc)) from exc
     draft_store.audit("finance_update_started", details=mode)

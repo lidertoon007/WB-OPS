@@ -146,7 +146,8 @@ class AccessTests(unittest.TestCase):
     def test_rnp_api(self):
         from fastapi.testclient import TestClient
         owner = TestClient(self.m.app)
-        with mock.patch.object(self.m, "_rnp_tokens", lambda: []):
+        # Без выгрузки «Оцифровки» из настоящей папки opiu: тест не должен зависеть от данных на компьютере
+        with mock.patch.object(self.m, "_rnp_tokens", lambda: []), mock.patch.object(self.m.rnp, "economics", lambda: None):
             d = owner.get("/api/rnp", params={"from": "2026-10-01", "to": "2026-10-14"}).json()
             self.assertEqual((d["total"]["orders"], d["has_tokens"], len(d["days"])), (0, False, 14))
             self.assertEqual(owner.post("/api/rnp/sync").status_code, 400)

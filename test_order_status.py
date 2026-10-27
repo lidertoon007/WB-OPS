@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
@@ -82,7 +83,7 @@ class StatusTests(unittest.TestCase):
     def test_legacy_migration_and_manual_preservation(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "test.db"
-            with sqlite3.connect(path) as c:
+            with closing(sqlite3.connect(path)) as c, c:
                 c.execute("CREATE TABLE inbox_items (id TEXT PRIMARY KEY,cabinet_id TEXT NOT NULL,item_type TEXT NOT NULL,text TEXT NOT NULL,rating INTEGER,product_id INTEGER,created_at TEXT NOT NULL)")
             store = DraftStore("sqlite:///" + str(path))
             item = self.item("rejected")

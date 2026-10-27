@@ -59,6 +59,62 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(s["previous_period"], ["2026-09-29", "2026-09-30"])
         self.assertEqual(s["previous"]["revenue"], 4000)
 
+    def test_retro_bonus(self):
+        """Ретро-бонус бренда — отдельная строка дохода: себестоимость не меняется, прибыль растёт."""
+        base = self.db.summary(date(2026, 10, 1), date(2026, 10, 2))["current"]
+        self.assertEqual(base["retro"], 0)
+        self.db.retro_rows = lambda: [{"brand": "бренд  a", "pct": 5.0, "since": ""},          # регистр и пробелы не важны
+                                      {"brand": "Бренд A", "pct": 10.0, "since": "2026-11-01"}]  # с ноября — 10%
+        c = self.db.summary(date(2026, 10, 1), date(2026, 10, 2))["current"]
+        self.assertEqual(c["cogs"], base["cogs"])
+        self.assertAlmostEqual(c["retro"], 2 * 1000 * 0.05)              # 2 шт a-1 × 1000 × 5%; у b-2 нет себестоимости
+        self.assertAlmostEqual(c["profit"], base["profit"] + 100)
+        self.assertAlmostEqual(c["retro_pct"], 100 / 12500 * 100)
+
+    def test_ads_from_cabinet_spend(self):
+        """Реклама — по затратам рекламного кабинета; «к перечислению» — по удержаниям WB."""
+        base = self.db.summary(date(2026, 10, 1), date(2026, 10, 2))["current"]
+        self.assertEqual((base["ads"], base["ads_source"]), (-1000, "withheld"))   # истории затрат нет — удержания
+        calls = []
+
+        def spend(start, end, cabinet):
+            calls.append((start, end, cabinet))
+            return {"by_day": {"2026-10-01": 600.0, "2026-10-02": 200.0},
+                    "by_article": {("2026-10-01", "A-1"): 500.0, ("2026-10-02", "B-2"): 250.0}}
+        self.db.ad_spend = spend
+        c = self.db.summary(date(2026, 10, 1), date(2026, 10, 2))["current"]
+        self.assertEqual((c["ads"], c["ads_source"], c["ads_withheld"]), (-800, "spend", -1000))
+        self.assertEqual(c["net_to_pay"], base["net_to_pay"])              # выплата не меняется
+        self.assertAlmostEqual(c["profit"], base["profit"] + 200)          # затрат меньше удержания на 200
+        self.assertAlmostEqual(c["drr"], 800 / 12500 * 100)
+        self.assertEqual(calls[0], ("2026-10-01", "2026-10-02", None))
+        c = self.db.summary(date(2026, 10, 1), date(2026, 10, 2), brand="Бренд A")["current"]
+        self.assertEqual(c["ads"], -500)                                   # с фильтром — по артикулам кампаний
+
+    def test_buyout_from_wb_funnel(self):
+        """Выкуп — как в воронке WB: выкуплено / (выкуплено + отменено), а не продано / заказано (уходило за 100%)."""
+        c = self.db.summary(date(2026, 10, 1), date(2026, 10, 2))["current"]
+        self.assertIsNone(c["buyout"])                   # у кабинета нет ключа — воронку не запрашиваем
+        accounts = self.db.wb_dir() / "wb_accounts.json"
+        accounts.write_text(json.dumps({"accounts": [{"name": CAB, "token": "T"}]}), encoding="utf-8")
+        calls = []
+
+        def fake(token, start, end):
+            calls.append((token, start, end))
+            return {"A-1": (326.0, 14.0), "B-2": (4.0, 6.0)}
+        self.db.fetch_funnel = fake
+        s = self.db.summary(date(2026, 10, 1), date(2026, 10, 2))
+        self.assertAlmostEqual(s["current"]["buyout"], 330 / 350 * 100)
+        self.assertEqual(calls, [("T", date(2026, 10, 1), date(2026, 10, 2)), ("T", date(2026, 9, 29), date(2026, 9, 30))])
+        c = self.db.summary(date(2026, 10, 1), date(2026, 10, 2), brand="Бренд A")["current"]
+        self.assertAlmostEqual(c["buyout"], 326 / 340 * 100)
+        self.assertEqual(len(calls), 2)                  # повторно — из кэша
+
+        def offline(token, start, end):
+            raise RuntimeError("429")
+        self.db.fetch_funnel = offline
+        self.assertIsNone(self.db.summary(date(2026, 10, 3), date(2026, 10, 3))["current"]["buyout"])
+
     def test_filters(self):
         c = self.db.summary(date(2026, 10, 1), date(2026, 10, 2), brand="Бренд A")["current"]
         self.assertEqual(c["revenue"], 10000)
