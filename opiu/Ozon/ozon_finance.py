@@ -48,8 +48,10 @@ URL_ROLES = "/v1/roles"  # роли и срок действия API-ключа
 KEY_WARN_DAYS = 14       # предупреждать о перевыпуске ключа за столько дней
 CACHE_AFTER_DAYS = 7  # дни старше недели считаем закрытыми и кэшируем
 # Заказы и остатки для юнит-экономики
-URL_FBO_LIST = "/v2/posting/fbo/list"
-URL_FBS_LIST = "/v3/posting/fbs/list"
+# /v2/posting/fbo/list и /v3/posting/fbs/list отключены (obsolete / 404): курсорная пагинация, limit ≤ 100
+URL_FBO_LIST = "/v3/posting/fbo/list"
+URL_FBS_LIST = "/v4/posting/fbs/list"
+POSTINGS_LIMIT = 100
 URL_STOCKS = "/v4/product/info/stocks"
 URL_PRICES = "/v5/product/info/prices"
 URL_ATTRIBUTES = "/v4/product/info/attributes"
@@ -290,29 +292,34 @@ def load_products(acc, cache_dir, from_cache, refresh):
 # ---------------------------------------------------------------------------
 # Заказы и остатки (юнит-экономика, в ОПиУ не входят)
 # ---------------------------------------------------------------------------
+def posting_rows(postings):
+    """Строки заказов из postings[] ответа /v3/posting/fbo/list или /v4/posting/fbs/list.
+    Цена товара приходит как {"amount": "746", "currency": "RUB"} (в старых версиях — строкой)."""
+    out = []
+    for p in postings or []:
+        day = str(p.get("in_process_at") or p.get("created_at") or "")[:10]
+        cancelled = p.get("status") == "cancelled"
+        for pr in p.get("products") or []:
+            qty = as_int(pr.get("quantity")) or 1
+            out.append([day, p.get("posting_number") or "", pr.get("offer_id") or f"SKU {pr.get('sku')}",
+                        qty, money(pr.get("price")), cancelled])
+    return out
+
+
 def fetch_postings(account, first, last):
     """Отправления FBO и FBS, созданные с first по last: [[дата, отправление, артикул, шт, цена за шт, отменён]]."""
     flt = {"since": f"{first}T00:00:00.000Z", "to": f"{last}T23:59:59.999Z"}
     out = []
     for path in (URL_FBO_LIST, URL_FBS_LIST):
-        offset = 0
-        for _ in range(500):
-            body = {"dir": "ASC", "filter": flt, "limit": 1000, "offset": offset}
-            if path == URL_FBO_LIST:
-                body["with"] = {"analytics_data": False, "financial_data": False}
+        cursor = ""
+        for _ in range(5000):
+            body = {"cursor": cursor, "filter": flt, "limit": POSTINGS_LIMIT, "sort_dir": "ASC",
+                    "with": {"analytics_data": False, "financial_data": False}}
             res = api_post(account, path, body)
-            res = res.get("result", res) if isinstance(res, dict) else res
-            postings = (res.get("postings") if isinstance(res, dict) else res) or []
-            for p in postings:
-                day = str(p.get("in_process_at") or p.get("created_at") or "")[:10]
-                cancelled = p.get("status") == "cancelled"
-                for pr in p.get("products") or []:
-                    qty = as_int(pr.get("quantity")) or 1
-                    out.append([day, p.get("posting_number") or "", pr.get("offer_id") or f"SKU {pr.get('sku')}",
-                                qty, money(pr.get("price")), cancelled])
-            offset += len(postings)
-            has_next = res.get("has_next") if isinstance(res, dict) else None
-            if len(postings) < 1000 or has_next is False:
+            res = res.get("result", res) if isinstance(res, dict) else {}
+            out += posting_rows(res.get("postings"))
+            cursor = res.get("cursor") or ""
+            if not res.get("has_next") or not cursor:
                 break
     return out
 
