@@ -1,5 +1,7 @@
-/* WB OPS: «Дашборд» — оцифровка ключевых показателей Wildberries за период (в духе TrueStats). */
+/* WB OPS: «Дашборд» — оцифровка ключевых показателей Wildberries или Ozon за период (в духе TrueStats).
+   Каждая страница (WB, Ozon) — свой экземпляр: window.WBOPSDashboard.create().render(section, 'ozon'). */
 window.WBOPSDashboard = (() => {
+ const create = () => {
   const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
   const MONTHS = ['январь', 'февраль', 'март', 'апрель', 'май', 'июнь', 'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь'];
   const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -45,10 +47,33 @@ window.WBOPSDashboard = (() => {
     {id: 'returns', title: 'Возвраты', qtyOnly: 'return_qty', good: 'down', hint: 'Возвращено штук за период.'},
     {id: 'acquiring', title: 'Эквайринг', v: 'acquiring', pct: 'acquiring_pct', money: true, good: 'down', by: 'pct', hint: 'Плата за приём платежей.'},
   ];
-  const st = {preset: 'week:1', from: '', to: '', cabinet: '', brand: '', category: '', article: '', data: null, poll: null};
-  let root = null, hidden = new Set();
-  try { hidden = new Set(JSON.parse(localStorage.getItem('wbops.dashboard.hidden') || '[]')); } catch (e) { /* нет хранилища */ }
-  try { Object.assign(st, JSON.parse(localStorage.getItem('wbops.dashboard.filters') || '{}'), {data: null, poll: null}); } catch (e) { /* ignore */ }
+  // Ozon: свои подписи и подсказки там, где WB и Ozon считают по-разному
+  const OZON = {
+    profit: {hint: 'Выручка за вычетом возвратов минус все начисления Ozon, себестоимость, подготовка и налог, плюс ретро-бонусы производителей — как строка «Прибыль» в ОПиУ. Маржинальность — прибыль к выручке.'},
+    ads: {hint: 'Реклама и продвижение из начислений Ozon: продвижение товара и бренда, оплата за клик, звёздные товары, бейджи, сбор отзывов. ДРР — доля от продаж.'},
+    net_to_pay: {title: 'К перечислению от Ozon', hint: 'Выручка минус все начисления Ozon плюс компенсации — сколько Ozon перечислит за период.'},
+    logistics: {hint: 'Доставка, обработка отправлений, обратная логистика и обработка возвратов и отмен.'},
+    buyout: {hint: 'Доля заказанных за период штук без отмен. Воронка Ozon есть только по месяцам, поэтому выкуп считается по заказам; невыкупы после доставки здесь не видны.'},
+    paid: {hint: 'Сколько фактически заплатили покупатели, за вычетом возвратов. С этой суммы считается налог.'},
+    storage: {hint: 'Хранение, временное размещение и утилизация на складах Ozon.'},
+    other: {hint: 'Подписки Premium и Premium Pro, «Аналитика Pro», страхование и другие услуги Ozon.'},
+    commission: {hint: 'Комиссия Ozon за продажу (за вычетом возвратов комиссии).'},
+    acquiring: {hint: 'Эквайринг и гибкий график выплат.'},
+    penalty: {hint: 'Штрафы Ozon: индекс ошибок, нерекомендованный слот, жалобы покупателей и другие нарушения.'},
+    compensation: {hint: 'Компенсации, корректировки стоимости услуг и перечисления за доставку от покупателя.'},
+    stock: {title: 'Остаток на складах', hint: 'Сейчас на складах Ozon (FBO) и своих складах (FBS, rFBS).'},
+    cap_cost: {hint: 'Остатки на складах сейчас × себестоимость.'}, cap_retail: {hint: 'Остатки на складах сейчас × текущая цена продавца.'},
+  };
+  const MP = {wb: {title: 'WB', key: 'wbops.dashboard'}, ozon: {title: 'Ozon', key: 'wbops.dashboard.ozon'}};
+  const tiles = () => mp === 'ozon' ? TILES.filter(t => t.id !== 'acceptance').map(t => ({...t, ...(OZON[t.id] || {}), hint: (OZON[t.id] || {}).hint || t.hint.replace(/\bWB\b/g, 'Ozon')})) : TILES;
+  let mp = 'wb', st = null, root = null, hidden = new Set();
+  function restore() {
+    st = {preset: 'week:1', from: '', to: '', cabinet: '', brand: '', category: '', article: '', data: null, poll: null};
+    hidden = new Set();
+    try { hidden = new Set(JSON.parse(localStorage.getItem(MP[mp].key + '.hidden') || '[]')); } catch (e) { /* нет хранилища */ }
+    try { Object.assign(st, JSON.parse(localStorage.getItem(MP[mp].key + '.filters') || '{}'), {data: null, poll: null}); } catch (e) { /* ignore */ }
+  }
+  const mpq = () => mp === 'wb' ? '' : `?mp=${mp}`;
 
   // ---------------------------------------------------------------- периоды
   function presets(last) {
@@ -74,13 +99,16 @@ window.WBOPSDashboard = (() => {
   }
 
   // ---------------------------------------------------------------- каркас
-  async function render(section) {
+  async function render(section, marketplace = 'wb') {
+    if (st && st.poll) clearTimeout(st.poll);
+    mp = MP[marketplace] ? marketplace : 'wb';
+    restore();
     root = section;
     root.className = 'panel rv-page db-page';
-    root.innerHTML = `<div class="db-head"><h2>Оцифровка</h2><span class="muted db-fresh" data-fresh></span></div>
+    root.innerHTML = `<div class="db-head"><h2>Оцифровка${mp === 'ozon' ? ' Ozon' : ''}</h2><span class="muted db-fresh" data-fresh></span></div>
       <div class="db-filters" data-filters></div>
       <div class="db-bar"><h3>Общие показатели</h3><div class="db-bar-actions">
-        <button type="button" class="db-ghost" data-refresh title="Пересобрать показатели из уже скачанных данных WB">↻ Обновить</button>
+        <button type="button" class="db-ghost" data-refresh title="Пересобрать показатели из уже скачанных данных ${MP[mp].title}">↻ Обновить</button>
         <button type="button" class="db-ghost" data-widgets aria-expanded="false">⚙ Настройка виджетов</button></div></div>
       <div class="db-widgets" data-widget-panel hidden></div>
       <div data-notes></div><div class="db-grid" data-grid><p class="muted">Загрузка…</p></div>`;
@@ -98,17 +126,20 @@ window.WBOPSDashboard = (() => {
       q.set('prev_from', iso(ps)); q.set('prev_to', iso(st.preset === 'month:0' ? pe : new Date(s.getFullYear(), s.getMonth(), 0)));
     }
     ['cabinet', 'brand', 'category', 'article'].forEach(k => st[k] && q.set(k, st[k]));
+    if (mp !== 'wb') q.set('mp', mp);
+    const board = root;
     let d;
     try { d = await (await fetch('/api/dashboard?' + q)).json(); }
     catch (e) { root.querySelector('[data-grid]').innerHTML = '<p class="rv-error">Нет связи с панелью.</p>'; return; }
+    if (board !== root || (d.mp && d.mp !== mp)) return;       // пока грузилось, открыли дашборд другого маркетплейса
     if (d.status === 'building') {
-      root.querySelector('[data-grid]').innerHTML = `<div class="rv-empty"><b>Собираю показатели…</b><p class="muted">Первый раз панель считает все дни из скачанного отчёта WB — это около минуты. Страница обновится сама.</p></div>`;
+      root.querySelector('[data-grid]').innerHTML = `<div class="rv-empty"><b>Собираю показатели…</b><p class="muted">Первый раз панель считает все дни из скачанных отчётов ${MP[mp].title} — это около минуты. Страница обновится сама.</p></div>`;
       waitBuild(); return;
     }
     if (d.status === 'error') { root.querySelector('[data-grid]').innerHTML = `<div class="rv-empty"><b>Нет данных для дашборда</b><p class="muted">${esc(d.message)}</p></div>`; return; }
     st.data = d;
     if (st.preset !== 'custom') { const [f2, t2] = resolve(); if (f2 !== from || t2 !== to) return load(); }   // «вчера» = последний день с данными
-    try { localStorage.setItem('wbops.dashboard.filters', JSON.stringify({preset: st.preset, from: st.from, to: st.to, cabinet: st.cabinet, brand: st.brand, category: st.category, article: st.article})); } catch (e) { /* ignore */ }
+    try { localStorage.setItem(MP[mp].key + '.filters', JSON.stringify({preset: st.preset, from: st.from, to: st.to, cabinet: st.cabinet, brand: st.brand, category: st.category, article: st.article})); } catch (e) { /* ignore */ }
     drawFilters(); drawNotes(); drawGrid();
     if (d.state && d.state.status === 'running') waitBuild(true);
   }
@@ -116,7 +147,7 @@ window.WBOPSDashboard = (() => {
     clearTimeout(st.poll);
     st.poll = setTimeout(async () => {
       if (!root?.isConnected) return;
-      const s = await (await fetch('/api/dashboard/status')).json().catch(() => ({}));
+      const s = await (await fetch('/api/dashboard/status' + mpq())).json().catch(() => ({}));
       if (s.status === 'running') return waitBuild(silent);
       if (s.status === 'error') { root.querySelector('[data-grid]').innerHTML = `<div class="rv-empty"><b>Не удалось собрать показатели</b><p class="muted">${esc(s.message)}</p></div>`; return; }
       load();
@@ -124,7 +155,7 @@ window.WBOPSDashboard = (() => {
   }
   async function refresh(e) {
     const b = e.currentTarget; b.disabled = true;
-    try { const r = await fetch('/api/dashboard/refresh', {method: 'POST'}); const d = await r.json(); if (!r.ok) throw new Error(d.detail); waitBuild(); }
+    try { const r = await fetch('/api/dashboard/refresh' + mpq(), {method: 'POST'}); const d = await r.json(); if (!r.ok) throw new Error(d.detail); waitBuild(); }
     catch (err) { alert(err.message); }
     setTimeout(() => { b.disabled = false; }, 3000);
   }
@@ -147,16 +178,17 @@ window.WBOPSDashboard = (() => {
       if (k === 'brand' || k === 'category') st.article = '';
       load();
     });
-    root.querySelector('[data-fresh]').textContent = `Отчёт WB по ${ru(o.last_day)}${o.stocks_at ? ` · остатки на ${o.stocks_at.slice(0, 16).replace(/(\d{4})-(\d\d)-(\d\d)/, '$3.$2')}` : ''} · сравнение с ${ru(st.data.previous_period[0])} – ${ru(st.data.previous_period[1])}`;
+    root.querySelector('[data-fresh]').textContent = `Отчёт ${MP[mp].title} по ${ru(o.last_day)}${o.stocks_at ? ` · остатки на ${o.stocks_at.slice(0, 16).replace(/(\d{4})-(\d\d)-(\d\d)/, '$3.$2')}` : ''} · сравнение с ${ru(st.data.previous_period[0])} – ${ru(st.data.previous_period[1])}`;
   }
 
   function drawNotes() {
     const c = st.data.current, o = st.data.options, [from] = resolve(), notes = [];
-    if (c.ads_source === 'withheld' && c.ads_withheld) notes.push('Реклама — по удержаниям WB из отчёта реализации: история затрат рекламного кабинета за этот период не загружена (раздел «Аналитика рекламы»).');
+    if (mp === 'wb' && c.ads_source === 'withheld' && c.ads_withheld) notes.push('Реклама — по удержаниям WB из отчёта реализации: история затрат рекламного кабинета за этот период не загружена (раздел «Аналитика рекламы»).');
     if (c.no_cost_qty > 0) notes.push(`Продано ${fmt(c.no_cost_qty)} шт. товаров без себестоимости — прибыль завышена. Задайте цены в «Товары → Номенклатура и себестоимость».`);
-    if (o.ordered_from && from < o.ordered_from) notes.push(`Заказы WB сохранены с ${ru(o.ordered_from)} — за более ранние дни заказы, выкуп и ДРРз не посчитаны.`);
-    if (st.brand || st.category || st.article) notes.push('С фильтром не учитываются расходы WB без артикула: часть рекламы, хранения и штрафов.');
-    if (st.data.state?.status === 'running') notes.push('Подтягиваю свежие данные из кэша WB — цифры обновятся сами.');
+    const t = MP[mp].title;
+    if (o.ordered_from && from < o.ordered_from) notes.push(`Заказы ${t} сохранены с ${ru(o.ordered_from)} — за более ранние дни заказы, выкуп и ДРРз не посчитаны.`);
+    if (st.brand || st.category || st.article) notes.push(`С фильтром не учитываются расходы ${t} без артикула: часть рекламы, хранения, подписок и штрафов.`);
+    if (st.data.state?.status === 'running') notes.push(`Подтягиваю свежие данные из кэша ${t} — цифры обновятся сами.`);
     root.querySelector('[data-notes]').innerHTML = notes.map(n => `<div class="db-note">${esc(n)}</div>`).join('');
   }
 
@@ -194,16 +226,19 @@ window.WBOPSDashboard = (() => {
       <div class="db-value ${main.replace(/<[^>]+>/g, '').length > 17 ? 'long' : main.replace(/<[^>]+>/g, '').length > 14 ? 'mid' : ''}">${main}</div>${t.fixed ? '<div class="db-fixed">на сегодня</div>' : `<div class="db-change">${delta}</div>`}</article>`;
   }
   function drawGrid() {
-    root.querySelector('[data-grid]').innerHTML = TILES.filter(t => !hidden.has(t.id)).map(tileHtml).join('') || '<p class="muted">Все виджеты скрыты — включите их в «Настройке виджетов».</p>';
+    root.querySelector('[data-grid]').innerHTML = tiles().filter(t => !hidden.has(t.id)).map(tileHtml).join('') || '<p class="muted">Все виджеты скрыты — включите их в «Настройке виджетов».</p>';
   }
   function drawWidgets() {
     const box = root.querySelector('[data-widget-panel]');
-    box.innerHTML = `<div class="db-wlist">${TILES.map(t => `<label><input type="checkbox" data-w="${t.id}" ${hidden.has(t.id) ? '' : 'checked'}> ${esc(t.title)}</label>`).join('')}</div>
+    box.innerHTML = `<div class="db-wlist">${tiles().map(t => `<label><input type="checkbox" data-w="${t.id}" ${hidden.has(t.id) ? '' : 'checked'}> ${esc(t.title)}</label>`).join('')}</div>
       <button type="button" class="rv-link" data-wall>Показать все</button>`;
     box.querySelectorAll('[data-w]').forEach(cb => cb.onchange = () => { cb.checked ? hidden.delete(cb.dataset.w) : hidden.add(cb.dataset.w); save(); drawGrid(); });
     box.querySelector('[data-wall]').onclick = () => { hidden.clear(); save(); drawWidgets(); drawGrid(); };
   }
-  function save() { try { localStorage.setItem('wbops.dashboard.hidden', JSON.stringify([...hidden])); } catch (e) { /* ignore */ } }
+  function save() { try { localStorage.setItem(MP[mp].key + '.hidden', JSON.stringify([...hidden])); } catch (e) { /* ignore */ } }
+
+  return {render};
+ };
 
   const style = document.createElement('style');
   style.textContent = `
@@ -225,12 +260,13 @@ window.WBOPSDashboard = (() => {
 .db-change{display:flex;align-items:center;gap:8px;min-height:24px}.db-delta{display:inline-block;background:#fff;border-radius:7px;padding:2px 8px;font-size:12px;font-weight:700;color:#1f2328;white-space:nowrap}
 .db-delta span{font-weight:500}.good .db-delta{color:#2f6b2f}.bad .db-delta{color:#b42323}.db-arrow{font-size:16px;font-weight:700}.good .db-arrow{color:#2f6b2f}.bad .db-arrow{color:#c03030}.neutral .db-arrow{color:#6b7280}
 .db-fixed{font-size:11px;color:#6b7280;min-height:24px;display:flex;align-items:center}
-.wb-member [data-nav=dashboard]{display:none!important}
+.wb-member [data-nav=dashboard],.wb-member [data-nav=dashboard-ozon]{display:none!important}
 @media(max-width:1500px){.db-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media(max-width:1150px){.db-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:800px){.db-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.db-period{min-width:0;width:100%}.db-value{font-size:20px}}
 @media(max-width:480px){.db-grid{grid-template-columns:1fr}}`;
   document.head.appendChild(style);
 
-  return {render};
+  const main = create();
+  return {render: main.render, create};
 })();

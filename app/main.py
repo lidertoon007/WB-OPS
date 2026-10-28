@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +24,8 @@ from app.services.review_list import ANSWER_STATUSES, ORDER_STATUSES, TAG_ICONS,
 from app.services.wb_images import WBImages
 from app.services.nomenclature import Nomenclature, NomenclatureError
 from app.services.dashboard import Dashboard, DashboardError
+from app.services import home as home_module
+from app.services import abc as abc_module
 from app.services.analytics import TAGS as ANALYTICS_TAGS
 from app.services.complaints import ComplaintService
 from app.services.replies import ReplyService
@@ -46,7 +49,8 @@ from app.services import finance
 from app.services import keycheck
 from app.services import analytics as analytics_module
 from app.services.analytics import Analytics
-from app.services.rnp import RNP, RNPError
+from app.services.rnp import RNP, RNPError, compose as rnp_compose, heatmap_of as rnp_heatmap_of
+from app.services.rnp_ozon import OzonRNP
 from app.services import tax as tax_module
 from app.services.transfer.common import TransferError
 from app.services.repricer import Repricer, RepricerError
@@ -63,7 +67,7 @@ from app.storage import DraftStore
 settings = get_settings()
 STATIC_DIR = Path(__file__).parent / "static"
 DASHBOARD_FILE = STATIC_DIR / "dashboard.html"
-DASHBOARD_PAGES = ("products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "notifications", "team", "complaints", "nomenclature", "dashboard", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads", "planfact", "ab")
+DASHBOARD_PAGES = ("workspace", "abc", "products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "notifications", "team", "complaints", "nomenclature", "dashboard", "dashboard-ozon", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads", "planfact", "ab")
 DASHBOARD_PATHS = {"/", *(f"/{page}" for page in DASHBOARD_PAGES)}
 app = FastAPI(
     title=settings.app_name,
@@ -337,7 +341,7 @@ def process_auto_question(item: InboxItem) -> dict[str, object]:
 
 LOCAL_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
 # Только владельцу (на компьютере с WB OPS): команда, токены, ключи, финансы, резервные копии
-OWNER_ONLY = ("/api/team", "/api/admin", "/api/notifications", "/api/finance", "/api/nomenclature", "/api/dashboard", "/api/rnp", "/api/transfer", "/api/repricer", "/api/penalties", "/api/ads", "/api/planfact", "/api/ab", "/api/settings/modules/telegram", "/docs", "/openapi.json",
+OWNER_ONLY = ("/api/team", "/api/admin", "/api/notifications", "/api/finance", "/api/home", "/api/abc", "/api/nomenclature", "/api/dashboard", "/api/rnp", "/api/transfer", "/api/repricer", "/api/penalties", "/api/ads", "/api/planfact", "/api/ab", "/api/settings/modules/telegram", "/docs", "/openapi.json",
               "/api/complaint-browser")
 OWNER_ONLY_WRITE = ("/api/cabinets", "/api/ai/settings", "/api/account", "/api/settings/auto-sync")
 MEMBER_OPEN = ("/api/team/me", "/api/team/logout")
@@ -346,7 +350,7 @@ MEMBER_OPEN = ("/api/team/me", "/api/team/logout")
 def is_owner_only(path: str, method: str) -> bool:
     if path.startswith(MEMBER_OPEN):
         return False
-    if path.startswith(OWNER_ONLY) or path in ("/finances", "/nomenclature", "/dashboard", "/rnp", "/transfer", "/repricer", "/penalties", "/ads", "/planfact", "/ab"):
+    if path.startswith(OWNER_ONLY) or path in ("/finances", "/nomenclature", "/dashboard", "/dashboard-ozon", "/abc", "/rnp", "/transfer", "/repricer", "/penalties", "/ads", "/planfact", "/ab"):
         return True
     return method not in ("GET", "HEAD") and path.startswith(OWNER_ONLY_WRITE)
 
@@ -389,7 +393,7 @@ async def inject_knowledge_workspace(request: Request, call_next):
     body = b"".join([chunk async for chunk in response.body_iterator])
     html = body.decode("utf-8")
     if request.url.path in DASHBOARD_PATHS:
-        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "router.js", "knowledge.js"))
+        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "home.js", "abc.js", "router.js", "knowledge.js"))
         html = html.replace("</body>", scripts + "</body>")
     return Response(content=html, status_code=response.status_code, headers={"content-type": "text/html; charset=utf-8"})
 
@@ -2147,6 +2151,22 @@ def nomenclature_bulk(value: dict) -> dict[str, object]:
     return {"updated": done}
 
 
+@app.post("/api/nomenclature/import")
+async def nomenclature_import(file: UploadFile = File(...)) -> dict[str, object]:
+    """Единый справочник себестоимости и подготовки из Excel/CSV — один на все кабинеты и юрлица."""
+    _nomenclature_guard()
+    content = await file.read()
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(400, "Файл больше 20 МБ")
+    try:
+        result = await asyncio.to_thread(nomenclature.import_file, file.filename or "", content)
+    except NomenclatureError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("cost_imported", file.filename or "", f"added={result['added']};updated={result['updated']};"
+                      f"skipped={len(result['skipped'])}")
+    return result
+
+
 @app.delete("/api/nomenclature/price")
 def nomenclature_delete_price(article: str, effective_from: str = Query(..., alias="from")) -> dict[str, object]:
     _nomenclature_guard()
@@ -2195,12 +2215,23 @@ kpi_dashboard = Dashboard(lambda: finance_project(), lambda: finance_settings()[
                       lambda: nomenclature.read_cost_rows()[1],
                       ad_spend=lambda start, end, cabinet: ads.spend(start, end, cabinet),   # ads создаётся ниже
                       retro_rows=lambda: nomenclature.retro_rows())
+ozon_dashboard = Dashboard(lambda: finance_project(), lambda: finance_settings()["python"] or finance.default_python(),
+                           lambda: nomenclature.read_cost_rows()[1], retro_rows=lambda: nomenclature.retro_rows(), mp="ozon")
+DASHBOARDS = {"wb": kpi_dashboard, "ozon": ozon_dashboard}
+
+
+def _dashboard(mp: str) -> Dashboard:
+    if mp not in DASHBOARDS:
+        raise HTTPException(400, "mp: wb или ozon")
+    return DASHBOARDS[mp]
 
 
 @app.get("/api/dashboard")
 def dashboard_data(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "",
-                   brand: str = "", category: str = "", article: str = "", prev_from: str = "", prev_to: str = "") -> dict[str, object]:
+                   brand: str = "", category: str = "", article: str = "", prev_from: str = "", prev_to: str = "",
+                   mp: str = "wb") -> dict[str, object]:
     from datetime import date as _date
+    kpi_dashboard = _dashboard(mp)
     try:
         start, end = _date.fromisoformat(date_from), _date.fromisoformat(date_to)
         previous = (_date.fromisoformat(prev_from), _date.fromisoformat(prev_to)) if prev_from and prev_to else None
@@ -2218,9 +2249,126 @@ def dashboard_data(date_from: str = Query(..., alias="from"), date_to: str = Que
         return {"status": "error", "message": str(exc), "state": kpi_dashboard.state}
 
 
+@app.get("/api/home")
+def home_summary(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to")) -> dict[str, object]:
+    """Главная: магазины (юрлицо × маркетплейс) — факт за период, остатки и прогноз на конец месяца."""
+    from datetime import date as _date
+    try:
+        start, end = _date.fromisoformat(date_from), _date.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(400, "Даты в формате ГГГГ-ММ-ДД")
+    building = []
+    for board in DASHBOARDS.values():
+        try:
+            if board.stale():
+                if not board.dump_path().exists():
+                    board.refresh()
+                    building.append(board.setup["title"])
+                else:
+                    board.refresh()            # данные есть — показываем их, свежие соберутся в фоне
+        except DashboardError:
+            pass                               # маркетплейс не подключён — строк по нему не будет
+    try:
+        project = finance.find_project_dir(finance_settings()["dir"] or None)
+    except Exception:
+        project = None
+    names = [{"marketplace": b.setup["title"], "cabinet": cab} for b in DASHBOARDS.values() if b.dump_path().exists()
+             for cab in _safe_cabinets(b)]
+    legal = {(o["marketplace"], o["cabinet"]): o["legal_name"] for o in finance.cabinet_options(names, project, configured_cabinets())}
+    try:
+        data = home_module.summary(DASHBOARDS, start, end, legal)
+    except DashboardError as exc:
+        raise HTTPException(400, str(exc))
+    connected = {c.marketplace for c in configured_cabinets() if c.enabled}
+    data["not_supported"] = [finance.REPORT_MP[m] for m in ("yandex",) if m in connected]
+    data["building"] = building
+    return data
+
+
+def _abc_book() -> dict[str, dict]:
+    """Справочник себестоимости для ABC: {артикул: {article, name, brand, category, cost}} — действующая цена."""
+    from app.services.nomenclature import art_key as _key, num as _num
+    rows = defaultdict(list)
+    for r in nomenclature.read_cost_rows()[1]:
+        if _key(r.get("артикул")):
+            rows[_key(r.get("артикул"))].append(r)
+    out = {}
+    for key, own in rows.items():
+        cur = nomenclature.current_price(own) or own[-1]
+        pick = lambda col: next((r.get(col) for r in own if r.get(col)), "")  # noqa: E731
+        out[key] = {"article": own[0].get("артикул", key), "name": pick("название (справочно)"), "brand": pick("бренд"),
+                    "category": pick("категория"), "cost": _num(cur.get("сс_за_ед"))}
+    return out
+
+
+def _abc_data(date_from: str, date_to: str, mp: str) -> dict:
+    from datetime import date as _date
+    try:
+        start, end = _date.fromisoformat(date_from), _date.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(400, "Даты в формате ГГГГ-ММ-ДД")
+    if mp not in ("all", *DASHBOARDS):
+        raise HTTPException(400, "mp: all, wb или ozon")
+    boards = {k: b for k, b in DASHBOARDS.items() if mp in ("all", k)}
+    for board in boards.values():
+        try:
+            if board.stale():
+                board.refresh()                    # свежая выгрузка соберётся в фоне
+        except DashboardError:
+            pass
+    try:
+        return abc_module.analysis(boards, start, end, _abc_book())
+    except DashboardError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/abc")
+def abc_report(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), mp: str = "all") -> dict[str, object]:
+    """ABC-анализ продаж и неликвид по артикулам за период (как лист «ABC» таблицы продавца)."""
+    return _abc_data(date_from, date_to, mp)
+
+
+@app.get("/api/abc/export")
+def abc_export(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), mp: str = "all", format: str = "xlsx"):
+    return _abc_export(_abc_data(date_from, date_to, mp), date_from, date_to, format)
+
+
+@app.post("/api/abc/export")
+def abc_export_selected(value: dict) -> Response:
+    """Выгрузка того, что на экране: keys — артикулы после фильтров, в порядке сортировки таблицы."""
+    date_from, date_to = str(value.get("from") or ""), str(value.get("to") or "")
+    d = _abc_data(date_from, date_to, str(value.get("mp") or "all"))
+    keys = [str(k) for k in value.get("keys") or []]
+    by_key = {r["key"]: r for r in d["rows"]}
+    d["rows"] = [by_key[k] for k in dict.fromkeys(keys) if k in by_key]
+    return _abc_export(d, date_from, date_to, str(value.get("format") or "xlsx"), suffix="_filtered")
+
+
+def _abc_export(d: dict, date_from: str, date_to: str, format: str, suffix: str = "") -> Response:
+    rows = [["Бренд", "Категория", "Артикул", "Наименование", "Маркетплейсы", f"Продажи {d['days']} дн, шт", f"Выручка {d['days']} дн, ₽",
+             "Доля выручки, %", "Накопительная доля, %", "ABC (выручка)", "ABC (оборачиваемость)", "ABC (прибыль)", "ABC",
+             "Прибыль, ₽", "Остаток, шт", "Себестоимость ед., ₽", "Себестоимость остатка, ₽", "Продажи в день, шт", "Запас, дн",
+             "Статус", f"Подсорт ({abc_module.RESTOCK_DAYS} дн), шт"]]
+    for r in d["rows"]:
+        rows.append([r["brand"], r["category"], r["article"], r["name"], ", ".join(r["marketplaces"]), round(r["sold"], 2),
+                     round(r["revenue"], 2), round(r["share"], 2), round(r["cum_share"], 2), r["abc_revenue"], r["abc_turnover"],
+                     r["abc_profit"], r["abc"], round(r["profit"], 2), round(r["stock"], 2), r["unit_cost"],
+                     None if r["stock_cost"] is None else round(r["stock_cost"], 2), round(r["per_day"], 2), r["days_left"],
+                     r["status"], r["restock"]])
+    return _table_download({"ABC": rows}, format, f"abc_{date_from}_{date_to}{suffix}")
+
+
+def _safe_cabinets(board) -> list[str]:
+    try:
+        return list(board.data()["cabinets"])
+    except DashboardError:
+        return []
+
+
 @app.get("/api/dashboard/status")
-def dashboard_status() -> dict[str, object]:
-    return {**kpi_dashboard.state, "ready": kpi_dashboard.dump_path().exists() if dashboard_project_ok() else False}
+def dashboard_status(mp: str = "wb") -> dict[str, object]:
+    board = _dashboard(mp)
+    return {**board.state, "ready": board.dump_path().exists() if dashboard_project_ok() else False}
 
 
 def dashboard_project_ok() -> bool:
@@ -2232,10 +2380,11 @@ def dashboard_project_ok() -> bool:
 
 
 @app.post("/api/dashboard/refresh")
-def dashboard_refresh() -> dict[str, object]:
+def dashboard_refresh(mp: str = "wb") -> dict[str, object]:
+    board = _dashboard(mp)
     try:
         sync_opiu_keys(finance_project())
-        return kpi_dashboard.refresh()
+        return board.refresh()
     except (DashboardError, finance.FinanceError) as exc:
         raise HTTPException(400, str(exc))
 
@@ -2253,25 +2402,51 @@ def _rnp_tokens() -> list[tuple[str, str, str]]:
     return out
 
 
-def _rnp_economics():
-    if kpi_dashboard.stale() and kpi_dashboard.dump_path().exists():
-        kpi_dashboard.refresh()                      # свежая выгрузка соберётся в фоне
-    return kpi_dashboard.data()
+def _rnp_ozon_accounts() -> list[tuple[str, str, str]]:
+    """(кабинет, Client ID, ключ API) — включённые кабинеты Ozon панели со сбором статистики."""
+    out, seen = [], set()
+    for c in configured_cabinets():
+        if c.marketplace == "ozon" and c.enabled and c.stats and c.client_id and c.token and c.client_id not in seen:
+            seen.add(c.client_id)
+            out.append((c.name, c.client_id, c.token))
+    return out
 
 
+def _rnp_economics_of(board: Dashboard):
+    def economics():
+        if board.stale() and board.dump_path().exists():
+            board.refresh()                          # свежая выгрузка соберётся в фоне
+        return board.data()
+    return economics
+
+
+_rnp_economics = _rnp_economics_of(kpi_dashboard)
 rnp = RNP(draft_store, _rnp_tokens, _rnp_economics, lambda: nomenclature.read_cost_rows()[1], lambda: nomenclature.retro_rows())
+rnp_ozon = OzonRNP(draft_store, _rnp_ozon_accounts, _rnp_economics_of(ozon_dashboard), lambda: nomenclature.read_cost_rows()[1],
+                   lambda: nomenclature.retro_rows())
+# (РНП, кабинеты с ключами, дашборд); кабинеты — через имя функции, чтобы подмена в тестах действовала
+RNPS = {"wb": (rnp, lambda: _rnp_tokens(), kpi_dashboard), "ozon": (rnp_ozon, lambda: _rnp_ozon_accounts(), ozon_dashboard)}
 RNP_SYNC_HOURS = 2
 
 
+def _rnp_mps(mp: str) -> list[str]:
+    if mp == "all":
+        return list(RNPS)
+    if mp not in RNPS:
+        raise HTTPException(400, "mp: wb, ozon или all")
+    return [mp]
+
+
 async def rnp_loop() -> None:
-    """Каждые 2 часа подтягивать заказы и рекламу из WB (если есть токен)."""
+    """Каждые 2 часа подтягивать заказы и рекламу из WB и Ozon (если есть ключи)."""
     await asyncio.sleep(20)
     while True:
-        try:
-            if _rnp_tokens():
-                await asyncio.to_thread(rnp.sync)
-        except Exception as exc:
-            draft_store.audit("rnp_sync_error", details=str(exc)[:300])
+        for service, tokens, _board in RNPS.values():
+            try:
+                if tokens():
+                    await asyncio.to_thread(service.sync)
+            except Exception as exc:
+                draft_store.audit("rnp_sync_error", details=f"{service.MP}: {str(exc)[:300]}")
         await asyncio.sleep(RNP_SYNC_HOURS * 3600)
 
 
@@ -2290,74 +2465,108 @@ def _rnp_articles(article: str):
     return {x.strip().upper().replace(" ", "") for x in article.split(",") if x.strip()} or None
 
 
-def _rnp_cabinets() -> list[dict]:
-    """Кабинеты РНП для фильтра: название, юрлицо и все имена кабинета (в панели и в расчёте ОПиУ —
+def _rnp_cabinets(mp: str = "wb") -> list[dict]:
+    """Кабинеты РНП для фильтра: маркетплейс, название, юрлицо и все имена кабинета (в панели и в расчёте ОПиУ —
     заказы РНП записаны под первым, выгрузка дашборда — под вторым)."""
-    panel = [c for c in configured_cabinets() if c.marketplace == "wildberries"]
     project = finance.find_project_dir(finance_settings()["dir"] or None)
     out = []
-    for name, token, _ in _rnp_tokens():
-        cab = next((c for c in panel if c.token == token), None)
-        names = {name}
-        if cab is not None:
-            account = tax_module.opiu_rate(project, cab, len(panel))["account"]
-            if account:
-                names.add(account)
-        out.append({"name": name, "legal_name": cab.legal_name if cab else "", "names": sorted(names)})
+    for key in _rnp_mps(mp):
+        marketplace = "wildberries" if key == "wb" else key
+        panel = [c for c in configured_cabinets() if c.marketplace == marketplace]
+        for name, token, third in RNPS[key][1]():
+            # у WB кабинет узнаём по токену, у Ozon — по Client ID
+            cab = next((c for c in panel if (c.token == token if key == "wb" else c.client_id == token)), None)
+            names = {name}
+            if cab is not None:
+                account = tax_module.opiu_rate(project, cab, len(panel))["account"]
+                if account:
+                    names.add(account)
+            out.append({"mp": key, "name": name, "legal_name": cab.legal_name if cab else "", "names": sorted(names)})
     return out
 
 
-def _rnp_cabinet_filter(cabinet: str):
+def _rnp_cabinet_filter(cabinet: str, mp: str = "wb"):
     if not cabinet:
         return None
-    for c in _rnp_cabinets():
-        if c["name"] == cabinet:
-            return set(c["names"])
-    return {cabinet}
+    names = {n for c in _rnp_cabinets(mp) if c["name"] == cabinet for n in c["names"]}
+    return names or {cabinet}
+
+
+def _rnp_parts(mp: str, start: str, end: str, brand: str, category: str, article: str, cabinet: str, with_cells: bool = False) -> list:
+    cabinets = _rnp_cabinet_filter(cabinet, mp)
+    return [RNPS[key][0].collect(start, end, brand=brand or None, category=category or None, articles=_rnp_articles(article),
+                                 with_cells=with_cells, cabinets=cabinets) for key in _rnp_mps(mp)]
+
+
+def _rnp_options(mp: str) -> dict:
+    """Бренды, категории и артикулы для фильтров — из выгрузок дашбордов выбранных маркетплейсов."""
+    out = {"brands": set(), "categories": set(), "articles": {}}
+    for key in _rnp_mps(mp):
+        try:
+            opts = RNPS[key][2].options()
+        except Exception:
+            continue
+        out["brands"] |= set(opts.get("brands") or [])
+        out["categories"] |= set(opts.get("categories") or [])
+        for a in opts.get("articles") or []:
+            out["articles"].setdefault(a["key"], a)
+    return {"brands": sorted(out["brands"]), "categories": sorted(out["categories"]),
+            "articles": sorted(out["articles"].values(), key=lambda x: x["article"].lower())}
 
 
 @app.get("/api/rnp")
 def rnp_table(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), brand: str = "", category: str = "",
-              article: str = "", cabinet: str = "") -> dict[str, object]:
+              article: str = "", cabinet: str = "", mp: str = "wb") -> dict[str, object]:
     start, end = _rnp_period(date_from, date_to)
-    data = rnp.table(start, end, brand=brand or None, category=category or None, articles=_rnp_articles(article),
-                     cabinets=_rnp_cabinet_filter(cabinet))
-    try:
-        opts = kpi_dashboard.options()
-    except Exception:
-        opts = {}
-    data["options"] = opts
-    data["cabinets"] = [{"name": c["name"], "legal_name": c["legal_name"]} for c in _rnp_cabinets()]
-    data["has_tokens"] = bool(_rnp_tokens())
+    data = rnp_compose(_rnp_parts(mp, start, end, brand, category, article, cabinet), notes=rnp.notes(start, end))
+    data["mp"] = mp
+    data["options"] = _rnp_options(mp)
+    data["cabinets"] = [{"mp": c["mp"], "name": c["name"], "legal_name": c["legal_name"]} for c in _rnp_cabinets("all")]
+    has = {key: bool(RNPS[key][1]()) for key in RNPS}
+    data["has_tokens_by_mp"] = has
+    data["has_tokens"] = any(has[key] for key in _rnp_mps(mp))
     data["sync_hours"] = RNP_SYNC_HOURS
     return data
 
 
 @app.get("/api/rnp/heatmap")
 def rnp_heatmap(metric: str, date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), brand: str = "",
-                category: str = "", article: str = "", cabinet: str = "") -> dict[str, object]:
+                category: str = "", article: str = "", cabinet: str = "", mp: str = "wb") -> dict[str, object]:
     start, end = _rnp_period(date_from, date_to)
+    if metric not in RNP.HEAT_METRICS:
+        raise HTTPException(400, "Неизвестный показатель")
     try:
-        return rnp.heatmap(start, end, metric, brand=brand or None, category=category or None, articles=_rnp_articles(article),
-                           cabinets=_rnp_cabinet_filter(cabinet))
+        return rnp_heatmap_of(rnp_compose(_rnp_parts(mp, start, end, brand, category, article, cabinet, with_cells=True), with_cells=True), metric)
     except RNPError as exc:
         raise HTTPException(400, str(exc))
 
 
 @app.get("/api/rnp/status")
-def rnp_status() -> dict[str, object]:
-    return {**rnp.state, "synced_at": draft_store.get_setting("rnp_synced_at", ""), "has_tokens": bool(_rnp_tokens())}
+def rnp_status(mp: str = "wb") -> dict[str, object]:
+    keys = _rnp_mps(mp)
+    states = {key: {**RNPS[key][0].state, "synced_at": draft_store.get_setting(RNPS[key][0].SYNCED_KEY, ""), "has_tokens": bool(RNPS[key][1]())}
+              for key in keys}
+    main = next((s for s in states.values() if s.get("status") == "running"), states[keys[0]])
+    return {**main, "status": "running" if any(s.get("status") == "running" for s in states.values()) else main.get("status"),
+            "has_tokens": any(s["has_tokens"] for s in states.values()), "by_mp": states}
 
 
 @app.post("/api/rnp/sync")
-def rnp_sync(days: int = 0) -> dict[str, object]:
-    if not _rnp_tokens():
-        raise HTTPException(400, "Нет кабинета WB с API-токеном — добавьте его в «Кабинеты маркетплейсов»")
-    if rnp.state.get("status") == "running":
-        return dict(rnp.state)
+def rnp_sync(days: int = 0, mp: str = "wb") -> dict[str, object]:
+    keys = [key for key in _rnp_mps(mp) if RNPS[key][1]()]
+    if not keys:
+        raise HTTPException(400, "Нет кабинета с API-ключом — добавьте его в «Кабинеты маркетплейсов»" if mp == "all" else
+                            f"Нет кабинета {'WB с API-токеном' if mp == 'wb' else 'Ozon с Client ID и API-ключом'} — добавьте его в «Кабинеты маркетплейсов»")
     days = max(0, min(int(days or 0), 90))
-    threading.Thread(target=rnp.sync, args=(days or None,), daemon=True).start()
-    draft_store.audit("rnp_sync", details=f"days={days}")
+    started = False
+    for key in keys:
+        service = RNPS[key][0]
+        if service.state.get("status") != "running":
+            threading.Thread(target=service.sync, args=(days or None,), daemon=True).start()
+            started = True
+    if not started:
+        return dict(RNPS[keys[0]][0].state)
+    draft_store.audit("rnp_sync", details=f"mp={mp};days={days}")
     return {"status": "running", "message": "Загрузка началась"}
 
 
@@ -2366,15 +2575,18 @@ class RNPPlanRequest(BaseModel):
     month: str
     orders_per_day: float | None = Field(default=None, ge=0, le=100000)
     margin: float | None = Field(default=None, ge=-100, le=100)
+    mp: str = "wb"
 
 
 @app.put("/api/rnp/plan")
 def rnp_set_plan(body: RNPPlanRequest) -> dict[str, object]:
+    if body.mp not in RNPS:
+        raise HTTPException(400, "План задаётся отдельно для WB и для Ozon — выберите маркетплейс")
     try:
-        rnp.set_plan(body.article, body.month, body.orders_per_day, body.margin)
+        RNPS[body.mp][0].set_plan(body.article, body.month, body.orders_per_day, body.margin)
     except RNPError as exc:
         raise HTTPException(400, str(exc))
-    draft_store.audit("rnp_plan", body.article, f"{body.month}: {body.orders_per_day} / {body.margin}")
+    draft_store.audit("rnp_plan", body.article, f"{body.mp} {body.month}: {body.orders_per_day} / {body.margin}")
     return {"saved": True}
 
 

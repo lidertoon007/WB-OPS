@@ -25,6 +25,13 @@ PRICE_HEADER = ["артикул", "кратность", COST_COL, PREP_COL, "д�
                 "бренд", "категория", "маркетплейсы (справочно)", "продано шт. с 01.2026 (справочно)"]
 RETRO_FILE, RETRO_COL = "retro_bonus.csv", "ретро_бонус_%"   # ретро-бонусы производителей по брендам (как в opiu_all.py)
 CARDS_URL = "https://content-api.wildberries.ru/content/v2/get/cards/list"
+# Загрузка справочника из Excel: поле -> начала заголовков колонки (в нижнем регистре)
+IMPORT_COLUMNS = (("article", ("артикул", "vendor code", "offer_id")),
+                  ("cost", ("себестоимость", "себес", COST_COL, "сс ")),
+                  ("prep", ("подготовка", PREP_COL, "фф", "фулфилмент")),
+                  ("brand", ("бренд",)),
+                  ("category", ("категория", "предмет")),
+                  ("name", ("наименование", "название")))
 ALL_MP = "Все маркетплейсы"
 
 
@@ -302,8 +309,88 @@ class Nomenclature:
             raise NomenclatureError("Цена с этой датой не найдена")
         self.write_cost_rows(header, left)
 
-    def _drop_missing(self, key: str) -> None:
-        """Артикул с ценой больше не «без себестоимости»: убираем его из cost_missing.csv."""
+    def import_table(self, table: list[list]) -> dict:
+        """Единый справочник из таблицы (первая строка — заголовки): себестоимость и подготовка по артикулу —
+        одна на все кабинеты и юрлица. Цена и подготовка из файла заменяют действующие; пустая ячейка
+        подготовки оставляет прежнюю; бренд, категория и название дописываются только в пустые ячейки.
+        Кратность не трогаем: в cost.csv это число единиц, на которое умножается себестоимость, а не штук в упаковке."""
+        if not table:
+            raise NomenclatureError("Файл пустой")
+        cols = {}
+        for i, h in enumerate(table[0]):
+            text = re.sub(r"\s+", " ", str(h or "")).strip().lower()
+            for field, words in IMPORT_COLUMNS:
+                if field not in cols and any(text == w or text.startswith(w) for w in words):
+                    cols[field] = i
+                    break
+        if "article" not in cols or "cost" not in cols:
+            raise NomenclatureError("Нужны колонки «Артикул» и «Себестоимость» в первой строке")
+        cell = lambda r, f: r[cols[f]] if f in cols and cols[f] < len(r) else None  # noqa: E731
+        header, rows = self.read_cost_rows()
+        by_key = defaultdict(list)
+        for r in rows:
+            by_key[art_key(r.get("артикул"))].append(r)
+        added, updated, same, skipped, changes, seen = 0, 0, 0, [], [], set()
+        for raw in table[1:]:
+            article = str(cell(raw, "article") or "").strip()
+            key = art_key(article)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            cost, prep = num(cell(raw, "cost")), num(cell(raw, "prep"))
+            if cost is None or not 0 <= cost <= 1_000_000 or (prep is not None and not 0 <= prep <= 100_000):
+                skipped.append(article)
+                continue
+            own = by_key.get(key) or []
+            target = self.current_price(own) or (own[-1] if own else None)
+            if target is None:
+                target = {"артикул": article, "кратность": "1", "действует_с": "", PREP_COL: fmt(prep or 0)}
+                rows.append(target)
+                by_key[key] = own = [target]
+                added += 1
+                before = None
+            else:
+                before = (num(target.get(COST_COL)), num(target.get(PREP_COL)))
+            target[COST_COL] = fmt(cost)
+            if prep is not None:
+                target[PREP_COL] = fmt(prep)
+            for field, col in (("brand", "бренд"), ("category", "категория"), ("name", "название (справочно)")):
+                value = re.sub(r"\s+", " ", str(cell(raw, field) or "")).strip()[:120]
+                if value:
+                    for r in own:
+                        if not r.get(col):
+                            r[col] = value
+            if before is not None:
+                after = (num(target.get(COST_COL)), num(target.get(PREP_COL)))
+                if before != after:
+                    updated += 1
+                    changes.append({"article": article, "cost": [before[0], after[0]], "prep": [before[1], after[1]]})
+                else:
+                    same += 1
+        if seen:
+            self.write_cost_rows(header, rows)
+            self._drop_missing(*seen)
+        return {"added": added, "updated": updated, "unchanged": same, "skipped": skipped, "changes": changes,
+                "total": len(by_key)}
+
+    def import_file(self, filename: str, content: bytes) -> dict:
+        """Excel (.xlsx) или CSV с себестоимостью → import_table."""
+        if (filename or "").lower().endswith((".xlsx", ".xlsm")):
+            from openpyxl import load_workbook
+            try:
+                ws = load_workbook(io.BytesIO(content), read_only=True, data_only=True).worksheets[0]
+            except Exception as exc:
+                raise NomenclatureError(f"Не удалось прочитать Excel: {exc}") from exc
+            table = [list(r) for r in ws.iter_rows(values_only=True)]
+        else:
+            text = content.decode("utf-8-sig", errors="replace")
+            delimiter = ";" if text[:4096].count(";") >= text[:4096].count(",") else ","
+            table = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+        return self.import_table([r for r in table if any(c not in (None, "") for c in r)])
+
+    def _drop_missing(self, *keys: str) -> None:
+        """Артикулы с ценой больше не «без себестоимости»: убираем их из cost_missing.csv."""
+        keys = set(keys)
         path = Path(self.project_dir()) / "cost_missing.csv"
         if not path.exists():
             return
@@ -311,7 +398,7 @@ class Nomenclature:
             lines = list(csv.reader(fh, delimiter=";"))
         if not lines:
             return
-        kept = [lines[0]] + [r for r in lines[1:] if r and art_key(r[0]) != key]
+        kept = [lines[0]] + [r for r in lines[1:] if r and art_key(r[0]) not in keys]
         if len(kept) != len(lines):
             buf = io.StringIO()
             csv.writer(buf, delimiter=";", lineterminator="\r\n").writerows(kept)

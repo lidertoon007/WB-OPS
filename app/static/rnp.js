@@ -44,11 +44,26 @@ window.WBOPSRnp = (() => {
     ['ads', 'Реклама, ₽', 'rub'], ['drr', 'ДРР', 'pct'], ['price', 'Цена до СПП', 'rub'], ['spp', 'СПП', 'pct'], ['ctr', 'CTR', 'pct'],
     ['views', 'Показы', 'int'], ['clicks', 'Клики', 'int'], ['cancel_rate', 'Отмены', 'pct']];
 
-  const st = {preset: 'days:14', from: '', to: '', cabinet: '', brand: '', category: '', article: '', view: 'days', heat: 'orders', sort: 'orders_sum', desc: true,
+  // Ozon: воронка карточки из аналитики Seller API (показы и корзина — только с подпиской Premium)
+  const FUNNEL_ROWS = [['Воронка Ozon'],
+    ['card_views', 'Показы карточки', 'int', 'Показы товара на Ozon: поиск, каталог и карточка (аналитика Seller API).'],
+    ['tocart', 'В корзину', 'int', 'Добавления в корзину.'], ['cart_rate', 'Конверсия в корзину', 'pct', 'Добавления в корзину к показам.'],
+    ['order_rate', 'Корзина → заказ', 'pct', 'Заказы к добавлениям в корзину.']];
+  const HEAT_OZON = [['card_views', 'Показы карточки', 'int'], ['tocart', 'В корзину', 'int'], ['cart_rate', 'Конверсия в корзину', 'pct']];
+  const MPS = [['wb', 'Wildberries'], ['ozon', 'Ozon'], ['all', 'Все маркетплейсы']];
+  const MP_SHORT = {wb: 'WB', ozon: 'Ozon', all: 'МП'};
+  // Показатели, которых у Ozon нет: СПП — только у WB, показы и клики рекламы — только в Ozon Performance API
+  const WB_ONLY = new Set(['spp', 'price_after_spp', 'views', 'clicks', 'ctr', 'cpc', 'cpo']);
+
+  const st = {preset: 'days:14', from: '', to: '', mp: 'wb', cabinet: '', brand: '', category: '', article: '', view: 'days', heat: 'orders', sort: 'orders_sum', desc: true,
     search: '', calc: '', data: null, poll: null};
   let root = null;
   try { Object.assign(st, JSON.parse(localStorage.getItem('wbops.rnp') || '{}'), {data: null, poll: null}); } catch (e) { /* без хранилища */ }
-  const remember = () => { try { localStorage.setItem('wbops.rnp', JSON.stringify({preset: st.preset, from: st.from, to: st.to, cabinet: st.cabinet, brand: st.brand, category: st.category, article: st.article, view: st.view, heat: st.heat, sort: st.sort, desc: st.desc})); } catch (e) { /* ignore */ } };
+  if (!MP_SHORT[st.mp]) st.mp = 'wb';
+  const remember = () => { try { localStorage.setItem('wbops.rnp', JSON.stringify({preset: st.preset, from: st.from, to: st.to, mp: st.mp, cabinet: st.cabinet, brand: st.brand, category: st.category, article: st.article, view: st.view, heat: st.heat, sort: st.sort, desc: st.desc})); } catch (e) { /* ignore */ } };
+  const mpWord = () => MP_SHORT[st.mp] || 'WB';
+  const hidden = key => st.mp === 'ozon' && WB_ONLY.has(key);
+  const label = text => st.mp === 'wb' ? text : text.replace('Комиссия WB', 'Комиссия МП');
 
   function presets() {
     const t = new Date(), y = addDays(t, -1);
@@ -62,7 +77,7 @@ window.WBOPSRnp = (() => {
     const p = presets().find(x => x[0] === st.preset) || presets()[3];
     return [iso(p[2]), iso(p[3])];
   }
-  const query = () => { const [from, to] = period(); const q = new URLSearchParams({from, to}); ['cabinet', 'brand', 'category', 'article'].forEach(k => st[k] && q.set(k, st[k])); return q; };
+  const query = () => { const [from, to] = period(); const q = new URLSearchParams({from, to, mp: st.mp}); ['cabinet', 'brand', 'category', 'article'].forEach(k => st[k] && q.set(k, st[k])); return q; };
 
   // ---------------------------------------------------------------- каркас
   async function render(section) {
@@ -74,7 +89,7 @@ window.WBOPSRnp = (() => {
       <div class="rnp-kpis" data-kpis></div>
       <div class="rnp-bar"><div class="rnp-tabs" role="tablist">
         ${[['days', 'По дням'], ['articles', 'По артикулам'], ['heat', 'Тепловая карта'], ['calc', 'Калькулятор гипотез']].map(([k, t]) => `<button type="button" role="tab" data-view="${k}">${t}</button>`).join('')}
-      </div><div class="db-bar-actions"><button type="button" class="db-ghost" data-sync title="Загрузить свежие заказы и рекламу из API WB">↻ Обновить из WB</button></div></div>
+      </div><div class="db-bar-actions"><button type="button" class="db-ghost" data-sync></button></div></div>
       <div data-body><p class="muted">Загрузка…</p></div>
       <section class="rnp-notes" data-notebook></section>`;
     root.querySelectorAll('[data-view]').forEach(b => b.onclick = () => { st.view = b.dataset.view; remember(); drawBody(); });
@@ -87,6 +102,8 @@ window.WBOPSRnp = (() => {
     try { const r = await fetch('/api/rnp?' + query()); d = await r.json(); if (!r.ok) throw new Error(d.detail || 'Ошибка'); }
     catch (e) { root.querySelector('[data-body]').innerHTML = `<p class="rv-error">${esc(e.message || 'Нет связи с панелью.')}</p>`; return; }
     st.data = d; remember();
+    const b = root.querySelector('[data-sync]');
+    if (b && !b.disabled) { b.textContent = `↻ Обновить из ${mpWord()}`; b.title = `Загрузить свежие заказы и рекламу из API ${st.mp === 'all' ? 'WB и Ozon' : mpWord()}`; }
     drawFilters(); drawNotes(); drawKpis(); drawBody(); drawNotebook();
     if (d.state?.status === 'running') waitSync();
   }
@@ -95,15 +112,20 @@ window.WBOPSRnp = (() => {
     const o = st.data.options || {}, [from, to] = period();
     const opt = (v, t, cur) => `<option value="${esc(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(t)}</option>`;
     const arts = (o.articles || []).filter(a => (!st.brand || a.brand === st.brand) && (!st.category || a.category === st.category));
-    // Кабинеты WB — группами по юрлицу; список показываем, если кабинетов больше одного
-    const cabs = st.data.cabinets || [], legal = [...new Set(cabs.map(c => c.legal_name || ''))];
+    // Кабинеты выбранного маркетплейса — группами по юрлицу; список показываем, если кабинетов больше одного
+    const all = st.data.cabinets || [], cabs = st.mp === 'all' ? all : all.filter(c => c.mp === st.mp);
+    const cabName = c => st.mp === 'all' ? `${c.name} · ${cabs.filter(x => x.name === c.name).map(x => MP_SHORT[x.mp]).join(' + ')}` : c.name;
+    const uniq = [...new Map(cabs.map(c => [c.name, c])).values()];       // один кабинет WB и Ozon с тем же названием — один пункт
+    const legal = [...new Set(uniq.map(c => c.legal_name || ''))];
     const cabOpts = legal.length > 1
-      ? legal.map(l => `<optgroup label="${esc(l || 'Без юрлица')}">${cabs.filter(c => (c.legal_name || '') === l).map(c => opt(c.name, c.name, st.cabinet)).join('')}</optgroup>`).join('')
-      : cabs.map(c => opt(c.name, c.name + (c.legal_name ? ' · ' + c.legal_name : ''), st.cabinet)).join('');
+      ? legal.map(l => `<optgroup label="${esc(l || 'Без юрлица')}">${uniq.filter(c => (c.legal_name || '') === l).map(c => opt(c.name, cabName(c), st.cabinet)).join('')}</optgroup>`).join('')
+      : uniq.map(c => opt(c.name, cabName(c) + (c.legal_name ? ' · ' + c.legal_name : ''), st.cabinet)).join('');
+    const has = st.data.has_tokens_by_mp || {};
     root.querySelector('[data-filters]').innerHTML = `
       <select data-f="preset" aria-label="Период" class="db-period">${presets().map(([k, t]) => opt(k, t, st.preset)).join('')}</select>
       ${st.preset === 'custom' ? `<label class="db-date">с <input type="date" data-f="from" value="${from}"></label><label class="db-date">по <input type="date" data-f="to" value="${to}"></label>` : ''}
-      ${cabs.length > 1 || st.cabinet ? `<select data-f="cabinet" aria-label="Кабинет">${opt('', 'Все кабинеты', st.cabinet)}${cabOpts}</select>` : ''}
+      <select data-f="mp" aria-label="Маркетплейс">${MPS.map(([k, t]) => opt(k, t + (k !== 'all' && has[k] === false ? ' · нет ключей' : ''), st.mp)).join('')}</select>
+      ${uniq.length > 1 || st.cabinet ? `<select data-f="cabinet" aria-label="Кабинет">${opt('', 'Все кабинеты', st.cabinet)}${cabOpts}</select>` : ''}
       <select data-f="brand" aria-label="Бренд">${opt('', 'Все бренды', st.brand)}${(o.brands || []).map(b => opt(b, b, st.brand)).join('')}</select>
       <select data-f="category" aria-label="Категория">${opt('', 'Все категории', st.category)}${(o.categories || []).map(b => opt(b, b, st.category)).join('')}</select>
       <select data-f="article" aria-label="Артикул">${opt('', 'Все артикулы', st.article)}${arts.map(a => opt(a.key, a.article, st.article)).join('')}</select>`;
@@ -112,27 +134,46 @@ window.WBOPSRnp = (() => {
       if (k === 'preset' && el.value === 'custom') { st.from = from; st.to = to; }
       st[k] = el.value;
       if (k === 'brand' || k === 'category') st.article = '';
+      if (k === 'mp') {           // кабинет другого маркетплейса сбрасываем
+        if (st.cabinet && st.mp !== 'all' && !all.some(c => c.mp === st.mp && c.name === st.cabinet)) st.cabinet = '';
+        st.pick = new Set();
+      }
       load();
     });
     const d = st.data, src = d.sources || {};
-    const synced = d.synced_at ? new Date(d.synced_at).toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'}) : null;
-    root.querySelector('[data-fresh]').textContent = [synced ? `API WB: ${synced}` : 'API WB ещё не загружали',
+    const when = s => s ? new Date(s).toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'}) : null;
+    const synced = Object.entries(d.synced_by_mp || {wb: d.synced_at}).map(([k, s]) => when(s) ? `API ${MP_SHORT[k]}: ${when(s)}` : `API ${MP_SHORT[k]} ещё не загружали`);
+    root.querySelector('[data-fresh]').textContent = [...synced,
       d.stocks_at ? `остатки на ${d.stocks_at.slice(0, 16).replace(/(\d{4})-(\d\d)-(\d\d)/, '$3.$2')}` : '',
       src.orders === 'cache' ? 'заказы из кэша ОПиУ' : ''].filter(Boolean).join(' · ');
   }
 
   function drawNotes() {
-    const d = st.data, s = d.sources || {}, notes = [], e = d.economics || {};
-    const src = [];
-    if (s.orders === 'cache' || s.orders === 'mixed') src.push(`заказы ${s.orders === 'mixed' ? 'за часть дней ' : ''}— из кэша ОПиУ (обновляется с «Финансами», без СПП)`);
-    if (s.ads === 'report') src.push('реклама — из отчёта реализации WB (с задержкой до недели, без показов и кликов)');
-    if (src.length) notes.push(`Сейчас ${src.join('; ')}. ${d.has_tokens ? 'Нажмите «Обновить из WB» — заказы и реклама подтянутся из API WB и дальше будут обновляться каждые 2 часа.'
-      : 'Чтобы данные шли из API WB каждые 2 часа, добавьте токен кабинета в «Кабинеты маркетплейсов» (категории «Статистика» и «Продвижение»).'}`);
+    const d = st.data, notes = [], has = d.has_tokens_by_mp || {wb: d.has_tokens};
+    const bySrc = d.sources_by_mp || {[st.mp]: d.sources || {}};
+    Object.entries(bySrc).forEach(([mp, s]) => {
+      const src = [], w = MP_SHORT[mp];
+      if (s.orders === 'cache' || s.orders === 'mixed') src.push(`заказы ${s.orders === 'mixed' ? 'за часть дней ' : ''}— из кэша ОПиУ (обновляется с «Финансами»${mp === 'wb' ? ', без СПП' : ''})`);
+      if (s.ads === 'report') src.push(mp === 'wb' ? 'реклама — из отчёта реализации WB (с задержкой до недели, без показов и кликов)'
+        : 'расходы на продвижение — из начислений Ozon в кэше ОПиУ');
+      if (src.length) notes.push(`${w}: сейчас ${src.join('; ')}. ${has[mp] ? `Нажмите «Обновить из ${mpWord()}» — данные подтянутся из API ${w} и дальше будут обновляться каждые 2 часа.`
+        : mp === 'wb' ? 'Чтобы данные шли из API WB каждые 2 часа, добавьте токен кабинета в «Кабинеты маркетплейсов» (категории «Статистика» и «Продвижение»).'
+          : 'Чтобы данные шли из Seller API Ozon каждые 2 часа, добавьте в «Кабинеты маркетплейсов» кабинет Ozon с Client ID и API-ключом и включённым сбором статистики.'}`);
+      if (mp === 'ozon') {
+        notes.push('Реклама Ozon — только расходы из начислений (группа «Реклама и продвижение»). Показы и клики рекламы Ozon отдаёт лишь в Performance API ' +
+          '(отдельные ключи на performance.ozon.ru) — он не подключён, поэтому показов, кликов, CTR, CPC и CPO по Ozon нет.');
+        if ((s.funnel_off || []).length) notes.push(`Воронка Ozon (показы карточки, корзина) недоступна для: ${s.funnel_off.join(', ')} — эти метрики Ozon отдаёт только с подпиской Premium.`);
+      }
+    });
     if (d.total?.no_cost > 0) notes.push(`${num(d.total.no_cost)} заказов по товарам без себестоимости — прибыль завышена. Задайте цены в «Товары → Номенклатура и себестоимость».`);
-    (d.state?.errors || []).forEach(x => notes.push('Загрузка из WB: ' + x));
-    if (d.state?.status === 'error') notes.push('Загрузка из WB не удалась: ' + d.state.message);
+    Object.entries(d.states || {[st.mp]: d.state || {}}).forEach(([mp, s]) => {
+      (s.errors || []).forEach(x => notes.push(`Загрузка из ${MP_SHORT[mp]}: ${x}`));
+      if (s.status === 'error') notes.push(`Загрузка из ${MP_SHORT[mp]} не удалась: ${s.message}`);
+    });
+    const econ = Object.entries(d.economics_by_mp || {[st.mp]: d.economics || {}});
     root.querySelector('[data-notes]').innerHTML = notes.map(n => `<div class="db-note">${esc(n)}</div>`).join('') +
-      `<p class="rnp-how muted">Прогноз прибыли по заказам: заказы × выкуп артикула − комиссия, эквайринг, логистика, реклама, хранение, себестоимость, подготовка и налог ${num(e.tax_rate, 1)}%. Доли — по отчёту WB за ${ru(e.window?.[0])} – ${ru(e.window?.[1])}.</p>`;
+      `<p class="rnp-how muted">Прогноз прибыли по заказам: заказы × выкуп артикула − комиссия, эквайринг, логистика, реклама, хранение, себестоимость, подготовка и налог. ` +
+      econ.map(([mp, e]) => `${MP_SHORT[mp]}: налог ${num(e.tax_rate, 1)}%, доли — по отчёту ${MP_SHORT[mp]} за ${ru(e.window?.[0])} – ${ru(e.window?.[1])}.`).join(' ') + '</p>';
   }
 
   function drawKpis() {
@@ -142,8 +183,8 @@ window.WBOPSRnp = (() => {
       k('Заказы', `${num(t.orders)} шт`, `${num(t.orders_sum)} ₽ · ${num(t.orders_per_day, 1)} в день`),
       k('Прогноз выручки', `${num(t.revenue)} ₽`, `выкуп ${F.pct(t.buyout)}`),
       k('Прогноз прибыли', `${num(t.profit)} ₽`, `маржа ${F.pct(t.margin)} · ROI ${F.pct(t.roi)}`, t.profit < 0 ? 'bad' : 'good'),
-      k('Реклама', `${num(t.ads)} ₽`, `ДРР ${F.pct(t.drr)}${t.cpo != null ? ` · CPO ${num(t.cpo)} ₽` : ''}`),
-      k('Остаток WB', `${num(t.stock)} шт`, t.orders_per_day ? `хватит на ${num(t.stock / t.orders_per_day)} дн.` : 'нет заказов'),
+      k('Реклама', `${num(t.ads)} ₽`, `ДРР ${F.pct(t.drr)}${t.cpo != null && st.mp !== 'ozon' ? ` · CPO ${num(t.cpo)} ₽` : ''}`),
+      k(`Остаток ${mpWord()}`, `${num(t.stock)} шт`, t.orders_per_day ? `хватит на ${num(t.stock / t.orders_per_day)} дн.` : 'нет заказов'),
       k('План заказов', t.plan_orders_per_day ? F.pct(t.plan_done) : '—', t.plan_orders_per_day ? `${num(t.plan_fact_per_day, 1)} из ${num(t.plan_orders_per_day, 1)} в день` : 'задайте во вкладке «По артикулам»',
         t.plan_done == null ? '' : t.plan_done >= 100 ? 'good' : 'bad'),
     ].join('');
@@ -166,8 +207,13 @@ window.WBOPSRnp = (() => {
       const cls = (key === 'profit' || key === 'margin') && v != null && v !== 0 ? (v < 0 ? 'neg' : 'pos') : '';
       return `<td class="${cls}">${F[fmt](v)}</td>`;
     };
-    const rows = DAY_ROWS.map(r => r.length === 1 ? `<tr class="rnp-group"><th class="rnp-sticky" colspan="${days.length + 2}">${esc(r[0])}</th></tr>`
-      : `<tr class="${r[4] || ''}"><th class="rnp-sticky" ${r[3] ? `title="${esc(r[3])}"` : ''}>${esc(r[1])}</th>${cell(r[0], r[2], d.total[r[0]])}${days.map(x => cell(r[0], r[2], d.by_day[x]?.[r[0]])).join('')}</tr>`).join('');
+    const funnel = st.mp !== 'wb' && d.sources_by_mp?.ozon?.funnel;
+    const list = DAY_ROWS.filter(r => r.length === 1 || !hidden(r[0]));
+    if (funnel) list.splice(list.findIndex(r => r[0] === 'Прогноз по заказам'), 0, ...FUNNEL_ROWS);
+    const tip = r => r[0] === 'ads' && st.mp !== 'wb' ? (st.mp === 'ozon' ? 'Расходы на продвижение Ozon из начислений.' : 'WB Продвижение и расходы на продвижение Ozon.')
+      : r[0] === 'spp' && st.mp === 'all' ? 'Средняя СПП по заказам WB (у Ozon её нет).' : r[3];
+    const rows = list.map(r => r.length === 1 ? `<tr class="rnp-group"><th class="rnp-sticky" colspan="${days.length + 2}">${esc(r[0])}</th></tr>`
+      : `<tr class="${r[4] || ''}"><th class="rnp-sticky" ${tip(r) ? `title="${esc(tip(r))}"` : ''}>${esc(label(r[1]))}</th>${cell(r[0], r[2], d.total[r[0]])}${days.map(x => cell(r[0], r[2], d.by_day[x]?.[r[0]])).join('')}</tr>`).join('');
     const noteRow = `<tr class="rnp-noterow"><th class="rnp-sticky">Заметки</th><td></td>${days.map(x => `<td>${(notes[x] || []).length
       ? `<button type="button" class="rnp-pin" data-note-day="${x}" title="${esc(notes[x].map(n => (n.article ? n.article + ': ' : '') + n.text).join('\n'))}">✎ ${notes[x].length}</button>`
       : `<button type="button" class="rnp-pin empty" data-note-day="${x}" aria-label="Добавить заметку за ${ru(x)}">+</button>`}</td>`).join('')}</tr>`;
@@ -176,7 +222,8 @@ window.WBOPSRnp = (() => {
       : empty();
     root.querySelectorAll('[data-note-day]').forEach(b => b.onclick = () => focusNote(b.dataset.noteDay));
   }
-  const empty = () => `<div class="rv-empty"><b>Нет заказов за период</b><p class="muted">${st.data.has_tokens ? 'Нажмите «Обновить из WB», чтобы загрузить заказы и рекламу.' : 'Подключите кабинет WB с токеном или обновите «Финансы».'}</p></div>`;
+  const empty = () => `<div class="rv-empty"><b>Нет заказов за период</b><p class="muted">${st.data.has_tokens ? `Нажмите «Обновить из ${mpWord()}», чтобы загрузить заказы и рекламу.`
+    : st.mp === 'ozon' ? 'Подключите кабинет Ozon с Client ID и API-ключом или обновите «Финансы».' : 'Подключите кабинет WB с токеном или обновите «Финансы».'}</p></div>`;
 
   // ---------------------------------------------------------------- по артикулам
   function drawArticles() {
@@ -191,20 +238,22 @@ window.WBOPSRnp = (() => {
       return sign * (x - y);
     });
     const th = (k, t) => `<th><button type="button" class="rnp-sort ${st.sort === k ? 'on' : ''}" data-sort="${k}">${esc(t)}${st.sort === k ? (st.desc ? ' ↓' : ' ↑') : ''}</button></th>`;
+    const cols = ART_COLS.filter(([k]) => !hidden(k)), planOff = st.mp === 'all';      // план задаётся отдельно для WB и Ozon
+    const planAttr = planOff ? 'disabled title="План задаётся отдельно для WB и для Ozon — выберите маркетплейс"' : '';
     const mLabel = MONTHS[Number(month.slice(5)) - 1].toLowerCase();
     st.pick = st.pick || new Set();
     root.querySelector('[data-body]').innerHTML = `<div class="rnp-tools"><input type="search" data-search placeholder="Поиск по артикулу, бренду, категории" value="${esc(st.search)}">
-        <span class="muted">${rows.length} артикулов · план на ${mLabel}: заказов в день и маржа, %. Сохраняется сразу.</span>
+        <span class="muted">${rows.length} артикулов · ${planOff ? `план на ${mLabel} — сумма планов WB и Ozon; задаётся при выборе одного маркетплейса.` : `план ${mpWord()} на ${mLabel}: заказов в день и маржа, %. Сохраняется сразу.`}</span>
         <span class="rnp-pick"><button type="button" class="rv-link" data-pick-neg>Отметить с маржой ниже 0</button>
         <button type="button" class="db-ghost" data-reprice ${st.pick.size ? '' : 'disabled'}>₽ Изменить цену${st.pick.size ? ` (${st.pick.size})` : ''}</button></span></div>
       <div class="rnp-scroll"><table class="rnp-table rnp-arts"><thead><tr>${th('article', 'Артикул').replace('<th>', '<th class="rnp-sticky">')}
-        ${ART_COLS.map(([k, t]) => th(k, t)).join('')}<th>План, шт/день</th><th>План маржи, %</th>${th('plan_done', '% плана')}</tr></thead>
+        ${cols.map(([k, t]) => th(k, t)).join('')}<th>План, шт/день</th><th>План маржи, %</th>${th('plan_done', '% плана')}</tr></thead>
       <tbody>${rows.map(r => `<tr><th class="rnp-sticky"><input type="checkbox" class="rnp-cb" data-pick="${esc(r.key)}" ${st.pick.has(r.key) ? 'checked' : ''} aria-label="Отметить ${esc(r.article)}"> <b>${esc(r.article)}</b><small>${esc([r.brand, r.category].filter(Boolean).join(' · '))}${r.economics?.source === 'кабинет' ? ' · доли по кабинету' : ''}</small></th>
-        ${ART_COLS.map(([k, , f]) => `<td class="${(k === 'profit' || k === 'margin') && r[k] ? (r[k] < 0 ? 'neg' : 'pos') : ''}${k === 'stock_days' && r[k] != null && r[k] < 14 ? ' warn' : ''}">${F[f](r[k])}</td>`).join('')}
-        <td><input type="number" min="0" step="0.5" inputmode="decimal" data-plan="${esc(r.key)}" data-k="orders_per_day" value="${r.plan_orders_per_day ?? ''}" aria-label="План заказов в день ${esc(r.article)}"></td>
-        <td><input type="number" min="-100" max="100" step="1" inputmode="decimal" data-plan="${esc(r.key)}" data-k="margin" value="${r.plan_margin ?? ''}" aria-label="План маржи ${esc(r.article)}"></td>
+        ${cols.map(([k, , f]) => `<td class="${(k === 'profit' || k === 'margin') && r[k] ? (r[k] < 0 ? 'neg' : 'pos') : ''}${k === 'stock_days' && r[k] != null && r[k] < 14 ? ' warn' : ''}">${F[f](r[k])}</td>`).join('')}
+        <td><input type="number" min="0" step="0.5" inputmode="decimal" data-plan="${esc(r.key)}" data-k="orders_per_day" value="${r.plan_orders_per_day ?? ''}" ${planAttr} aria-label="План заказов в день ${esc(r.article)}"></td>
+        <td><input type="number" min="-100" max="100" step="1" inputmode="decimal" data-plan="${esc(r.key)}" data-k="margin" value="${r.plan_margin == null ? '' : Math.round(r.plan_margin * 10) / 10}" ${planAttr} aria-label="План маржи ${esc(r.article)}"></td>
         <td class="${r.plan_done == null ? '' : r.plan_done >= 100 ? 'pos' : 'neg'}">${F.pct(r.plan_done)}${r.plan_margin != null && r.margin != null ? `<small>маржа ${r.margin >= r.plan_margin ? '✓' : '✗'}</small>` : ''}</td></tr>`).join('')
-        || `<tr><td colspan="${ART_COLS.length + 4}" class="muted">Ничего не найдено.</td></tr>`}</tbody></table></div>`;
+        || `<tr><td colspan="${cols.length + 4}" class="muted">Ничего не найдено.</td></tr>`}</tbody></table></div>`;
     const s = root.querySelector('[data-search]');
     s.oninput = () => { st.search = s.value; const pos = s.selectionStart; drawArticles(); const n = root.querySelector('[data-search]'); n.focus(); n.setSelectionRange(pos, pos); };
     root.querySelectorAll('[data-sort]').forEach(b => b.onclick = () => { if (st.sort === b.dataset.sort) st.desc = !st.desc; else { st.sort = b.dataset.sort; st.desc = b.dataset.sort !== 'article'; } remember(); drawArticles(); });
@@ -220,7 +269,7 @@ window.WBOPSRnp = (() => {
     const get = k => { const el = root.querySelector(`[data-plan="${CSS.escape(key)}"][data-k="${k}"]`); return el && el.value !== '' ? Number(el.value) : null; };
     const els = root.querySelectorAll(`[data-plan="${CSS.escape(key)}"]`);
     try {
-      const r = await fetch('/api/rnp/plan', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({article: key, month, orders_per_day: get('orders_per_day'), margin: get('margin')})});
+      const r = await fetch('/api/rnp/plan', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({article: key, month, orders_per_day: get('orders_per_day'), margin: get('margin'), mp: st.mp})});
       if (!r.ok) throw new Error((await r.json()).detail || 'Не сохранилось');
       els.forEach(e => { e.classList.add('saved'); setTimeout(() => e.classList.remove('saved'), 1200); });
       st.data = await (await fetch('/api/rnp?' + query())).json();
@@ -231,8 +280,9 @@ window.WBOPSRnp = (() => {
   // ---------------------------------------------------------------- тепловая карта
   async function drawHeat() {
     const body = root.querySelector('[data-body]');
-    const def = HEAT.find(h => h[0] === st.heat) || HEAT[0];
-    body.innerHTML = `<div class="rnp-tools"><label>Показатель <select data-heat>${HEAT.map(([k, t]) => `<option value="${k}" ${k === def[0] ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
+    const heat = [...HEAT.filter(([k]) => !hidden(k)), ...(st.mp !== 'wb' && st.data.sources_by_mp?.ozon?.funnel ? HEAT_OZON : [])];
+    const def = heat.find(h => h[0] === st.heat) || heat[0];
+    body.innerHTML = `<div class="rnp-tools"><label>Показатель <select data-heat>${heat.map(([k, t]) => `<option value="${k}" ${k === def[0] ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
       <span class="muted" data-legend></span></div><div data-heatbody><p class="muted">Загрузка…</p></div>`;
     body.querySelector('[data-heat]').onchange = e => { st.heat = e.target.value; remember(); drawHeat(); };
     const q = query(); q.set('metric', def[0]);
@@ -278,7 +328,7 @@ window.WBOPSRnp = (() => {
       acquiring: (e.acquiring || 0) * 100, logistics: e.logistics_per_order || 0, cost: row.cost || 0, prep: row.prep_cost || 0, opd: row.orders_per_day || 0, dorders: 0};
     const base = Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, Math.round(v * 100) / 100]));
     const fields = [['price', 'Цена продавца, ₽', 1], ['dprice', 'Изменение цены, %', 1], ['dorders', 'Изменение заказов, %', 1], ['drr', 'ДРР от заказов, %', 0.1],
-      ['buyout', 'Выкуп, %', 0.5], ['commission', 'Комиссия WB, % от выручки', 0.1], ['acquiring', 'Эквайринг, %', 0.1], ['logistics', 'Логистика на заказ, ₽', 1],
+      ['buyout', 'Выкуп, %', 0.5], ['commission', `${label('Комиссия WB')}, % от выручки`, 0.1], ['acquiring', 'Эквайринг, %', 0.1], ['logistics', 'Логистика на заказ, ₽', 1],
       ['cost', 'Себестоимость, ₽', 1], ['prep', 'Подготовка, ₽', 1], ['opd', 'Заказов в день сейчас', 0.5]];
     root.querySelector('[data-body]').innerHTML = `<div class="rnp-calc"><form class="rnp-calc-form" data-calc>
         <label class="wide">Артикул <select name="art">${arts.map(r => `<option value="${esc(r.key)}" ${r.key === row.key ? 'selected' : ''}>${esc(r.article)}</option>`).join('')}</select></label>
@@ -302,7 +352,7 @@ window.WBOPSRnp = (() => {
       const line = (t, k, f = 'rub', strong) => { const a = now[k], b = hyp[k], diff = a != null && b != null && Math.abs(b - a) >= (f === 'pct' ? 0.05 : 0.5) ? b - a : null;
         return `<tr class="${strong ? 'strong' : ''}"><th>${t}</th><td>${F[f](a)}</td><td>${F[f](b)}</td><td class="${diff == null || k === 'P' ? '' : (['profit', 'margin', 'roi', 'day', 'month', 'rev', 'beDrr', 'opd'].includes(k) ? diff > 0 : diff < 0) ? 'pos' : 'neg'}">${diff == null || Math.abs(diff) < 0.005 ? '' : (diff > 0 ? '+' : '') + F[f](diff)}</td></tr>`; };
       root.querySelector('[data-out]').innerHTML = `<table class="rnp-table rnp-calc-table"><thead><tr><th>На один заказ</th><th>Сейчас</th><th>Гипотеза</th><th>Разница</th></tr></thead><tbody>
-        ${line('Цена продавца', 'P')}${line('Выручка с учётом выкупа', 'rev')}${line('Комиссия WB', 'comm')}${line('Эквайринг', 'acq')}${line('Логистика', 'log')}
+        ${line('Цена продавца', 'P')}${line('Выручка с учётом выкупа', 'rev')}${line(label('Комиссия WB'), 'comm')}${line('Эквайринг', 'acq')}${line('Логистика', 'log')}
         ${line('Реклама', 'ads')}${line('Себестоимость и подготовка', 'cogs')}${line('Налог', 'tax')}${line('Прибыль с заказа', 'profit', 'rub', true)}
         ${line('Маржинальность', 'margin', 'pct', true)}${line('ROI', 'roi', 'pct')}${line('ДРР безубыточности', 'beDrr', 'pct')}
         ${line('Заказов в день', 'opd', 'rub2')}${line('Прибыль в день', 'day', 'rub', true)}${line('Прибыль за 30 дней', 'month', 'rub', true)}</tbody></table>
@@ -360,7 +410,7 @@ window.WBOPSRnp = (() => {
   async function sync(e) {
     const b = e.currentTarget; b.disabled = true;
     try {
-      const r = await fetch('/api/rnp/sync', {method: 'POST'}); const d = await r.json();
+      const r = await fetch('/api/rnp/sync?mp=' + st.mp, {method: 'POST'}); const d = await r.json();
       if (!r.ok) throw new Error(d.detail || 'Не удалось');
       b.textContent = '↻ Загружаю…'; waitSync();
     } catch (err) { alert(err.message); b.disabled = false; }
@@ -370,9 +420,10 @@ window.WBOPSRnp = (() => {
     const b = root.querySelector('[data-sync]'); if (b) { b.disabled = true; b.textContent = '↻ Загружаю…'; }
     st.poll = setTimeout(async () => {
       if (!root?.isConnected) return;
-      const s = await (await fetch('/api/rnp/status')).json().catch(() => ({}));
+      const s = await (await fetch('/api/rnp/status?mp=' + st.mp)).json().catch(() => ({}));
       if (s.status === 'running') { if (b) b.title = s.message || ''; return waitSync(); }
-      if (b) { b.disabled = false; b.textContent = '↻ Обновить из WB'; }
+      if (b) { b.disabled = false; b.textContent = `↻ Обновить из ${mpWord()}`; }
+
       load();
     }, 4000);
   }

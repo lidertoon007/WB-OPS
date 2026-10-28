@@ -130,5 +130,57 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(o["last_day"], "2026-10-02")
 
 
+class OzonDashboardTests(unittest.TestCase):
+    """Выгрузка ozon_finance --grain day: свои статьи, бренд и категория — из cost.csv, выкуп — по заказам без отмен."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        (root / "Ozon" / "cache" / "123").mkdir(parents=True)
+        (root / "Ozon" / "ozon_accounts.json").write_text(json.dumps({"tax_percent": 2, "accounts": [{"name": CAB}]}), encoding="utf-8")
+        data = {"months": ["2026-10-01"], "cabinets": {CAB: {
+            "by_article": [["2026-10-01", "a-1", "Выручка", "Продажи (цена продавца)", 10000.0],
+                           ["2026-10-01", "a-1", "Комиссия Ozon", "Комиссия за продажу", -1500.0],
+                           ["2026-10-01", "a-1", "Логистика и доставка", "Логистика", -800.0],
+                           ["2026-10-01", "a-1", "Обработка возвратов и отмен", "Обратная логистика", -200.0],
+                           ["2026-10-01", "a-1", "Реклама и продвижение", "Оплата за клик", -600.0],
+                           ["2026-10-01", "", "Подписки и прочие услуги Ozon", "Подписка Premium Pro (процент)", -300.0],
+                           ["2026-10-01", "", "Штрафы и нарушения", "Превышение индекса ошибок", -100.0],
+                           ["2026-10-01", "", "Компенсации и прочие начисления", "Корректировка стоимости услуг", 50.0]],
+            "orders": [["2026-10-01", "2026-10-01", "p1", "a-1", 2.0, 10000.0]],
+            "tax_base_by_article": [["2026-10-01", "a-1", 9000.0]],
+            "ordered": [["2026-10-01", "a-1", 4.0, 20000.0, 1.0, 5000.0]],
+            "stocks": [["a-1", "Свой склад (FBS)", "own", 5]], "prices": [["a-1", 5000.0, 5000.0, 5000.0]]}}}
+        (root / "Ozon" / "cache" / DUMP_NAME).write_text(json.dumps(data), encoding="utf-8")
+        (root / "Ozon" / "cache" / "123" / "orders.json").write_text("{}", encoding="utf-8")
+        costs = [{"артикул": "A-1", "кратность": "1", "сс_за_ед": "1000,00", "подготовка_за_ед": "60,00", "действует_с": "",
+                  "бренд": "Zillii", "категория": "Корм"}]
+        spend = lambda *a: {"by_day": {"2026-10-01": 99999}, "by_article": {}}  # noqa: E731 — реклама WB к Ozon не относится
+        self.db = Dashboard(lambda: root, lambda: "python", lambda: costs, ad_spend=spend, mp="ozon")
+        self.root = root
+
+    def test_ozon_metrics(self):
+        s = self.db.summary(date(2026, 10, 1), date(2026, 10, 1))
+        c = s["current"]
+        self.assertEqual(s["mp"], "ozon")
+        self.assertEqual((c["revenue"], c["commission"], c["logistics"], c["ads"]), (10000, -1500, -1000, -900))   # + Premium Pro (маркетинг)
+        self.assertEqual((c["other"], c["penalty"], c["compensation"], c["marketing"]), (0, -100, 50, -300))
+        self.assertEqual(c["net_to_pay"], 10000 - 1500 - 1000 - 600 - 300 - 100 + 50)
+        self.assertEqual((c["cogs"], c["prep"]), (-2000, -120))
+        self.assertAlmostEqual(c["tax"], -180)                       # 2% от 9000
+        self.assertAlmostEqual(c["profit"], 6550 - 2000 - 120 - 180)
+        self.assertEqual(c["buyout"], 75)                            # 4 заказано, 1 отменён
+        self.assertEqual(c["stock_qty"], 5)
+        o = s["options"]
+        self.assertEqual((o["brands"], o["categories"]), (["Zillii"], ["Корм"]))   # Ozon их не даёт — из cost.csv
+
+    def test_ozon_cache_in_cabinet_folders_marks_stale(self):
+        import os, time
+        later = time.time() + 60
+        os.utime(self.root / "Ozon" / "cache" / "123" / "orders.json", (later, later))
+        self.assertTrue(self.db.stale())
+
+
 if __name__ == "__main__":
     unittest.main()

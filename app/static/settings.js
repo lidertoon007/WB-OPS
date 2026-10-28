@@ -466,6 +466,7 @@ window.WBOPSSettings = (() => {
     try { me = await api('/api/team/me'); } catch (e) { me = {role: 'owner'}; }
     if (me.role === 'member') {
       document.body.classList.add('wb-member');
+      window.dispatchEvent(new PopStateEvent('popstate'));   // роутер покажет сотруднику рабочую очередь вместо сводки
       const foot = document.querySelector('.sidebar-footer');
       if (foot) {
         foot.innerHTML = `<span>${esc(me.member.name)}</span> <button type="button" class="st-link" data-logout>Выйти</button>`;

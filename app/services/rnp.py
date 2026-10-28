@@ -45,6 +45,11 @@ class _Limiter:
 
 
 class RNP:
+    MP, TITLE = "wb", "WB"
+    PLANS_TABLE = "rnp_plans"
+    SYNCED_KEY = "rnp_synced_at"
+    NO_TOKENS = "Нет кабинетов WB с API-токеном (раздел «Кабинеты маркетплейсов»)"
+
     def __init__(self, store, tokens, economics, cost_rows, retro_rows=lambda: []):
         self.store = store
         self.tokens = tokens            # callable -> [(название кабинета, токен[, токен рекламы])]
@@ -56,24 +61,28 @@ class RNP:
         self._lock = threading.Lock()
         self.limiter = _Limiter()
         with store._connect() as c:
-            c.execute("CREATE TABLE IF NOT EXISTS rnp_orders (srid TEXT PRIMARY KEY, cabinet TEXT, day TEXT, last_change TEXT, nm_id INTEGER, "
-                      "article TEXT, brand TEXT, subject TEXT, price REAL, spp REAL, finished REAL, total REAL, is_cancel INTEGER)")
-            c.execute("CREATE INDEX IF NOT EXISTS rnp_orders_day ON rnp_orders(day)")
-            cols = {r[1] for r in c.execute("PRAGMA table_info(rnp_orders)")}
-            if "barcode" not in cols:            # размер заказа — для заказов в день по размерам (вкладка «Остатки FBS»)
-                c.execute("ALTER TABLE rnp_orders ADD COLUMN barcode TEXT")
-                c.execute("ALTER TABLE rnp_orders ADD COLUMN tech_size TEXT")
-                c.execute("DELETE FROM app_settings WHERE key LIKE 'rnp_orders_since:%'")     # перезагрузить заказы с размерами
-            c.execute("CREATE TABLE IF NOT EXISTS rnp_ads (cabinet TEXT, day TEXT, nm_id INTEGER, views REAL, clicks REAL, spend REAL, atbs REAL, "
-                      "orders REAL, shks REAL, sum_price REAL, PRIMARY KEY(cabinet, day, nm_id))")
-            # Один продавец мог быть подключён дважды (кабинет панели и кабинет ОПиУ с другим ключом) —
-            # реклама задваивалась. Один раз очищаем рекламу, чтобы она перезагрузилась без дублей.
-            if not c.execute("SELECT 1 FROM app_settings WHERE key='rnp_ads_dedup_v1'").fetchone():
-                c.execute("DELETE FROM rnp_ads")
-                c.execute("DELETE FROM app_settings WHERE key LIKE 'rnp_ads_since:%'")
-                c.execute("INSERT OR REPLACE INTO app_settings(key, value) VALUES('rnp_ads_dedup_v1', '1')")
-            c.execute("CREATE TABLE IF NOT EXISTS rnp_plans (article TEXT, month TEXT, orders_per_day REAL, margin REAL, PRIMARY KEY(article, month))")
+            c.execute(f"CREATE TABLE IF NOT EXISTS {self.PLANS_TABLE} (article TEXT, month TEXT, orders_per_day REAL, margin REAL, PRIMARY KEY(article, month))")
             c.execute("CREATE TABLE IF NOT EXISTS rnp_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT, article TEXT, text TEXT, author TEXT, created_at TEXT)")
+            self._init_db(c)
+
+    def _init_db(self, c):
+        """Таблицы загрузки из API маркетплейса (у Ozon — свои, см. rnp_ozon.py)."""
+        c.execute("CREATE TABLE IF NOT EXISTS rnp_orders (srid TEXT PRIMARY KEY, cabinet TEXT, day TEXT, last_change TEXT, nm_id INTEGER, "
+                  "article TEXT, brand TEXT, subject TEXT, price REAL, spp REAL, finished REAL, total REAL, is_cancel INTEGER)")
+        c.execute("CREATE INDEX IF NOT EXISTS rnp_orders_day ON rnp_orders(day)")
+        cols = {r[1] for r in c.execute("PRAGMA table_info(rnp_orders)")}
+        if "barcode" not in cols:            # размер заказа — для заказов в день по размерам (вкладка «Остатки FBS»)
+            c.execute("ALTER TABLE rnp_orders ADD COLUMN barcode TEXT")
+            c.execute("ALTER TABLE rnp_orders ADD COLUMN tech_size TEXT")
+            c.execute("DELETE FROM app_settings WHERE key LIKE 'rnp_orders_since:%'")     # перезагрузить заказы с размерами
+        c.execute("CREATE TABLE IF NOT EXISTS rnp_ads (cabinet TEXT, day TEXT, nm_id INTEGER, views REAL, clicks REAL, spend REAL, atbs REAL, "
+                  "orders REAL, shks REAL, sum_price REAL, PRIMARY KEY(cabinet, day, nm_id))")
+        # Один продавец мог быть подключён дважды (кабинет панели и кабинет ОПиУ с другим ключом) —
+        # реклама задваивалась. Один раз очищаем рекламу, чтобы она перезагрузилась без дублей.
+        if not c.execute("SELECT 1 FROM app_settings WHERE key='rnp_ads_dedup_v1'").fetchone():
+            c.execute("DELETE FROM rnp_ads")
+            c.execute("DELETE FROM app_settings WHERE key LIKE 'rnp_ads_since:%'")
+            c.execute("INSERT OR REPLACE INTO app_settings(key, value) VALUES('rnp_ads_dedup_v1', '1')")
 
     # ------------------------------------------------------------------ загрузка из WB
     def _get(self, client, url, token, params, key, interval, need):
@@ -106,30 +115,35 @@ class RNP:
         with self._lock:
             if self.state["status"] == "running":
                 return dict(self.state)
-            self.state = {"status": "running", "message": "Загрузка заказов и рекламы из WB…", "at": None, "errors": []}
+            self.state = {"status": "running", "message": f"Загрузка заказов и рекламы из {self.TITLE}…", "at": None, "errors": []}
         errors = []
         try:
             tokens = self.tokens()
             if not tokens:
-                raise RNPError("Нет кабинетов WB с API-токеном (раздел «Кабинеты маркетплейсов»)")
+                raise RNPError(self.NO_TOKENS)
             self._ads_seen = set()          # кампании уже загружены другим кабинетом (тот же продавец)
             with httpx.Client(timeout=120) as client:
                 for entry in tokens:
-                    name, token = entry[0], entry[1]
-                    ads_token = entry[2] if len(entry) > 2 and entry[2] else token
-                    for part, fn, key in (("заказы", self._sync_orders, token), ("реклама", self._sync_ads, ads_token)):
+                    name = entry[0]
+                    for part, fn, key in self._sync_steps(entry):
                         self.state["message"] = f"{name}: {part}…"
                         try:
                             fn(client, name, key, days)
                         except RNPError as exc:
                             errors.append(f"{name}, {part}: {exc}")
             self._trim()
-            self.store.set_setting("rnp_synced_at", datetime.now(timezone.utc).isoformat())
+            self.store.set_setting(self.SYNCED_KEY, datetime.now(timezone.utc).isoformat())
             self.state = {"status": "done" if not errors else "partial", "message": "Готово" if not errors else "Загружено не всё",
                           "at": time.time(), "errors": errors}
         except Exception as exc:
             self.state = {"status": "error", "message": str(exc)[:300], "at": time.time(), "errors": errors}
         return dict(self.state)
+
+    def _sync_steps(self, entry):
+        """[(что загружаем, функция, ключ)] для кабинета из self.tokens()."""
+        token = entry[1]
+        ads_token = entry[2] if len(entry) > 2 and entry[2] else token
+        return [("заказы", self._sync_orders, token), ("реклама", self._sync_ads, ads_token)]
 
     def _since(self, key, days):
         stored = self.store.get_setting(key, "")
@@ -210,7 +224,6 @@ class RNP:
             c.execute("DELETE FROM rnp_ads WHERE day<?", (edge,))
 
     # ------------------------------------------------------------------ юнит-экономика
-     # ------------------------------------------------------------------ юнит-экономика
     def _dash(self):
         try:
             return self.economics()
@@ -235,10 +248,9 @@ class RNP:
                             per[art][k] += m.get(k, 0)
                             total[k] += m.get(k, 0)
         if not total["orders_qty"]:                     # заказов в выгрузке нет — берём свои
-            with self.store._connect() as c:
-                for art, n in c.execute("SELECT article, COUNT(*) FROM rnp_orders WHERE day BETWEEN ? AND ? GROUP BY article", (s, e)):
-                    per[art_key(art)]["orders_qty"] += n
-                    total["orders_qty"] += n
+            for art, n in self._order_counts(s, e):
+                per[art_key(art)]["orders_qty"] += n
+                total["orders_qty"] += n
 
         def ratios(m, fallback=None):
             revenue = m["revenue_sales"] + m["revenue_returns"]
@@ -256,6 +268,11 @@ class RNP:
         base = ratios(total)
         base["storage_per_day"] = 0.0
         return {"articles": {a: ratios(m, base) for a, m in per.items()}, "cabinet": base, "tax_rate": rate, "window": [s, e]}
+
+    def _order_counts(self, start, end):
+        """[(артикул, заказов)] из своей загрузки заказов — если в выгрузке дашборда заказов нет."""
+        with self.store._connect() as c:
+            return c.execute("SELECT article, COUNT(*) FROM rnp_orders WHERE day BETWEEN ? AND ? GROUP BY article", (start, end)).fetchall()
 
     def _costs(self):
         out = defaultdict(list)
@@ -342,6 +359,15 @@ class RNP:
                 m["ad_orders"] += orders or 0
                 info.setdefault(key, {"article": key, "nm_id": nm, "brand": "", "subject": ""})
             has_ads = has_ads or bool(c.execute("SELECT 1 FROM rnp_ads LIMIT 1").fetchone())
+        cache_days = self._from_cache(out, d, start, end, own_days, has_ads)
+        return {"rows": out, "info": info,
+                "sources": {"orders": "api" if own_days and not cache_days else ("mixed" if own_days else ("cache" if cache_days else "none")),
+                            "ads": "api" if has_ads else "report"}}
+
+    @staticmethod
+    def _from_cache(out, d, start, end, own_days, has_ads) -> set:
+        """Дополнить факты выгрузкой дашборда: заказы за дни без своей загрузки, реклама — если её не загружали.
+        Возвращает дни, заказы которых взяты из выгрузки."""
         cache_days = set()
         for cab in (d or {}).get("cabinets", {}).values():
             for day, arts in cab["days"].items():
@@ -358,9 +384,7 @@ class RNP:
                     withheld = m.get("ads", 0) + m.get("ads_promo", 0)     # удержания за рекламу из отчёта реализации
                     if not has_ads and withheld:
                         out[(day, art)]["ads"] += -withheld
-        return {"rows": out, "info": info,
-                "sources": {"orders": "api" if own_days and not cache_days else ("mixed" if own_days else ("cache" if cache_days else "none")),
-                            "ads": "api" if has_ads else "report"}}
+        return cache_days
 
     # ------------------------------------------------------------------ таблица
     @staticmethod
@@ -379,12 +403,21 @@ class RNP:
                 "ctr": (m.get("clicks", 0) / m["views"] * 100) if m.get("views") else None,
                 "cpc": (m.get("ads", 0) / m["clicks"]) if m.get("clicks") else None,
                 "cpo": (m.get("ads", 0) / m["ad_orders"]) if m.get("ad_orders") else None,
+                # воронка карточки (Ozon: /v1/analytics/data) — показы → корзина → заказ
+                "cart_rate": (m.get("tocart", 0) / m["card_views"] * 100) if m.get("card_views") else None,
+                "order_rate": (o / m["tocart"] * 100) if m.get("tocart") else None,
                 "margin": (m.get("profit", 0) / rev * 100) if rev else None,
                 "roi": (m.get("profit", 0) / spend * 100) if spend else None,
                 "orders_per_day": o / max(1, n_days), "profit_per_day": m.get("profit", 0) / max(1, n_days)}
 
     def table(self, start: str, end: str, brand: str | None = None, category: str | None = None, articles: set | None = None,
               with_cells: bool = False, cabinets: set | None = None) -> dict:
+        part = self.collect(start, end, brand=brand, category=category, articles=articles, with_cells=with_cells, cabinets=cabinets)
+        return compose([part], with_cells=with_cells, notes=self.notes(start, end))
+
+    def collect(self, start: str, end: str, brand: str | None = None, category: str | None = None, articles: set | None = None,
+                with_cells: bool = False, cabinets: set | None = None) -> dict:
+        """Факты и прогноз по дням и артикулам одного маркетплейса — суммы без производных показателей (их считает compose)."""
         d = self._dash()
         f = self.facts(start, end, d, cabinets)
         econ = self.unit_economics(d)      # доли расходов — по всем кабинетам, как и раньше
@@ -444,7 +477,7 @@ class RNP:
                 for k, v in list(m.items()) + list(calc.items()):
                     target[k] += v
             if with_cells:
-                cells[(day, key)] = self._derive({**m, **calc})
+                cells[(day, key)] = {**m, **calc}
         for key, qty in stocks.items():
             if qty and match(key):
                 by_art[key]["stock"] = qty
@@ -459,62 +492,26 @@ class RNP:
             if storage_day:
                 m["storage"] += storage_day
                 m["profit"] -= storage_day
-
         month = end[:7]
-        art_rows = []
-        for key, m in by_art.items():
-            if not (m.get("orders") or m.get("ads") or m.get("stock")):
-                continue
-            plan = plans.get((key, month)) or {}
-            row = self._derive(m, n)
-            cost = self._cost_at(costs.get(key), end)
-            row.update(meta(key))
-            row.update({"key": key, "plan_orders_per_day": plan.get("orders_per_day"), "plan_margin": plan.get("margin"),
-                        "plan_done": (row["orders_per_day"] / plan["orders_per_day"] * 100) if plan.get("orders_per_day") else None,
-                        "stock": m.get("stock", 0), "stock_days": (m.get("stock", 0) / row["orders_per_day"]) if row["orders_per_day"] else None,
-                        "current_price": prices.get(key), "cost": cost[1] * cost[0] if cost and cost[1] is not None else None,
-                        "prep_cost": (cost[2] or 0) * cost[0] if cost else None,
-                        "economics": econ["articles"].get(key) or econ["cabinet"]})
-            art_rows.append(row)
-        art_rows.sort(key=lambda r: (-(r.get("orders_sum") or 0), -(r.get("stock") or 0), r["article"]))
-        total = defaultdict(float, {k: 0.0 for k in ("orders", "orders_sum", "ads", "revenue", "profit", "sales_qty", "no_cost")})
-        for r in by_day.values():
-            for k, v in r.items():
-                total[k] += v
-        total_row = self._derive(total, n)
-        total_row["stock"] = sum(r["stock"] for r in art_rows)
-        plan_total = sum(r["plan_orders_per_day"] or 0 for r in art_rows)
-        total_row["plan_orders_per_day"] = plan_total or None
-        fact_planned = sum(r["orders_per_day"] for r in art_rows if r["plan_orders_per_day"])
-        total_row["plan_fact_per_day"] = fact_planned if plan_total else None
-        total_row["plan_done"] = (fact_planned / plan_total * 100) if plan_total else None
-        planned = [r for r in art_rows if r["plan_orders_per_day"]]
-        total_row["plan_margin"] = (sum((r["plan_margin"] or 0) * r["plan_orders_per_day"] for r in planned) /
-                                    sum(r["plan_orders_per_day"] for r in planned)) if planned and any(r["plan_margin"] for r in planned) else None
-        out = {"days": days, "by_day": {day: self._derive(m) for day, m in by_day.items()}, "articles": art_rows, "total": total_row,
-               "economics": {"window": econ["window"], "cabinet": econ["cabinet"], "tax_rate": econ["tax_rate"]},
-               "sources": f["sources"], "stocks_at": stocks_at, "notes": self.notes(start, end),
-               "synced_at": self.store.get_setting("rnp_synced_at", ""), "state": dict(self.state)}
-        if with_cells:
-            out["cells"] = cells
-        return out
+        return {"mp": self.MP, "title": self.TITLE, "days": days, "by_day": by_day, "by_art": dict(by_art), "cells": cells,
+                "meta": {key: meta(key) for key in by_art},
+                "plans": {key: plans[(key, month)] for key in by_art if (key, month) in plans},
+                "costs": {key: self._cost_at(costs.get(key), end) for key in by_art},
+                "economics": econ, "prices": prices, "stocks_at": stocks_at, "sources": f["sources"],
+                "synced_at": self.store.get_setting(self.SYNCED_KEY, ""), "state": dict(self.state)}
 
-    HEAT_METRICS = ("orders", "orders_sum", "profit", "margin", "ads", "drr", "price", "spp", "buyout", "ctr", "views", "clicks", "cancel_rate")
+    HEAT_METRICS = ("orders", "orders_sum", "profit", "margin", "ads", "drr", "price", "spp", "buyout", "ctr", "views", "clicks", "cancel_rate",
+                    "card_views", "tocart", "cart_rate")
 
     def heatmap(self, start: str, end: str, metric: str, **filters) -> dict:
         if metric not in self.HEAT_METRICS:
             raise RNPError("Неизвестный показатель")
-        t = self.table(start, end, with_cells=True, **filters)
-        rows = t["articles"][:80]
-        keys = {r["key"] for r in rows}
-        cells = {f"{day}|{key}": v.get(metric) for (day, key), v in t["cells"].items() if key in keys}
-        return {"days": t["days"], "metric": metric, "cells": cells,
-                "rows": [{"key": r["key"], "article": r["article"], "total": r.get(metric)} for r in rows]}
+        return heatmap_of(self.table(start, end, with_cells=True, **filters), metric)
 
     # ------------------------------------------------------------------ план и заметки
     def plans(self) -> dict:
         with self.store._connect() as c:
-            return {(a, m): {"orders_per_day": o, "margin": mg} for a, m, o, mg in c.execute("SELECT article, month, orders_per_day, margin FROM rnp_plans")}
+            return {(a, m): {"orders_per_day": o, "margin": mg} for a, m, o, mg in c.execute(f"SELECT article, month, orders_per_day, margin FROM {self.PLANS_TABLE}")}
 
     def set_plan(self, article: str, month: str, orders_per_day=None, margin=None):
         key = art_key(article)
@@ -522,9 +519,9 @@ class RNP:
             raise RNPError("Нужны артикул и месяц ГГГГ-ММ")
         with self.store._connect() as c:
             if orders_per_day in (None, "") and margin in (None, ""):
-                c.execute("DELETE FROM rnp_plans WHERE article=? AND month=?", (key, month))
+                c.execute(f"DELETE FROM {self.PLANS_TABLE} WHERE article=? AND month=?", (key, month))
             else:
-                c.execute("INSERT OR REPLACE INTO rnp_plans(article, month, orders_per_day, margin) VALUES(?,?,?,?)",
+                c.execute(f"INSERT OR REPLACE INTO {self.PLANS_TABLE}(article, month, orders_per_day, margin) VALUES(?,?,?,?)",
                           (key, month, orders_per_day, margin))
 
     def notes(self, start: str, end: str) -> list:
@@ -545,3 +542,104 @@ class RNP:
         with self.store._connect() as c:
             return c.execute("DELETE FROM rnp_notes WHERE id=?", (note_id,)).rowcount > 0
 
+
+def _add(target, m):
+    for k, v in m.items():
+        target[k] += v
+
+
+def compose(parts: list, with_cells: bool = False, notes=()) -> dict:
+    """Таблица РНП из частей RNP.collect: одного маркетплейса или нескольких (режим «все» — суммы по артикулу и дню)."""
+    first = parts[0]
+    days = first["days"]
+    n = len(days)
+    by_day = {day: defaultdict(float) for day in days}
+    by_art = defaultdict(lambda: defaultdict(float))
+    cells = defaultdict(lambda: defaultdict(float))
+    meta, costs, econ_art, prices, plans = {}, {}, {}, {}, defaultdict(list)
+    for p in parts:
+        for day, m in p["by_day"].items():
+            _add(by_day[day], m)
+        for (day, key), m in p["cells"].items():
+            _add(cells[(day, key)], m)
+        econ = p["economics"]
+        for key, m in p["by_art"].items():
+            _add(by_art[key], m)
+            meta.setdefault(key, p["meta"][key])
+            if costs.get(key) is None:
+                costs[key] = p["costs"].get(key)
+            econ_art.setdefault(key, econ["articles"].get(key) or econ["cabinet"])
+            if prices.get(key) is None and p["prices"].get(key) is not None:
+                prices[key] = p["prices"][key]
+            if key in p["plans"]:
+                plans[key].append(p["plans"][key])
+
+    def plan_of(key):
+        """План артикула; в режиме «все» — сумма планов заказов по маркетплейсам, маржа — средняя по плану заказов."""
+        rows = plans.get(key) or []
+        opd = sum(r["orders_per_day"] or 0 for r in rows) or None
+        with_margin = [r for r in rows if r["margin"] is not None]
+        weight = sum(r["orders_per_day"] or 1 for r in with_margin)
+        margin = sum(r["margin"] * (r["orders_per_day"] or 1) for r in with_margin) / weight if with_margin else None
+        return {"orders_per_day": opd, "margin": margin}
+
+    art_rows = []
+    for key, m in by_art.items():
+        if not (m.get("orders") or m.get("ads") or m.get("stock")):
+            continue
+        plan = plan_of(key)
+        row = RNP._derive(m, n)
+        cost = costs.get(key)
+        row.update(meta[key])
+        row.update({"key": key, "plan_orders_per_day": plan["orders_per_day"], "plan_margin": plan["margin"],
+                    "plan_done": (row["orders_per_day"] / plan["orders_per_day"] * 100) if plan["orders_per_day"] else None,
+                    "stock": m.get("stock", 0), "stock_days": (m.get("stock", 0) / row["orders_per_day"]) if row["orders_per_day"] else None,
+                    "current_price": prices.get(key), "cost": cost[1] * cost[0] if cost and cost[1] is not None else None,
+                    "prep_cost": (cost[2] or 0) * cost[0] if cost else None,
+                    "economics": econ_art[key]})
+        art_rows.append(row)
+    art_rows.sort(key=lambda r: (-(r.get("orders_sum") or 0), -(r.get("stock") or 0), r["article"]))
+    total = defaultdict(float, {k: 0.0 for k in ("orders", "orders_sum", "ads", "revenue", "profit", "sales_qty", "no_cost")})
+    for r in by_day.values():
+        for k, v in r.items():
+            total[k] += v
+    total_row = RNP._derive(total, n)
+    total_row["stock"] = sum(r["stock"] for r in art_rows)
+    plan_total = sum(r["plan_orders_per_day"] or 0 for r in art_rows)
+    total_row["plan_orders_per_day"] = plan_total or None
+    fact_planned = sum(r["orders_per_day"] for r in art_rows if r["plan_orders_per_day"])
+    total_row["plan_fact_per_day"] = fact_planned if plan_total else None
+    total_row["plan_done"] = (fact_planned / plan_total * 100) if plan_total else None
+    planned = [r for r in art_rows if r["plan_orders_per_day"]]
+    total_row["plan_margin"] = (sum((r["plan_margin"] or 0) * r["plan_orders_per_day"] for r in planned) /
+                                sum(r["plan_orders_per_day"] for r in planned)) if planned and any(r["plan_margin"] for r in planned) else None
+    econ = first["economics"]
+    running = next((p["state"] for p in parts if p["state"].get("status") == "running"), first["state"])
+    out = {"days": days, "by_day": {day: RNP._derive(m) for day, m in by_day.items()}, "articles": art_rows, "total": total_row,
+           "economics": {"window": econ["window"], "cabinet": econ["cabinet"], "tax_rate": econ["tax_rate"]},
+           "economics_by_mp": {p["mp"]: {"window": p["economics"]["window"], "tax_rate": p["economics"]["tax_rate"]} for p in parts},
+           "sources": first["sources"] if len(parts) == 1 else _merge_sources([p["sources"] for p in parts]),
+           "sources_by_mp": {p["mp"]: p["sources"] for p in parts},
+           "stocks_at": max(filter(None, (p["stocks_at"] for p in parts)), default=None), "notes": list(notes),
+           "synced_at": first["synced_at"], "synced_by_mp": {p["mp"]: p["synced_at"] for p in parts},
+           "state": running, "states": {p["mp"]: p["state"] for p in parts}, "marketplaces": [p["mp"] for p in parts]}
+    if with_cells:
+        out["cells"] = {k: RNP._derive(m) for k, m in cells.items()}
+    return out
+
+
+def _merge_sources(items: list) -> dict:
+    orders = {s["orders"] for s in items} - {"none"}
+    return {"orders": orders.pop() if len(orders) == 1 else ("mixed" if orders else "none"),
+            "ads": "api" if all(s["ads"] == "api" for s in items) else "report"}
+
+
+def heatmap_of(t: dict, metric: str) -> dict:
+    """Тепловая карта из таблицы РНП, собранной с with_cells=True."""
+    if metric not in RNP.HEAT_METRICS:
+        raise RNPError("Неизвестный показатель")
+    rows = t["articles"][:80]
+    keys = {r["key"] for r in rows}
+    cells = {f"{day}|{key}": v.get(metric) for (day, key), v in t["cells"].items() if key in keys}
+    return {"days": t["days"], "metric": metric, "cells": cells,
+            "rows": [{"key": r["key"], "article": r["article"], "total": r.get(metric)} for r in rows]}

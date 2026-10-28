@@ -13,7 +13,7 @@ window.WBOPSProducts = (() => {
   let root = null, timer = null;
 
   async function api(url, options = {}) {
-    if (options.body && typeof options.body !== 'string') options = {...options, headers: {'Content-Type': 'application/json'}, body: JSON.stringify(options.body)};
+    if (options.body && typeof options.body !== 'string' && !(options.body instanceof FormData)) options = {...options, headers: {'Content-Type': 'application/json'}, body: JSON.stringify(options.body)};
     const r = await fetch(url, options);
     let d = null;
     try { d = await r.json(); } catch (e) { /* пусто */ }
@@ -31,7 +31,8 @@ window.WBOPSProducts = (() => {
     root = section;
     root.className = 'panel rv-page pr-page';
     root.innerHTML = `<div class="rv-head"><div class="rv-counters" data-counters></div>
-        <div class="rv-head-actions"><button type="button" class="rv-dark" data-refresh title="Загрузить названия, фото и WB ID из карточек товаров Wildberries">Обновить из WB</button>
+        <div class="rv-head-actions"><label class="rv-dark pr-import" role="button" tabindex="0" title="Excel или CSV: колонки «Артикул», «Себестоимость», по желанию «Подготовка» (или «ФФ»), «Бренд», «Категория», «Наименование». Один справочник на все кабинеты и юрлица — новые кабинеты берут себестоимость отсюда же">Загрузить себестоимость<input type="file" accept=".xlsx,.xlsm,.csv" data-import hidden></label>
+          <button type="button" class="rv-dark" data-refresh title="Загрузить названия, фото и WB ID из карточек товаров Wildberries">Обновить из WB</button>
           <div class="rv-menu-wrap"><button type="button" class="rv-dark rv-sq" data-export aria-label="Скачать" title="Скачать номенклатуру">⇩</button>
           <div class="rv-menu" role="menu" hidden><a role="menuitem" href="/api/nomenclature/export?format=xlsx">Excel (.xlsx)</a><a role="menuitem" href="/api/nomenclature/export?format=csv">CSV</a></div></div></div></div>
       <div data-banner></div>
@@ -45,6 +46,8 @@ window.WBOPSProducts = (() => {
     root.querySelector('[data-search]').oninput = e => { clearTimeout(timer); timer = setTimeout(() => { st.search = e.target.value.trim().toLowerCase(); draw(); }, 200); };
     root.querySelectorAll('[data-f]').forEach(s => s.onchange = () => { st[s.dataset.f] = s.value; draw(); });
     root.querySelector('[data-refresh]').onclick = refreshCards;
+    root.querySelector('[data-import]').onchange = e => importCosts(e.target);
+    root.querySelector('.pr-import').onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); root.querySelector('[data-import]').click(); } };
     const menu = root.querySelector('.rv-menu');
     root.querySelector('[data-export]').onclick = e => { e.stopPropagation(); menu.hidden = !menu.hidden; };
     document.addEventListener('click', e => { if (root?.isConnected && !e.target.closest('.rv-menu-wrap')) menu.hidden = true; });
@@ -271,6 +274,21 @@ window.WBOPSProducts = (() => {
     catch (err) { toast(err.message); }
     b.disabled = false; b.textContent = 'Обновить из WB';
   }
+  async function importCosts(input) {
+    const file = input.files[0];
+    if (!file) return;
+    const label = input.closest('label'), text = label.firstChild;
+    text.textContent = 'Загрузка…';
+    try {
+      const fd = new FormData(); fd.append('file', file);
+      const r = await api('/api/nomenclature/import', {method: 'POST', body: fd});
+      const ch = r.changes.slice(0, 5).map(c => c.article).join(', ');
+      toast(`Справочник: добавлено ${r.added}, изменено ${r.updated}${ch ? ` (${ch}${r.changes.length > 5 ? '…' : ''})` : ''}, без изменений ${r.unchanged}`
+        + (r.skipped.length ? `, пропущено без цены: ${r.skipped.slice(0, 5).join(', ')}` : '') + '. Пересоберите ОПиУ.');
+      st.dirty = true; await load();
+    } catch (e) { toast(e.message); }
+    text.textContent = 'Загрузить себестоимость'; input.value = '';
+  }
   async function rebuild() {
     try { await api('/api/finance/update', {method: 'POST', body: {mode: 'cache'}}); toast('ОПиУ пересобирается — прогресс в разделе «Финансы»'); st.dirty = false; st.data.finance = 'running'; draw(); }
     catch (e) { toast(e.message); }
@@ -300,6 +318,7 @@ window.WBOPSProducts = (() => {
 .pr-hist table{width:100%;font-size:12px;margin-top:6px}.pr-hist th,.pr-hist td{padding:6px 8px;text-transform:none;letter-spacing:0}
 .pr-new p{font-size:12px;margin:4px 0 8px}.pr-new-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.pr-new-grid label{display:grid;gap:4px;font-size:12px;font-weight:600;color:#374151}
 .pr-new-grid input{height:34px;border:1px solid #dfe2e8;border-radius:8px;padding:0 8px;font:inherit;min-width:0}
+.pr-import{cursor:pointer;display:inline-flex;align-items:center}.pr-import:focus-visible{outline:3px solid #ede9fe}
 .pr-retro{background:#fff;border:1px solid #e7e9ee;border-radius:12px;margin-bottom:12px}
 .pr-retro-head{display:flex;gap:10px;align-items:baseline;width:100%;border:0;background:none;padding:12px 14px;font:inherit;font-size:14px;text-align:left;cursor:pointer;color:#1f2328}
 .pr-retro-head span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.pr-retro-head i{font-style:normal;color:#6b7280}

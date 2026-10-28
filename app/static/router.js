@@ -7,12 +7,15 @@
   const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
   const PAGES = {
-    home:            {path: '/',                title: 'Отзывы, вопросы и поставки FBS', sub: 'Рабочая панель продавца',
+    home:            {path: '/',                title: 'Главная', sub: 'Магазины по маркетплейсам: факт за период, остатки и прогноз на конец периода', show: ['homeSummary']},
+    workspace:       {path: '/workspace',       title: 'Отзывы, вопросы и поставки FBS', sub: 'Рабочая панель продавца',
                       show: ['cabinet', 'syncToolbar', 'cards', 'inbox-panel', 'fbs-panel', 'complaints-panel', 'audit-panel']},
-    dashboard:       {path: '/dashboard',       title: 'Дашборд', sub: 'Оцифровка: ключевые показатели Wildberries за период', show: ['dashboardPage']},
+    dashboard:       {path: '/dashboard',       title: 'Дашборд WB', sub: 'Оцифровка: ключевые показатели Wildberries за период', show: ['dashboardPage']},
+    'dashboard-ozon': {path: '/dashboard-ozon', title: 'Дашборд Ozon', sub: 'Оцифровка: ключевые показатели Ozon за период', show: ['ozonDashboardPage']},
     transfer:        {path: '/transfer',        title: 'Перенос карточек', sub: 'Перенос товаров между кабинетами Wildberries, Ozon и Яндекс Маркета по артикулу', show: ['transferPage']},
     'fbs-analytics': {path: '/fbs-analytics',   title: 'Аналитика FBS', sub: 'Статусы сборочных заданий, скорость отгрузки, склады, % выкупа и скидки/штрафы WB за сроки', show: ['fbsPage']},
     ab:              {path: '/ab',              title: 'A/B-тесты', sub: 'Какое главное фото даёт больше кликов и корзин: варианты по очереди на живой карточке', show: ['abPage']},
+    abc:             {path: '/abc',             title: 'ABC-анализ', sub: 'Сегментация ассортимента по выручке, оборачиваемости и прибыли и контроль неликвида', show: ['abcPage']},
     planfact:        {path: '/planfact',        title: 'План-факт', sub: 'Планы на месяц по бизнесу и артикулам, отклонения и прогноз на конец месяца', show: ['planfactPage']},
     ads:             {path: '/ads',             title: 'Аналитика рекламы', sub: 'Расходы, ДРР, кампании, артикулы, поисковые запросы и списания WB за рекламу', show: ['adsPage']},
     penalties:       {path: '/penalties',       title: 'Аналитика штрафов', sub: 'Штрафы Wildberries из отчётов реализации: динамика, причины, артикулы, задания FBS и прочие удержания', show: ['penaltiesPage']},
@@ -39,8 +42,11 @@
     team:            {path: '/team',            title: 'Моя команда', sub: 'Приглашения и доступ сотрудников', show: ['team']},
     finances:        {path: '/finances',        title: 'Финансы', sub: 'ОПиУ по всем маркетплейсам и кабинетам', show: ['finances']},
   };
+  const SENDS = new Set(['workspace', 'reviews', 'complaints', 'questions', 'chats', 'messengers', 'templates', 'settings', 'ai', 'import']);
   const byPath = Object.fromEntries(Object.entries(PAGES).map(([k, v]) => [v.path, k]));
-  const currentPage = () => byPath[location.pathname.replace(/\/+$/, '') || '/'] || 'home';
+  // Сводка по магазинам — только владельцу: сотрудник на «Главной» видит рабочую очередь
+  const currentPage = () => { const p = byPath[location.pathname.replace(/\/+$/, '') || '/'] || 'home';
+    return p === 'home' && document.body.classList.contains('wb-member') ? 'workspace' : p; };
 
   // --- stable ids for blocks that had none --------------------------------
   const header = document.getElementById('home');
@@ -157,9 +163,24 @@
     if (window.WBOPSProducts) window.WBOPSProducts.render(s);
     else s.innerHTML = '<p class="muted">Не загрузился модуль products.js.</p>';
   };
+  const abcPage = () => {
+    const s = section('abcPage', '');
+    if (window.WBOPSAbc) window.WBOPSAbc.render(s);
+    else s.innerHTML = '<p class="muted">Не загрузился модуль abc.js.</p>';
+  };
+  const homePage = () => {
+    const s = section('homeSummary', '');
+    if (window.WBOPSHome) window.WBOPSHome.render(s);
+    else s.innerHTML = '<p class="muted">Не загрузился модуль home.js.</p>';
+  };
   const dashboardPage = () => {
     const s = section('dashboardPage', '');
     if (window.WBOPSDashboard) window.WBOPSDashboard.render(s);
+    else s.innerHTML = '<p class="muted">Не загрузился модуль dashboard.js.</p>';
+  };
+  const ozonDashboardPage = () => {
+    const s = section('ozonDashboardPage', '');
+    if (window.WBOPSDashboard) window.WBOPSDashboard.create().render(s, 'ozon');
     else s.innerHTML = '<p class="muted">Не загрузился модуль dashboard.js.</p>';
   };
   const rnpPage = () => {
@@ -207,7 +228,7 @@
     if (window.WBOPSAB) window.WBOPSAB.render(s);
     else s.innerHTML = '<p class="muted">Не загрузился модуль ab.js.</p>';
   };
-  const rendered = {ab: abPage, planfact: planfactPage, ads: adsPage, penalties: penaltiesPage, 'fbs-analytics': fbsPage, stocks: stocksPage, repricer: repricerPage, transfer: transferPage, rnp: rnpPage, dashboard: dashboardPage, nomenclature: nomenclaturePage, complaints: complaintsPage, reviews: reviewsPage, cabinets: settingsPage('cabinets', 'cabinets'), notifications: settingsPage('notificationsSettings', 'notifications'), team: settingsPage('team', 'team'), analytics: renderAnalytics, import: renderImport, profile: renderProfile, messengers: renderMessengers, finances: renderFinances};
+  const rendered = {home: homePage, abc: abcPage, ab: abPage, planfact: planfactPage, ads: adsPage, penalties: penaltiesPage, 'fbs-analytics': fbsPage, stocks: stocksPage, repricer: repricerPage, transfer: transferPage, rnp: rnpPage, dashboard: dashboardPage, 'dashboard-ozon': ozonDashboardPage, nomenclature: nomenclaturePage, complaints: complaintsPage, reviews: reviewsPage, cabinets: settingsPage('cabinets', 'cabinets'), notifications: settingsPage('notificationsSettings', 'notifications'), team: settingsPage('team', 'team'), analytics: renderAnalytics, import: renderImport, profile: renderProfile, messengers: renderMessengers, finances: renderFinances};
   const done = new Set();
   let applying = false;
   function apply() {
@@ -232,6 +253,9 @@
       const t = header.querySelector('.title'), m = header.querySelector('.brand .muted');
       if (t) t.textContent = cfg.title; if (m) m.textContent = cfg.sub;
     }
+    // Режим публикации важен только там, где что-то отправляется покупателям.
+    const ps = document.getElementById('publishStatus');
+    if (ps) ps.style.display = SENDS.has(page) ? '' : 'none';
     document.title = cfg.title + ' · WB OPS';
     document.querySelectorAll('[data-nav]').forEach(a => {
       const target = PAGES[a.dataset.nav];

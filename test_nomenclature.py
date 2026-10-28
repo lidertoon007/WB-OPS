@@ -107,6 +107,37 @@ class NomenclatureTests(unittest.TestCase):
         self.n.read_cost_rows()                                  # файл не менялся — повторно не переносим
         self.assertEqual((self.dir / "cost.csv").stat().st_mtime_ns, mtime)
 
+    def test_import_shared_cost_book(self):
+        # Как файл «Себес.xlsx»: «Кратность» там — штук в упаковке, себестоимость — за всю упаковку
+        table = [["Артикулы ВБ", "Наименование товара", "Себестоимость товара", "Категория WB", "Бренд", "Кратность", "ФФ"],
+                 ["DE-90", "Джинсы", 1200, "Брюки", "Другой", 12, None],      # цена меняется, подготовка остаётся
+                 ["b012", "", 1041, None, "Deemivis", None, 85],             # без изменений
+                 ["new-1", "Новый товар", 500.5, "Корм", "Zillii", 3, 60],    # нового в cost.csv не было
+                 ["X-NA", "Без цены", "#N/A", None, "Z", None, None]]
+        r = self.n.import_table(table)
+        self.assertEqual((r["added"], r["updated"], r["unchanged"], r["skipped"]), (1, 1, 1, ["X-NA"]))
+        self.assertEqual(r["changes"], [{"article": "DE-90", "cost": [1091.0, 1200.0], "prep": [85.0, 85.0]}])
+        rows = {x["артикул"]: x for x in csv.DictReader(open(self.dir / "cost.csv", encoding="utf-8-sig"), delimiter=";")}
+        self.assertEqual((rows["de-90"]["сс_за_ед"], rows["de-90"]["подготовка_за_ед"], rows["de-90"]["кратность"]), ("1200,00", "85,00", "1"))
+        self.assertEqual(rows["de-90"]["бренд"], "Deemivis")                    # заполненный бренд не перетираем
+        self.assertEqual((rows["new-1"]["сс_за_ед"], rows["new-1"]["подготовка_за_ед"], rows["new-1"]["кратность"]), ("500,50", "60,00", "1"))
+        self.assertEqual((rows["new-1"]["бренд"], rows["new-1"]["категория"], rows["new-1"]["название (справочно)"]), ("Zillii", "Корм", "Новый товар"))
+        self.assertNotIn("X-NA", rows)
+        self.assertNotIn("NEW-1", (self.dir / "cost_missing.csv").read_text(encoding="utf-8-sig"))   # цена есть — не «без себестоимости»
+        self.assertTrue(self.by_key()["NEW-1"]["has_cost"])
+
+    def test_import_file_xlsx_and_errors(self):
+        import io
+        from openpyxl import Workbook
+        wb = Workbook()
+        wb.active.append(["Артикул", "Себестоимость"])
+        wb.active.append(["B012", 999])
+        buf = io.BytesIO(); wb.save(buf)
+        self.assertEqual(self.n.import_file("Себес.xlsx", buf.getvalue())["updated"], 1)
+        self.assertEqual(self.n.import_file("c.csv", "Артикул;сс_за_ед\nb012;1000\n".encode())["updated"], 1)
+        with self.assertRaises(NomenclatureError):
+            self.n.import_file("c.csv", "Товар;Цена\nb012;1\n".encode())
+
 
 if __name__ == "__main__":
     unittest.main()
