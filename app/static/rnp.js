@@ -44,11 +44,11 @@ window.WBOPSRnp = (() => {
     ['ads', 'Реклама, ₽', 'rub'], ['drr', 'ДРР', 'pct'], ['price', 'Цена до СПП', 'rub'], ['spp', 'СПП', 'pct'], ['ctr', 'CTR', 'pct'],
     ['views', 'Показы', 'int'], ['clicks', 'Клики', 'int'], ['cancel_rate', 'Отмены', 'pct']];
 
-  const st = {preset: 'days:14', from: '', to: '', brand: '', category: '', article: '', view: 'days', heat: 'orders', sort: 'orders_sum', desc: true,
+  const st = {preset: 'days:14', from: '', to: '', cabinet: '', brand: '', category: '', article: '', view: 'days', heat: 'orders', sort: 'orders_sum', desc: true,
     search: '', calc: '', data: null, poll: null};
   let root = null;
   try { Object.assign(st, JSON.parse(localStorage.getItem('wbops.rnp') || '{}'), {data: null, poll: null}); } catch (e) { /* без хранилища */ }
-  const remember = () => { try { localStorage.setItem('wbops.rnp', JSON.stringify({preset: st.preset, from: st.from, to: st.to, brand: st.brand, category: st.category, article: st.article, view: st.view, heat: st.heat, sort: st.sort, desc: st.desc})); } catch (e) { /* ignore */ } };
+  const remember = () => { try { localStorage.setItem('wbops.rnp', JSON.stringify({preset: st.preset, from: st.from, to: st.to, cabinet: st.cabinet, brand: st.brand, category: st.category, article: st.article, view: st.view, heat: st.heat, sort: st.sort, desc: st.desc})); } catch (e) { /* ignore */ } };
 
   function presets() {
     const t = new Date(), y = addDays(t, -1);
@@ -62,7 +62,7 @@ window.WBOPSRnp = (() => {
     const p = presets().find(x => x[0] === st.preset) || presets()[3];
     return [iso(p[2]), iso(p[3])];
   }
-  const query = () => { const [from, to] = period(); const q = new URLSearchParams({from, to}); ['brand', 'category', 'article'].forEach(k => st[k] && q.set(k, st[k])); return q; };
+  const query = () => { const [from, to] = period(); const q = new URLSearchParams({from, to}); ['cabinet', 'brand', 'category', 'article'].forEach(k => st[k] && q.set(k, st[k])); return q; };
 
   // ---------------------------------------------------------------- каркас
   async function render(section) {
@@ -95,9 +95,15 @@ window.WBOPSRnp = (() => {
     const o = st.data.options || {}, [from, to] = period();
     const opt = (v, t, cur) => `<option value="${esc(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(t)}</option>`;
     const arts = (o.articles || []).filter(a => (!st.brand || a.brand === st.brand) && (!st.category || a.category === st.category));
+    // Кабинеты WB — группами по юрлицу; список показываем, если кабинетов больше одного
+    const cabs = st.data.cabinets || [], legal = [...new Set(cabs.map(c => c.legal_name || ''))];
+    const cabOpts = legal.length > 1
+      ? legal.map(l => `<optgroup label="${esc(l || 'Без юрлица')}">${cabs.filter(c => (c.legal_name || '') === l).map(c => opt(c.name, c.name, st.cabinet)).join('')}</optgroup>`).join('')
+      : cabs.map(c => opt(c.name, c.name + (c.legal_name ? ' · ' + c.legal_name : ''), st.cabinet)).join('');
     root.querySelector('[data-filters]').innerHTML = `
       <select data-f="preset" aria-label="Период" class="db-period">${presets().map(([k, t]) => opt(k, t, st.preset)).join('')}</select>
       ${st.preset === 'custom' ? `<label class="db-date">с <input type="date" data-f="from" value="${from}"></label><label class="db-date">по <input type="date" data-f="to" value="${to}"></label>` : ''}
+      ${cabs.length > 1 || st.cabinet ? `<select data-f="cabinet" aria-label="Кабинет">${opt('', 'Все кабинеты', st.cabinet)}${cabOpts}</select>` : ''}
       <select data-f="brand" aria-label="Бренд">${opt('', 'Все бренды', st.brand)}${(o.brands || []).map(b => opt(b, b, st.brand)).join('')}</select>
       <select data-f="category" aria-label="Категория">${opt('', 'Все категории', st.category)}${(o.categories || []).map(b => opt(b, b, st.category)).join('')}</select>
       <select data-f="article" aria-label="Артикул">${opt('', 'Все артикулы', st.article)}${arts.map(a => opt(a.key, a.article, st.article)).join('')}</select>`;

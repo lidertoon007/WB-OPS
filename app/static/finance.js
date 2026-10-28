@@ -4,7 +4,26 @@ window.WBOPSFinance = (() => {
   const rub = v => v == null ? '–' : Math.round(v).toLocaleString('ru-RU');
   const pct = v => v == null ? '–' : (v * 100).toLocaleString('ru-RU', {minimumFractionDigits: 1, maximumFractionDigits: 1}) + '%';
   const neg = v => v != null && v < 0 ? ' class="f-neg"' : '';
-  let root, report = null, showDetails = false, lastMonths = 6, polling = null;
+  let root, report = null, polling = null;
+  // Фильтры: кабинет ("" — все, «Ozon» — площадка, «Ozon|Еврозоо» — кабинет), период таблицы, расшифровка
+  const flt = {cabinet: '', lastMonths: 6, showDetails: false};
+  try { Object.assign(flt, JSON.parse(localStorage.getItem('wbops.finance.f') || '{}')); } catch (e) { /* без хранилища */ }
+  const remember = () => { try { localStorage.setItem('wbops.finance.f', JSON.stringify(flt)); } catch (e) { /* ignore */ } };
+  const opt = (value, label, current) => `<option value="${esc(value)}"${value === current ? ' selected' : ''}>${esc(label)}</option>`;
+
+  function cabinetSelect(cabs) {
+    const perMp = new Map(), groups = new Map();
+    cabs.forEach(c => {
+      perMp.set(c.marketplace, (perMp.get(c.marketplace) || 0) + 1);
+      const g = c.marketplace + (c.legal_name ? ' · ' + c.legal_name : '');
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(c);
+    });
+    const whole = [...perMp].filter(([, n]) => n > 1).map(([mp]) => opt(mp, `${mp} — все кабинеты`, flt.cabinet)).join('');
+    return `<select data-f-cabinet class="btn secondary" aria-label="Кабинет">${opt('', 'Все кабинеты', flt.cabinet)}
+      ${whole ? `<optgroup label="Маркетплейс целиком">${whole}</optgroup>` : ''}
+      ${[...groups].map(([g, list]) => `<optgroup label="${esc(g)}">${list.map(c => opt(c.key, c.cabinet, flt.cabinet)).join('')}</optgroup>`).join('')}</select>`;
+  }
 
   async function api(url, options) {
     const r = await fetch(url, options);
@@ -32,12 +51,12 @@ window.WBOPSFinance = (() => {
   }
 
   function renderTable(s) {
-    const n = s.periods.length, from = lastMonths ? Math.max(0, n - lastMonths) : 0;
+    const n = s.periods.length, from = flt.lastMonths ? Math.max(0, n - flt.lastMonths) : 0;
     const periods = s.periods.slice(from), fc = s.forecast_title;
     const head = `<tr><th class="f-sticky">Статья</th><th>Итого</th><th>% выр.</th>${periods.map(p => `<th>${esc(p)}</th>`).join('')}${fc ? `<th class="f-fc">${esc(fc)}</th>` : ''}</tr>`;
     const body = s.rows.map(r => {
       if (r.kind === 'section') return `<tr class="f-section"><td class="f-sticky" colspan="${3 + periods.length + (fc ? 1 : 0)}">${esc(r.label)}</td></tr>`;
-      if (r.kind === 'detail' && !showDetails) return '';
+      if (r.kind === 'detail' && !flt.showDetails) return '';
       const isShare = r.kind === 'share', fmt = isShare ? pct : rub;
       const cells = r.values.slice(from).map(v => `<td${neg(v)}>${fmt(v)}</td>`).join('');
       return `<tr class="f-${r.kind}${/^ПРИБЫЛЬ/.test(r.label) ? ' f-profit' : ''}"><td class="f-sticky">${esc(r.label)}</td>
@@ -57,7 +76,7 @@ window.WBOPSFinance = (() => {
     const h = g.header, idx = name => h.indexOf(name);
     const iArt = idx('Артикул'), iMp = idx('Маркетплейс'), iRev = idx('Выручка');
     if (iArt < 0) return '<p class="muted">Лист «Товары» не найден.</p>';
-    let rows = g.rows.filter(r => iMp < 0 || r[iMp] === 'Все маркетплейсы');
+    let rows = g.rows.filter(r => iMp < 0 || r[iMp] === (g.scope || 'Все маркетплейсы'));
     if (query) rows = rows.filter(r => String(r[iArt] ?? '').toLowerCase().includes(query.toLowerCase()));
     if (iRev >= 0) rows.sort((a, b) => (b[iRev] || 0) - (a[iRev] || 0));
     const cols = h.map((name, i) => [name, i]).filter(([name, i]) => i !== iMp && name !== 'Название');
@@ -74,21 +93,27 @@ window.WBOPSFinance = (() => {
       ${problems.length ? `<div class="f-alert"><b>На листе «Контроль» есть замечания (${problems.length}):</b><ul>${problems.slice(0, 6).map(p => `<li>${esc(p.marketplace)}${p.cabinet && p.cabinet !== '—' ? ' · ' + esc(p.cabinet) : ''}: ${esc(p.metric)} — ${esc(typeof p.value === 'number' ? rub(p.value) : p.value)} <i>${esc(p.status)}</i></li>`).join('')}</ul></div>` : '<div class="f-ok">Сверки сошлись, замечаний нет.</div>'}
       ${renderKpi(s)}
       <div class="f-head"><h3>ОПиУ по месяцам</h3><div class="toolbar">
-        <label class="r-check"><input type="checkbox" data-f-details ${showDetails ? 'checked' : ''}> По маркетплейсам</label>
-        <select data-f-months class="btn secondary"><option value="6"${lastMonths === 6 ? ' selected' : ''}>Последние 6 мес.</option><option value="12"${lastMonths === 12 ? ' selected' : ''}>Последние 12 мес.</option><option value="0"${!lastMonths ? ' selected' : ''}>Весь период</option></select></div></div>
+        ${cabinetSelect(report.cabinets || [])}
+        <label class="r-check"><input type="checkbox" data-f-details ${flt.showDetails ? 'checked' : ''}> ${flt.cabinet ? 'Расшифровка статей' : 'По маркетплейсам'}</label>
+        <select data-f-months class="btn secondary"><option value="6"${flt.lastMonths === 6 ? ' selected' : ''}>Последние 6 мес.</option><option value="12"${flt.lastMonths === 12 ? ' selected' : ''}>Последние 12 мес.</option><option value="0"${!flt.lastMonths ? ' selected' : ''}>Весь период</option></select></div></div>
       ${renderTable(s)}
       <h3>Контроль</h3>${renderControl(report.control)}
       <div class="f-head"><h3>Товары за период</h3><input data-f-goods-search placeholder="Поиск по артикулу"></div>
       <div data-f-goods>${renderGoods(report.goods)}</div>`;
-    box.querySelector('[data-f-details]').onchange = e => { showDetails = e.target.checked; renderReport(); };
-    box.querySelector('[data-f-months]').onchange = e => { lastMonths = Number(e.target.value); renderReport(); };
+    box.querySelector('[data-f-cabinet]').onchange = e => { flt.cabinet = e.target.value; remember(); loadReport(); };
+    box.querySelector('[data-f-details]').onchange = e => { flt.showDetails = e.target.checked; remember(); renderReport(); };
+    box.querySelector('[data-f-months]').onchange = e => { flt.lastMonths = Number(e.target.value); remember(); renderReport(); };
     box.querySelector('[data-f-goods-search]').oninput = e => { box.querySelector('[data-f-goods]').innerHTML = renderGoods(report.goods, e.target.value.trim()); };
   }
 
   async function loadReport() {
     const box = root.querySelector('[data-f-report]');
     box.innerHTML = '<p class="muted">Загрузка отчёта…</p>';
-    try { report = await api('/api/finance/report'); renderReport(); }
+    try {
+      report = await api('/api/finance/report?cabinet=' + encodeURIComponent(flt.cabinet));
+      if (report.selected !== flt.cabinet) { flt.cabinet = report.selected || ''; remember(); }   // кабинета больше нет в отчёте
+      renderReport();
+    }
     catch (e) { report = null; box.innerHTML = `<div class="f-alert">${esc(e.message)}</div>`; }
   }
 

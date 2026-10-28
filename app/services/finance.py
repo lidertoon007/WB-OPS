@@ -380,15 +380,17 @@ def cabinet_options(report_cabinets: list[dict], project: Path | None, panel_cab
     """Кабинеты отчёта с юрлицом и id кабинета панели (сопоставление — как у ставки налога, tax._match)."""
     from app.services import tax
 
-    panel = {}
+    panel, by_name = {}, {}
     for c in panel_cabinets:
         same = sum(1 for x in panel_cabinets if x.marketplace == c.marketplace)
         account = tax.opiu_rate(project, c, same)["account"]
         if account:
             panel.setdefault((REPORT_MP.get(c.marketplace), account), c)
+        by_name.setdefault((REPORT_MP.get(c.marketplace), tax._norm(c.name)), c)   # нет конфига — по названию
     out = []
     for item in report_cabinets:
-        c = panel.get((item["marketplace"], item["cabinet"]))
+        c = (panel.get((item["marketplace"], item["cabinet"]))
+             or by_name.get((item["marketplace"], tax._norm(item["cabinet"]))))
         out.append({**item, "legal_name": c.legal_name if c else "", "panel_id": c.id if c else "",
                     "panel_name": c.name if c else ""})
     return out

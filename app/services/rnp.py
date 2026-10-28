@@ -296,16 +296,28 @@ class RNP:
         return chosen
 
     # ------------------------------------------------------------------ факты
-    def facts(self, start: str, end: str, d=None) -> dict:
+    @staticmethod
+    def _only(d, cabinets: set | None):
+        """Выгрузка дашборда только по выбранным кабинетам (None — все)."""
+        if not d or not cabinets:
+            return d
+        return {**d, "cabinets": {k: v for k, v in (d.get("cabinets") or {}).items() if k in cabinets}}
+
+    def facts(self, start: str, end: str, d=None, cabinets: set | None = None) -> dict:
         """{(день, артикул): метрики}. Заказы — из API WB; за дни, где их нет, — из кэша ОПиУ.
-        Реклама — из API продвижения; если её не загружали — из отчёта реализации (с задержкой)."""
+        Реклама — из API продвижения; если её не загружали — из отчёта реализации (с задержкой).
+        cabinets — названия кабинетов (в панели и в ОПиУ), None — все."""
         out = defaultdict(lambda: defaultdict(float))
         info = {}
         own_days, has_ads = set(), False
+        cab_sql, cab_args = "", ()
+        if cabinets:
+            cab_sql, cab_args = f" AND cabinet IN ({','.join('?' * len(cabinets))})", tuple(sorted(cabinets))
+        d = self._only(d, cabinets)
         with self.store._connect() as c:
             for day, art, nm, brand, subject, qty, price, spp, finished, cancels in c.execute(
                     "SELECT day, article, MAX(nm_id), MAX(brand), MAX(subject), COUNT(*), SUM(price), SUM(spp), SUM(finished), SUM(is_cancel) "
-                    "FROM rnp_orders WHERE day BETWEEN ? AND ? GROUP BY day, article", (start, end)):
+                    f"FROM rnp_orders WHERE day BETWEEN ? AND ?{cab_sql} GROUP BY day, article", (start, end, *cab_args)):
                 key = art_key(art)
                 m = out[(day, key)]
                 m["orders"] += qty
@@ -319,7 +331,7 @@ class RNP:
             nm_art = {nm: art_key(a) for nm, a in c.execute("SELECT nm_id, MAX(article) FROM rnp_orders GROUP BY nm_id")}
             for day, nm, views, clicks, spend, atbs, orders in c.execute(
                     "SELECT day, nm_id, SUM(views), SUM(clicks), SUM(spend), SUM(atbs), SUM(orders) "
-                    "FROM rnp_ads WHERE day BETWEEN ? AND ? GROUP BY day, nm_id", (start, end)):
+                    f"FROM rnp_ads WHERE day BETWEEN ? AND ?{cab_sql} GROUP BY day, nm_id", (start, end, *cab_args)):
                 has_ads = True
                 key = nm_art.get(nm) or f"NM{nm}"
                 m = out[(day, key)]
@@ -372,10 +384,11 @@ class RNP:
                 "orders_per_day": o / max(1, n_days), "profit_per_day": m.get("profit", 0) / max(1, n_days)}
 
     def table(self, start: str, end: str, brand: str | None = None, category: str | None = None, articles: set | None = None,
-              with_cells: bool = False) -> dict:
+              with_cells: bool = False, cabinets: set | None = None) -> dict:
         d = self._dash()
-        f = self.facts(start, end, d)
-        econ = self.unit_economics(d)
+        f = self.facts(start, end, d, cabinets)
+        econ = self.unit_economics(d)      # доли расходов — по всем кабинетам, как и раньше
+        d = self._only(d, cabinets)
         costs = self._costs()
         retro = self._retro()
         catalog = (d or {}).get("catalog", {})

@@ -2290,16 +2290,44 @@ def _rnp_articles(article: str):
     return {x.strip().upper().replace(" ", "") for x in article.split(",") if x.strip()} or None
 
 
+def _rnp_cabinets() -> list[dict]:
+    """Кабинеты РНП для фильтра: название, юрлицо и все имена кабинета (в панели и в расчёте ОПиУ —
+    заказы РНП записаны под первым, выгрузка дашборда — под вторым)."""
+    panel = [c for c in configured_cabinets() if c.marketplace == "wildberries"]
+    project = finance.find_project_dir(finance_settings()["dir"] or None)
+    out = []
+    for name, token, _ in _rnp_tokens():
+        cab = next((c for c in panel if c.token == token), None)
+        names = {name}
+        if cab is not None:
+            account = tax_module.opiu_rate(project, cab, len(panel))["account"]
+            if account:
+                names.add(account)
+        out.append({"name": name, "legal_name": cab.legal_name if cab else "", "names": sorted(names)})
+    return out
+
+
+def _rnp_cabinet_filter(cabinet: str):
+    if not cabinet:
+        return None
+    for c in _rnp_cabinets():
+        if c["name"] == cabinet:
+            return set(c["names"])
+    return {cabinet}
+
+
 @app.get("/api/rnp")
 def rnp_table(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), brand: str = "", category: str = "",
-              article: str = "") -> dict[str, object]:
+              article: str = "", cabinet: str = "") -> dict[str, object]:
     start, end = _rnp_period(date_from, date_to)
-    data = rnp.table(start, end, brand=brand or None, category=category or None, articles=_rnp_articles(article))
+    data = rnp.table(start, end, brand=brand or None, category=category or None, articles=_rnp_articles(article),
+                     cabinets=_rnp_cabinet_filter(cabinet))
     try:
         opts = kpi_dashboard.options()
     except Exception:
         opts = {}
     data["options"] = opts
+    data["cabinets"] = [{"name": c["name"], "legal_name": c["legal_name"]} for c in _rnp_cabinets()]
     data["has_tokens"] = bool(_rnp_tokens())
     data["sync_hours"] = RNP_SYNC_HOURS
     return data
@@ -2307,10 +2335,11 @@ def rnp_table(date_from: str = Query(..., alias="from"), date_to: str = Query(..
 
 @app.get("/api/rnp/heatmap")
 def rnp_heatmap(metric: str, date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), brand: str = "",
-                category: str = "", article: str = "") -> dict[str, object]:
+                category: str = "", article: str = "", cabinet: str = "") -> dict[str, object]:
     start, end = _rnp_period(date_from, date_to)
     try:
-        return rnp.heatmap(start, end, metric, brand=brand or None, category=category or None, articles=_rnp_articles(article))
+        return rnp.heatmap(start, end, metric, brand=brand or None, category=category or None, articles=_rnp_articles(article),
+                           cabinets=_rnp_cabinet_filter(cabinet))
     except RNPError as exc:
         raise HTTPException(400, str(exc))
 
