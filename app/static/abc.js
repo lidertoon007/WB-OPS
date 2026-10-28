@@ -21,7 +21,7 @@ window.WBOPSAbc = (() => {
     ['sold', 'Продажи, шт', r => num(r.sold)], ['revenue', 'Выручка, ₽', r => rub(r.revenue)], ['share', 'Доля выручки', r => pct(r.share)],
     ['cum_share', 'Накоп. доля', r => pct(r.cum_share)],
     ['abc_revenue', 'ABC выручка', r => badge(r.abc_revenue), 'c'], ['abc_turnover', 'ABC оборач.', r => badge(r.abc_turnover), 'c'],
-    ['abc_profit', 'ABC прибыль', r => badge(r.abc_profit), 'c'], ['abc', 'ABC', r => `<b>${esc(r.abc)}</b>`, 'c'],
+    ['abc_profit', 'ABC прибыль', r => badge(r.abc_profit), 'c'], ['abc', 'ABC', r => `<b>${esc(r.abc)}</b>`, 'c'], ['group', 'Группа', r => badge(r.group), 'c'],
     ['profit', 'Прибыль, ₽', r => `<span class="${r.profit < 0 ? 'neg' : ''}">${rub(r.profit)}</span>`],
     ['stock', 'Остаток, шт', r => num(r.stock)], ['unit_cost', 'Себест. ед., ₽', r => rub(r.unit_cost)],
     ['stock_cost', 'Себест. остатка, ₽', r => rub(r.stock_cost)], ['per_day', 'Продажи в день', r => num(r.per_day, 1)],
@@ -31,12 +31,12 @@ window.WBOPSAbc = (() => {
   ];
   const HINTS = {
     abc_revenue: 'Артикулы по убыванию выручки: накопительная доля до 80% — A, до 95% — B, остальное — C.',
-    abc_turnover: 'То же по проданным штукам.', abc_profit: 'То же по прибыли артикула; прибыль 0 или в минусе — C.',
+    abc_turnover: 'То же по проданным штукам.', group: 'Итоговая группа по большинству трёх букв ABC: AAC → A, ABB → B, CCA → C; все три разные — B.', abc_profit: 'То же по прибыли артикула; прибыль 0 или в минусе — C.',
     profit: 'Как на дашборде с фильтром по товару: выручка минус удержания и реклама артикула, себестоимость, подготовка и налог, плюс ретро-бонусы.',
     stock: 'Сейчас: склады маркетплейсов + свой склад (один раз, хотя его видят все маркетплейсы).',
     days_left: 'Остаток / продажи в день. ∞ — остаток без продаж.',
-    status: 'Критический неликвид — запас больше 120 дн или остаток без продаж; избыток — 60–120 дн; дефицит — меньше 15 дн при продажах.',
-    restock: '14 × продажи в день − остаток. Для группы C по выручке — 0: дозакупать не нужно.',
+    status: 'Критический неликвид — итоговая группа C и запас больше 120 дн или остаток без продаж (у A и B такой запас — избыток); избыток — 60–120 дн; дефицит — меньше 15 дн при продажах.',
+    restock: '14 × продажи в день − остаток. Для итоговой группы C — 0: дозакупать не нужно.',
   };
   const badge = g => `<span class="ab-g ab-${g}">${g}</span>`;
 
@@ -92,7 +92,7 @@ window.WBOPSAbc = (() => {
   }
 
   // Фильтры по столбцам: текст — «содержит», ABC и статус — список, числа — условие: >100, <5, >=10, 10-50, 0
-  const TEXT_COLS = ['brand', 'category', 'article', 'name', 'abc'], PICK_COLS = {abc_revenue: 'ABC', abc_turnover: 'ABC', abc_profit: 'ABC', status: null};
+  const TEXT_COLS = ['brand', 'category', 'article', 'name', 'abc'], PICK_COLS = {abc_revenue: 'ABC', abc_turnover: 'ABC', abc_profit: 'ABC', group: 'ABC', status: null};
   const norm = v => String(v ?? '').toLowerCase().replace(/ё/g, 'е');
   const toNum = s => { const t = String(s).replace(/\s/g, '').replace(',', '.').replace('%', ''); return t === '' || isNaN(t) ? null : Number(t); };
   function numTest(expr) {
@@ -121,7 +121,7 @@ window.WBOPSAbc = (() => {
   function visible() {
     const q = st.q.toLowerCase().replace(/ё/g, 'е'), tests = colTests();
     const rows = st.data.rows.filter(r => (!st.brand || r.brand === st.brand) && (!st.category || r.category === st.category)
-      && (!st.group || r.abc_revenue === st.group) && (!st.status || r.status === st.status)
+      && (!st.group || r.group === st.group) && (!st.status || r.status === st.status)
       && (!q || `${r.article} ${r.name} ${r.brand}`.toLowerCase().replace(/ё/g, 'е').includes(q)) && tests.every(t => t(r)));
     const k = st.sort, dir = st.desc ? -1 : 1;
     return rows.sort((a, b) => { const x = a[k] ?? -Infinity, y = b[k] ?? -Infinity;
@@ -145,11 +145,11 @@ window.WBOPSAbc = (() => {
       <div class="db-note">Учтены продажи кабинетов панели: ${esc(d.marketplaces.join(' и '))}. Свой склад общий для всех кабинетов, поэтому если товар продаётся ещё в других кабинетах или на Яндекс Маркете, без них он попадёт в «Неликвид» или «Избыток» ошибочно — подключите все кабинеты в «Кабинетах маркетплейсов».</div>
       ${k.no_cost ? `<div class="db-note">У ${num(k.no_cost)} артикулов с остатком нет себестоимости — стоимость их остатка не посчитана. Задайте цены в «Товары → Номенклатура и себестоимость».</div>` : ''}
       <div class="ab-summary">
-        <table class="ab-mini"><thead><tr><th>Группа</th><th>Кол-во SKU</th><th>Доля SKU</th><th>Выручка, ₽</th><th>Доля выручки</th><th>Остаток, ₽</th></tr></thead>
-          <tbody>${'ABC'.split('').map(g => { const x = d.groups[g]; return `<tr data-group="${g}" class="${st.group === g ? 'sel' : ''}" title="Показать группу ${g}"><td>${badge(g)} Группа ${g}</td><td>${num(x.count)}</td><td>${pct(x.count / total * 100)}</td><td>${rub(x.revenue)}</td><td>${pct(k.revenue ? x.revenue / k.revenue * 100 : 0)}</td><td>${rub(x.stock_cost)}</td></tr>`; }).join('')}</tbody>
-          <tfoot><tr><td>Итого</td><td>${num(d.count)}</td><td>100%</td><td>${rub(k.revenue)}</td><td>100%</td><td>${rub(k.stock_cost)}</td></tr></tfoot></table>
+        <table class="ab-mini"><thead><tr><th>Группа</th><th>Кол-во SKU</th><th>Доля SKU</th><th>Выручка, ₽</th><th>Доля выручки</th><th>Остаток, ₽</th><th title="Себестоимость остатка в статусе «Критический неликвид» — он бывает только у группы C">Неликвид, ₽</th></tr></thead>
+          <tbody>${'ABC'.split('').map(g => { const x = d.groups[g]; return `<tr data-group="${g}" class="${st.group === g ? 'sel' : ''}" title="Показать группу ${g}"><td>${badge(g)} Группа ${g}</td><td>${num(x.count)}</td><td>${pct(x.count / total * 100)}</td><td>${rub(x.revenue)}</td><td>${pct(k.revenue ? x.revenue / k.revenue * 100 : 0)}</td><td>${rub(x.stock_cost)}</td><td class="${x.dead_cost ? 'ab-dead' : ''}">${rub(x.dead_cost)}</td></tr>`; }).join('')}</tbody>
+          <tfoot><tr><td>Итого</td><td>${num(d.count)}</td><td>100%</td><td>${rub(k.revenue)}</td><td>100%</td><td>${rub(k.stock_cost)}</td><td>${rub(k.dead_cost)}</td></tr></tfoot></table>
         <div class="ab-recs"><b>📋 Рекомендации по ассортименту и запасам</b>${'ABC'.split('').map(g => `<p>${esc(RECS[g])}</p>`).join('')}
-          <p class="muted">⚡ Нормативы: «Критический неликвид» — запас больше 120 дн или остаток без продаж, «Избыток» — 60–120 дн, «Норма» — 15–60 дн, «Дефицит» — меньше 15 дн.</p></div>
+          <p class="muted">⚡ Группа — по большинству трёх букв ABC (выручка · оборачиваемость · прибыль): AAC → A, ABB → B, все разные → B. «Критический неликвид» — группа C и запас больше 120 дн или остаток без продаж, «Избыток» — 60–120 дн, «Норма» — 15–60 дн, «Дефицит» — меньше 15 дн.</p></div>
         <table class="ab-mini"><thead><tr><th>Статус остатка</th><th>Кол-во SKU</th><th>Доля SKU</th><th>Остаток, ₽</th></tr></thead>
           <tbody>${Object.entries(d.statuses).map(([s, x]) => `<tr data-status="${esc(s)}" class="${st.status === s ? 'sel' : ''}" title="Показать «${esc(s)}»"><td><span class="ab-st ${STATUS_CLS[s]}">${esc(s)}</span></td><td>${num(x.count)}</td><td>${pct(x.count / total * 100)}</td><td>${rub(x.stock_cost)}</td></tr>`).join('')}</tbody></table>
       </div>
@@ -197,9 +197,9 @@ window.WBOPSAbc = (() => {
     const active = Object.values(st.cf || {}).filter(v => v !== '' && v != null).length;
     root.querySelector('[data-count]').innerHTML = `Показано ${num(Math.min(rows.length, st.shown))} из ${num(rows.length)}`
       + (active ? ` · фильтров по столбцам: ${active} <button type="button" class="rv-link" data-cf-reset>сбросить</button>` : '');
-    const fixed = COLS.every(([k]) => widths[k]);
-    box.innerHTML = `<table class="ab-table ${fixed ? 'fixed' : ''}" ${fixed ? `style="width:${COLS.reduce((a, [k]) => a + widths[k], 0)}px"` : ''}>
-      <colgroup>${COLS.map(([k]) => `<col data-col="${k}" ${fixed ? `style="width:${widths[k]}px"` : ''}>`).join('')}</colgroup>
+    const fixed = COLS.some(([k]) => widths[k]), w = k => widths[k] || 90;   // новый столбец после сохранённых ширин — 90 px
+    box.innerHTML = `<table class="ab-table ${fixed ? 'fixed' : ''}" ${fixed ? `style="width:${COLS.reduce((a, [k]) => a + w(k), 0)}px"` : ''}>
+      <colgroup>${COLS.map(([k]) => `<col data-col="${k}" ${fixed ? `style="width:${w(k)}px"` : ''}>`).join('')}</colgroup>
       <thead><tr>${COLS.map(([k, t, , a]) => `<th class="${a || ''} ${st.sort === k ? 'sorted' : ''}" data-sort="${k}" ${HINTS[k] ? `title="${esc(HINTS[k])}"` : ''} aria-sort="${st.sort === k ? (st.desc ? 'descending' : 'ascending') : 'none'}">${esc(t)}${st.sort === k ? (st.desc ? ' ↓' : ' ↑') : ''}<span class="ab-rz" data-rz="${k}" title="Потяните, чтобы изменить ширину. Двойной клик — по содержимому" aria-hidden="true"></span></th>`).join('')}</tr>
         <tr class="ab-cf">${COLS.map(([k]) => `<th>${filterCell(k)}</th>`).join('')}</tr></thead>
       <tbody>${rows.length ? rows.slice(0, st.shown).map(r => `<tr>${COLS.map(([, , v, a]) => `<td class="${a || ''}">${v(r)}</td>`).join('')}</tr>`).join('')
@@ -290,7 +290,8 @@ window.WBOPSAbc = (() => {
 .ab-kpi{background:#fff;border:1px solid #e7e9ee;border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:4px;min-width:0}
 .ab-kpi span{font-size:12px;font-weight:600;color:#374151}.ab-kpi b{font-size:22px;font-variant-numeric:tabular-nums}.ab-kpi small{font-size:11px;color:#6b7280}
 .ab-kpi.warn{background:#fffbeb;border-color:#fde68a}.ab-kpi.bad{background:#fef2f2;border-color:#fecaca}
-.ab-summary{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start}
+.ab-mini td.ab-dead{color:#9f1239}
+.ab-summary{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start}
 .ab-mini{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e7e9ee;border-radius:12px;overflow:hidden;font-size:13px;font-variant-numeric:tabular-nums}
 .ab-mini th{background:#2f4b8a;color:#fff;font-weight:600;font-size:12px;padding:7px 8px;text-align:right}.ab-mini th:first-child,.ab-mini td:first-child{text-align:left}
 .ab-mini td{padding:7px 8px;border-bottom:1px solid #eef0f5;text-align:right;white-space:nowrap}.ab-mini tbody tr{cursor:pointer}.ab-mini tbody tr:hover td{background:#f5f7fb}

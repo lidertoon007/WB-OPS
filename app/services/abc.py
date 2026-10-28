@@ -4,9 +4,11 @@
   • ABC по выручке, по оборачиваемости (продажам в штуках) и по прибыли: артикулы по убыванию, накопительная
     доля до 80% — A, до 95% — B, остальное — C; с нулём или минусом — C. Код ABC — три буквы подряд (AAC);
   • остаток сейчас (склады маркетплейсов + свой склад один раз), себестоимость остатка, продажи в день,
-    запас в днях и статус: «Нет остатка», «Критический неликвид» (>120 дн или остаток без продаж),
-    «Избыток запаса» (60–120 дн), «Дефицит» (<15 дн при продажах), «В норме»;
-  • подсорт на 14 дней: 14 × продаж в день − остаток (для группы C по выручке — 0, дозакупать не нужно).
+    запас в днях и статус: «Нет остатка», «Критический неликвид» (итоговая группа C и запас >120 дн или остаток
+    без продаж; у A и B такой запас — «Избыток запаса»), «Избыток запаса» (60–120 дн), «Дефицит» (<15 дн при продажах),
+    «В норме»;
+  • итоговая группа — по большинству трёх букв (AAC → A, ABB → B, все три разные → B);
+  • подсорт на 14 дней: 14 × продаж в день − остаток (для итоговой группы C — 0, дозакупать не нужно).
 Цифры по артикулу — как на дашборде с фильтром по товару: выручка, удержания и реклама этого артикула,
 себестоимость и подготовка из cost.csv, налог, ретро-бонусы; расходы без артикула в прибыль артикула не входят.
 """
@@ -33,11 +35,20 @@ def groups(values: dict[str, float]) -> dict[str, str]:
     return out
 
 
-def status(stock: float, sold: float, days_left: float) -> str:
+def final_group(code: str) -> str:
+    """Итоговая группа по трём буквам (выручка, оборачиваемость, прибыль): та, что встречается 2–3 раза; все разные — B."""
+    for g in "ABC":
+        if code.count(g) >= 2:
+            return g
+    return "B"
+
+
+def status(stock: float, sold: float, days_left: float, group: str = "C") -> str:
+    """Неликвид — только у итоговой группы C: у A и B долгий запас — «Избыток запаса»."""
     if stock <= 0 and sold <= 0:
         return "Нет остатка"
     if stock > 0 and (sold <= 0 or days_left > DEAD_DAYS):
-        return "Критический неликвид"
+        return "Критический неликвид" if group == "C" else "Избыток запаса"
     if days_left > EXCESS_DAYS:
         return "Избыток запаса"
     if days_left < DEFICIT_DAYS and sold > 0:
@@ -86,14 +97,16 @@ def analysis(boards: dict[str, Dashboard], start: date, end: date, book: dict[st
         per_day = max(0.0, sold) / days
         left = stock / per_day if per_day > 0 else (999 if stock > 0 else 0)
         cost = b.get("cost")
-        st = status(stock, sold, left)
-        restock = 0 if revenue[k] == "C" or per_day <= 0 else max(0, math.ceil(RESTOCK_DAYS * per_day - stock))
+        code = revenue[k] + turnover[k] + profit[k]
+        group = final_group(code)
+        st = status(stock, sold, left, group)
+        restock = 0 if group == "C" or per_day <= 0 else max(0, math.ceil(RESTOCK_DAYS * per_day - stock))
         rows.append({"key": k, "article": b.get("article") or c.get("article") or k, "name": b.get("name") or "",
                      "brand": b.get("brand") or c.get("brand") or "", "category": b.get("category") or c.get("category") or "",
                      "marketplaces": sorted(mps[k]), "sold": sold, "revenue": s["revenue"], "profit": s["profit"],
                      "share": s["revenue"] / total_revenue * 100 if total_revenue and s["revenue"] > 0 else 0.0,
                      "abc_revenue": revenue[k], "abc_turnover": turnover[k], "abc_profit": profit[k],
-                     "abc": revenue[k] + turnover[k] + profit[k], "stock": stock, "unit_cost": cost,
+                     "abc": code, "group": group, "stock": stock, "unit_cost": cost,
                      "stock_cost": stock * cost if cost is not None else None, "per_day": per_day,
                      "days_left": round(left), "status": st, "restock": restock})
     rows.sort(key=lambda r: (-r["revenue"], r["article"].lower()))
@@ -103,9 +116,12 @@ def analysis(boards: dict[str, Dashboard], start: date, end: date, book: dict[st
         r["cum_share"] = acc
     stock_total = sum(r["stock_cost"] or 0 for r in rows)
     dead = [r for r in rows if r["status"] == "Критический неликвид"]
-    by_group = {g: {"count": sum(1 for r in rows if r["abc_revenue"] == g),
-                    "revenue": sum(r["revenue"] for r in rows if r["abc_revenue"] == g),
-                    "stock_cost": sum(r["stock_cost"] or 0 for r in rows if r["abc_revenue"] == g)} for g in "ABC"}
+    by_group = {}
+    for g in "ABC":
+        part = [r for r in rows if r["group"] == g]
+        by_group[g] = {"count": len(part), "revenue": sum(r["revenue"] for r in part),
+                       "stock_cost": sum(r["stock_cost"] or 0 for r in part),
+                       "dead_cost": sum(r["stock_cost"] or 0 for r in part if r["status"] == "Критический неликвид")}
     by_status = {s: {"count": sum(1 for r in rows if r["status"] == s),
                      "stock_cost": sum(r["stock_cost"] or 0 for r in rows if r["status"] == s)} for s in STATUSES}
     dead_cost = sum(r["stock_cost"] or 0 for r in dead)

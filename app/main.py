@@ -142,7 +142,15 @@ def seed_product_models() -> int:
     for nm, vendor in extra.items():
         if str(nm).isdigit() and str(vendor).strip():
             links.setdefault(str(vendor).strip(), set()).add(int(nm))
-    return product_models.seed(links)
+    # Только товары из карточек WB по API (app/knowledge/wb_cards.json): старые вопросы и отчёты бывают
+    # от чужих или закрытых кабинетов — их модели в «Товарах» не нужны. Нет карточек — ничего не создаём.
+    try:
+        cards = json.loads(Path("app/knowledge/wb_cards.json").read_text(encoding="utf-8")).get("cards", [])
+    except (OSError, ValueError):
+        cards = []
+    api = {int(c["nm"]) for c in cards if str(c.get("nm") or "").isdigit()}
+    links = {vendor: {nm for nm in nms if nm in api} for vendor, nms in links.items()}
+    return product_models.seed({vendor: nms for vendor, nms in links.items() if nms})
 
 
 try:
@@ -2346,13 +2354,13 @@ def abc_export_selected(value: dict) -> Response:
 
 def _abc_export(d: dict, date_from: str, date_to: str, format: str, suffix: str = "") -> Response:
     rows = [["Бренд", "Категория", "Артикул", "Наименование", "Маркетплейсы", f"Продажи {d['days']} дн, шт", f"Выручка {d['days']} дн, ₽",
-             "Доля выручки, %", "Накопительная доля, %", "ABC (выручка)", "ABC (оборачиваемость)", "ABC (прибыль)", "ABC",
+             "Доля выручки, %", "Накопительная доля, %", "ABC (выручка)", "ABC (оборачиваемость)", "ABC (прибыль)", "ABC", "Группа",
              "Прибыль, ₽", "Остаток, шт", "Себестоимость ед., ₽", "Себестоимость остатка, ₽", "Продажи в день, шт", "Запас, дн",
              "Статус", f"Подсорт ({abc_module.RESTOCK_DAYS} дн), шт"]]
     for r in d["rows"]:
         rows.append([r["brand"], r["category"], r["article"], r["name"], ", ".join(r["marketplaces"]), round(r["sold"], 2),
                      round(r["revenue"], 2), round(r["share"], 2), round(r["cum_share"], 2), r["abc_revenue"], r["abc_turnover"],
-                     r["abc_profit"], r["abc"], round(r["profit"], 2), round(r["stock"], 2), r["unit_cost"],
+                     r["abc_profit"], r["abc"], r["group"], round(r["profit"], 2), round(r["stock"], 2), r["unit_cost"],
                      None if r["stock_cost"] is None else round(r["stock_cost"], 2), round(r["per_day"], 2), r["days_left"],
                      r["status"], r["restock"]])
     return _table_download({"ABC": rows}, format, f"abc_{date_from}_{date_to}{suffix}")

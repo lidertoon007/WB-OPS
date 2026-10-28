@@ -25,6 +25,17 @@ class AbcRulesTests(unittest.TestCase):
         g = abc.groups({"a": 70, "b": 15, "c": 10, "d": 5, "e": 0, "f": -3})
         self.assertEqual(g, {"a": "A", "b": "B", "c": "B", "d": "C", "e": "C", "f": "C"})   # 70 → 85 → 95 → 100
 
+    def test_final_group_by_majority(self):
+        for code, g in (("AAA", "A"), ("AAC", "A"), ("ACA", "A"), ("ABB", "B"), ("BCB", "B"), ("CCA", "C"), ("CCC", "C"),
+                        ("ABC", "B"), ("CBA", "B")):
+            self.assertEqual(abc.final_group(code), g, code)
+
+    def test_dead_stock_only_in_group_c(self):
+        self.assertEqual(abc.status(500, 2, 250, "C"), "Критический неликвид")
+        self.assertEqual(abc.status(5, 0, 999, "C"), "Критический неликвид")
+        self.assertEqual(abc.status(500, 2, 250, "A"), "Избыток запаса")     # A и B с долгим запасом — не неликвид
+        self.assertEqual(abc.status(5, 0, 999, "B"), "Избыток запаса")
+
     def test_statuses(self):
         self.assertEqual(abc.status(0, 0, 0), "Нет остатка")
         self.assertEqual(abc.status(5, 0, 999), "Критический неликвид")       # остаток без продаж
@@ -79,6 +90,10 @@ class AbcAnalysisTests(unittest.TestCase):
         self.assertEqual(d["kpi"]["dead_count"], 1)
         self.assertEqual(d["kpi"]["no_cost"], 1)
         self.assertEqual(d["groups"]["A"]["count"], 1)
+        self.assertEqual(a["group"], "A")                                   # ABA — по большинству букв
+        self.assertEqual(rows["D-4"]["group"], "C")
+        self.assertEqual(sum(d["groups"][g]["count"] for g in "ABC"), d["count"])
+        self.assertEqual(d["groups"]["C"]["dead_cost"], 0)                  # у D-4 нет себестоимости
         self.assertEqual(d["rows"][0]["key"], "A-1")                        # по убыванию выручки
         self.assertAlmostEqual(d["rows"][-1]["cum_share"], 100)
 
@@ -98,7 +113,7 @@ class AbcExportApiTests(unittest.TestCase):
 
         from app import main
         rows = [{"key": k, "article": k, "brand": "", "category": "", "name": "", "marketplaces": ["Ozon"], "sold": 1, "revenue": 1,
-                 "share": 1, "cum_share": 1, "abc_revenue": "A", "abc_turnover": "A", "abc_profit": "A", "abc": "AAA", "profit": 1,
+                 "share": 1, "cum_share": 1, "abc_revenue": "A", "abc_turnover": "A", "abc_profit": "A", "abc": "AAA", "group": "A", "profit": 1,
                  "stock": 0, "unit_cost": None, "stock_cost": None, "per_day": 0, "days_left": 0, "status": "Нет остатка", "restock": 0}
                 for k in ("A-1", "B-2", "C-3")]
         with mock.patch.object(main, "_abc_data", return_value={"days": 30, "rows": rows}):
