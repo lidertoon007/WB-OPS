@@ -1,4 +1,4 @@
-/* WB OPS: «Аналитика FBS» — сводка, лента сборочных заданий, склады, артикулы, скорость отгрузки и скидки/штрафы WB за сроки. */
+/* WB OPS: «Аналитика FBS» (Wildberries; Ozon — fbs_ozon.js, выбор маркетплейса — mount) — сводка, лента сборочных заданий, склады, артикулы, скорость отгрузки и скидки/штрафы WB за сроки. */
 window.WBOPSFbs = (() => {
   const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
   const num = (v, d = 0) => v == null || v === '' || isNaN(v) ? '—' : Number(v).toLocaleString('ru-RU', {minimumFractionDigits: d, maximumFractionDigits: d});
@@ -42,10 +42,35 @@ window.WBOPSFbs = (() => {
   }
 
   // ---------------------------------------------------------------- каркас
+  // ---------------------------------------------------------------- выбор маркетплейса (WB — этот модуль, Ozon — fbs_ozon.js)
+  const MPS = [['wb', 'Wildberries'], ['ozon', 'Ozon']];
+  function currentMp() {
+    const u = new URLSearchParams(location.search).get('mp');
+    if (u === 'wb' || u === 'ozon') return u;
+    try { return localStorage.getItem('wbops.fbs.mp') === 'ozon' ? 'ozon' : 'wb'; } catch (e) { return 'wb'; }
+  }
+  function mount(section) {
+    const mp = currentMp() === 'ozon' && window.WBOPSFbsOzon ? 'ozon' : 'wb';
+    section.dataset.mp = mp;
+    return mp === 'ozon' ? window.WBOPSFbsOzon.render(section) : render(section);
+  }
+  const mpSelect = cur => `<select data-fbs-mp aria-label="Маркетплейс">${MPS.map(([k, t]) => `<option value="${k}" ${k === cur ? 'selected' : ''}>${t}</option>`).join('')}</select>`;
+  function bindMp(section) {
+    const el = section.querySelector('[data-fbs-mp]');
+    if (!el) return;
+    el.onchange = () => {
+      try { localStorage.setItem('wbops.fbs.mp', el.value); } catch (e) { /* без хранилища */ }
+      const u = new URL(location.href);
+      if (u.searchParams.has('mp')) { u.searchParams.set('mp', el.value); history.replaceState(history.state, '', u); }
+      mount(section);
+    };
+  }
+
   async function render(section) {
     root = section;
+    root.dataset.mp = 'wb';
     root.className = 'panel rv-page fb-page';
-    root.innerHTML = `<div class="db-head"><h2>Аналитика FBS</h2><span class="muted db-fresh" data-fresh></span></div>
+    root.innerHTML = `<div class="db-head"><h2>Аналитика FBS · Wildberries</h2><span class="muted db-fresh" data-fresh></span></div>
       <div class="db-filters" data-filters></div><div data-notes></div>
       <div class="rnp-tabs fb-tabs" role="tablist">${[['summary', 'Сводка'], ['feed', 'Лента заказов'], ['warehouses', 'Склады'], ['articles', 'Артикулы'], ['calc', 'Штраф за отгрузку'], ['lost', 'Упущенная выгода']]
         .map(([k, t]) => `<button type="button" role="tab" data-tab="${k}">${t}</button>`).join('')}</div>
@@ -56,15 +81,18 @@ window.WBOPSFbs = (() => {
   async function load() {
     const [from, to] = period(), days = (parse(to) - parse(from)) / 864e5 + 1;
     const q = query({prev_from: iso(addDays(parse(from), -days)), prev_to: iso(addDays(parse(from), -1))});
-    try { st.data = await api('/api/fbs-analytics?' + q); }
-    catch (e) { root.querySelector('[data-body]').innerHTML = `<p class="rv-error">${esc(e.message)}</p>`; return; }
+    let data;
+    try { data = await api('/api/fbs-analytics?' + q); }
+    catch (e) { if (root.dataset.mp === 'wb') root.querySelector('[data-body]').innerHTML = `<p class="rv-error">${esc(e.message)}</p>`; return; }
+    if (root.dataset.mp !== 'wb') return;                    // пока грузилось, переключили на Ozon
+    st.data = data;
     st.feed = null;
     drawFilters(); drawNotes(); drawBody();
     clearTimeout(st.poll);
     if (st.data.state?.status === 'running') st.poll = setTimeout(waitSync, 5000);
   }
   async function waitSync() {
-    if (!root?.isConnected) return;
+    if (!root?.isConnected || root.dataset.mp !== 'wb') return;
     const s = await api('/api/fbs-analytics/status').catch(() => ({}));
     if (s.status === 'running') { const n = root.querySelector('[data-sync-msg]'); if (n) n.textContent = s.message || 'Загружаю…'; st.poll = setTimeout(waitSync, 5000); return; }
     load();
@@ -74,7 +102,7 @@ window.WBOPSFbs = (() => {
     const o = st.data.options, f = st.f, [from, to] = period();
     const opt = (v, t, cur) => `<option value="${esc(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(t)}</option>`;
     const whs = o.warehouses.filter(w => !f.cabinet || w.cabinet_id === f.cabinet);
-    root.querySelector('[data-filters]').innerHTML = `
+    root.querySelector('[data-filters]').innerHTML = `${mpSelect('wb')}
       <select data-f="preset" aria-label="Период" class="db-period">${presets().map(([k, t]) => opt(k, t, f.preset)).join('')}</select>
       ${f.preset === 'custom' ? `<label class="db-date">с <input type="date" data-f="from" value="${from}"></label><label class="db-date">по <input type="date" data-f="to" value="${to}"></label>` : ''}
       ${o.cabinets.length > 1 ? `<select data-f="cabinet" aria-label="Кабинет">${opt('', 'Все кабинеты', f.cabinet)}${o.cabinets.map(c => opt(c.id, c.name, f.cabinet)).join('')}</select>` : ''}
@@ -83,6 +111,7 @@ window.WBOPSFbs = (() => {
       <select data-f="category" aria-label="Категория">${opt('', 'Все категории', f.category)}${o.categories.map(b => opt(b, b, f.category)).join('')}</select>
       <input type="search" data-f="q" placeholder="Артикул, задание, поставка" value="${esc(f.q)}" aria-label="Поиск">
       <span class="rp-tools"><button type="button" class="db-ghost" data-sync ${st.data.state?.status === 'running' ? 'disabled' : ''}>↻ ${st.data.state?.status === 'running' ? 'Загружаю…' : 'Обновить из WB'}</button></span>`;
+    bindMp(root);
     let t;
     root.querySelectorAll('[data-f]').forEach(el => {
       const h = () => {
@@ -412,5 +441,5 @@ window.WBOPSFbs = (() => {
 @media(max-width:900px){.fb-two{grid-template-columns:1fr}.fb-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.fb-calc{grid-template-columns:1fr}}`;
   document.head.appendChild(style);
 
-  return {render};
+  return {render, mount, mpSelect, bindMp};
 })();

@@ -56,6 +56,7 @@ from app.services.transfer.common import TransferError
 from app.services.repricer import Repricer, RepricerError
 from app.services.stocks import Stocks, StocksError
 from app.services.fbs_analytics import FbsAnalytics
+from app.services.fbs_ozon import FbsOzon
 from app.services.penalties import Penalties
 from app.services.ads import AdsAnalytics
 from app.services.planfact import PlanFact, PlanFactError
@@ -401,7 +402,7 @@ async def inject_knowledge_workspace(request: Request, call_next):
     body = b"".join([chunk async for chunk in response.body_iterator])
     html = body.decode("utf-8")
     if request.url.path in DASHBOARD_PATHS:
-        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "home.js", "abc.js", "router.js", "knowledge.js"))
+        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "fbs_ozon.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "home.js", "abc.js", "router.js", "knowledge.js"))
         html = html.replace("</body>", scripts + "</body>")
     return Response(content=html, status_code=response.status_code, headers={"content-type": "text/html; charset=utf-8"})
 
@@ -3038,10 +3039,11 @@ async def stocks_check() -> dict[str, object]:
 
 # ---------------------------------------------------------------- аналитика FBS
 fbs = FbsAnalytics(draft_store, configured_cabinets, _stocks_catalog)
+fbs_ozon = FbsOzon(draft_store, configured_cabinets, _stocks_catalog)
 
 
 async def fbs_loop() -> None:
-    """Раз в 30 минут подтягивать сборочные задания, статусы, поставки и выкупы."""
+    """Раз в 30 минут подтягивать сборочные задания WB (статусы, поставки, выкупы) и отправления FBS Ozon."""
     await asyncio.sleep(90)
     while True:
         try:
@@ -3049,6 +3051,11 @@ async def fbs_loop() -> None:
                 await asyncio.to_thread(fbs.sync)
         except Exception as exc:
             draft_store.audit("fbs_sync_error", details=str(exc)[:300])
+        try:
+            if fbs_ozon.ozon_cabinets():
+                await asyncio.to_thread(fbs_ozon.sync)
+        except Exception as exc:
+            draft_store.audit("fbs_ozon_sync_error", details=str(exc)[:300])
         await asyncio.sleep(30 * 60)
 
 
@@ -3109,6 +3116,55 @@ def fbs_sync() -> dict[str, object]:
 @app.get("/api/fbs-analytics/status")
 def fbs_status() -> dict[str, object]:
     return {**fbs.state, "synced_at": draft_store.get_setting("fbs_analytics_synced_at", "")}
+
+
+@app.get("/api/fbs-analytics/ozon")
+async def fbs_ozon_report(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", warehouse: str = "",
+                          q: str = "", brand: str = "", category: str = "", prev_from: str = "", prev_to: str = "") -> dict[str, object]:
+    a, b, f = _fbs_args(date_from, date_to, cabinet, warehouse, q, brand, category)
+    prev = (prev_from, prev_to) if prev_from and prev_to else None
+    if not draft_store.get_setting("fbs_ozon_synced_at", "") and fbs_ozon.state["status"] != "running" and fbs_ozon.ozon_cabinets():
+        threading.Thread(target=fbs_ozon.sync, daemon=True).start()
+    return await asyncio.to_thread(fbs_ozon.report, a, b, f, prev)
+
+
+@app.get("/api/fbs-analytics/ozon/orders")
+async def fbs_ozon_feed(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", warehouse: str = "",
+                        q: str = "", brand: str = "", category: str = "", status: str = "", sort: str = "created_at", desc: bool = True,
+                        limit: int = 100, offset: int = 0) -> dict[str, object]:
+    a, b, f = _fbs_args(date_from, date_to, cabinet, warehouse, q, brand, category)
+    return await asyncio.to_thread(fbs_ozon.feed, a, b, f, status, sort, desc, max(1, min(limit, 500)), max(0, offset))
+
+
+@app.get("/api/fbs-analytics/ozon/orders.csv")
+async def fbs_ozon_feed_csv(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", warehouse: str = "",
+                            q: str = "", brand: str = "", category: str = "", status: str = ""):
+    from app.services.fbs_ozon import STATUS_TITLES
+    a, b, f = _fbs_args(date_from, date_to, cabinet, warehouse, q, brand, category)
+    data = await asyncio.to_thread(fbs_ozon.feed, a, b, f, status, "created_at", True, 100000, 0)
+    table = [["Дата заказа", "Отправление", "Кабинет", "Склад", "Артикул", "SKU", "Бренд", "Шт", "Сумма, ₽", "Статус", "Статус Ozon", "Причина отмены",
+              "Срок отгрузки", "Передано в доставку", "Часов до передачи", "Опоздание, ч", "Просрочено", "Скорость отгрузки, %", "Скидка/наценка, ₽", "Штрафы, ₽"]]
+    for r in data["items"]:
+        table.append([r["created_at"], r["posting"], r["cabinet"], r["warehouse"], r["article"], r["sku"], r["brand"], r["qty"], r["price"],
+                      STATUS_TITLES.get(r["status"], r["status"]), r["ozon_status"], r["cancel_reason"], r["shipment_date"] or "", r["shipped_at"] or "",
+                      r["hours_to_ship"] if r["hours_to_ship"] is not None else "", r["late_hours"] if r["late_hours"] is not None else "",
+                      "да" if r["overdue"] else "", r["effect_pct"] if r["effect_pct"] is not None else "",
+                      r["effect_rub"] if r["effect_rub"] is not None else "", r["fine_rub"] or ""])
+    return _table_download({"FBS Ozon": table}, "csv", f"fbs_ozon_{a}_{b}")
+
+
+@app.post("/api/fbs-analytics/ozon/sync")
+def fbs_ozon_sync() -> dict[str, object]:
+    if not fbs_ozon.ozon_cabinets():
+        raise HTTPException(400, "Нет кабинета Ozon с Client ID и API-ключом")
+    if fbs_ozon.state["status"] != "running":
+        threading.Thread(target=fbs_ozon.sync, daemon=True).start()
+    return {"status": "running"}
+
+
+@app.get("/api/fbs-analytics/ozon/status")
+def fbs_ozon_status() -> dict[str, object]:
+    return {**fbs_ozon.state, "synced_at": draft_store.get_setting("fbs_ozon_synced_at", "")}
 
 
 # ---------------------------------------------------------------- аналитика штрафов

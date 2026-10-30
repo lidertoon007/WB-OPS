@@ -13,7 +13,7 @@
     dashboard:       {path: '/dashboard',       title: 'Дашборд WB', sub: 'Оцифровка: ключевые показатели Wildberries за период', show: ['dashboardPage']},
     'dashboard-ozon': {path: '/dashboard-ozon', title: 'Дашборд Ozon', sub: 'Оцифровка: ключевые показатели Ozon за период', show: ['ozonDashboardPage']},
     transfer:        {path: '/transfer',        title: 'Перенос карточек', sub: 'Перенос товаров между кабинетами Wildberries, Ozon и Яндекс Маркета по артикулу', show: ['transferPage']},
-    'fbs-analytics': {path: '/fbs-analytics',   title: 'Аналитика FBS', sub: 'Статусы сборочных заданий, скорость отгрузки, склады, % выкупа и скидки/штрафы WB за сроки', show: ['fbsPage']},
+    'fbs-analytics': {path: '/fbs-analytics',   title: 'Аналитика FBS', sub: 'Wildberries и Ozon: статусы заказов FBS, скорость отгрузки, сроки, склады, % выкупа и скидки/штрафы за сроки', show: ['fbsPage']},
     ab:              {path: '/ab',              title: 'A/B-тесты', sub: 'Какое главное фото даёт больше кликов и корзин: варианты по очереди на живой карточке', show: ['abPage']},
     abc:             {path: '/abc',             title: 'ABC-анализ', sub: 'Сегментация ассортимента по выручке, оборачиваемости и прибыли и контроль неликвида', show: ['abcPage']},
     planfact:        {path: '/planfact',        title: 'План-факт', sub: 'Планы на месяц по бизнесу и артикулам, отклонения и прогноз на конец месяца', show: ['planfactPage']},
@@ -205,7 +205,7 @@
   };
   const fbsPage = () => {
     const s = section('fbsPage', '');
-    if (window.WBOPSFbs) window.WBOPSFbs.render(s);
+    if (window.WBOPSFbs) window.WBOPSFbs.mount(s);
     else s.innerHTML = '<p class="muted">Не загрузился модуль fbs.js.</p>';
   };
   const penaltiesPage = () => {
