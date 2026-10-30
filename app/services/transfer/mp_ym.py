@@ -96,7 +96,12 @@ class YM:
         if self._all is None:
             self._all, token = [], ""
             for _ in range(500):
-                params = {"limit": 200, **({"page_token": token} if token else {})}
+                # Yandex Market uses camelCase for the cursor parameter.  The
+                # snake_case spelling is silently ignored by the API, which
+                # makes every request return the first page and can eventually
+                # lead to duplicate data or an apparent endless import.
+                # The endpoint accepts at most 100 items per page.
+                params = {"limit": 100, **({"pageToken": token} if token else {})}
                 r = self.http.post(f"{API}/v2/businesses/{self.business}/offer-mappings", {}, params=params)["result"]
                 self._all += [m["offer"]["offerId"] for m in r.get("offerMappings") or []]
                 token = (r.get("paging") or {}).get("nextPageToken") or ""

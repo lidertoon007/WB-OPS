@@ -394,6 +394,26 @@ def load_account(acc, client, d_from, d_to, cache_dir, args):
         except RuntimeError as e:
             if "HTTP 401" in str(e) or "HTTP 403" in str(e):
                 raise
+            # Report generation is asynchronous and Market can occasionally
+            # return FAILED with an empty subStatus.  If this month was
+            # downloaded earlier, keep the last good report instead of
+            # dropping the whole month from the P&L.
+            fallback = f if 'f' in locals() and f.exists() else None
+            if fallback and fallback.stat().st_size > 2:
+                try:
+                    cached_data = json.loads(fallback.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    cached_data = None
+                if cached_data:
+                    print(f"    ошибка API: {e}; беру сохранённый отчёт {fallback.name}")
+                    data = cached_data
+                    if kind == "services":
+                        services.append(data)
+                    elif kind == "payments":
+                        payments.append((start, end, [r for rows in data.values() for r in rows]))
+                    else:
+                        realization.append((shop, key, data))
+                    continue
             print(f"    ОШИБКА, отчёт пропущен (запустите скрипт ещё раз, скачается только недостающее): {e}")
             continue
         if data is None:

@@ -253,12 +253,23 @@ def fetch_products(account):
         if not items or not last_id:
             break
     mapping = {}
+    # В ответе product/list Ozon иногда уже возвращает offer_id и sku.
+    # Не отбрасываем их: product/info/list может вернуть неполный набор
+    # товаров, из-за чего в отчёте ошибочно показывался технический «SKU …».
+    for product in products:
+        offer = product.get("offer_id")
+        sku = product.get("sku")
+        if offer and sku:
+            try:
+                mapping[int(sku)] = str(offer)
+            except (TypeError, ValueError):
+                pass
     ids = [pr.get("product_id") or pr.get("id") for pr in products if pr.get("product_id") or pr.get("id")]
     for i in range(0, len(ids), 1000):
         res = api_post(account, "/v3/product/info/list", {"product_id": ids[i:i + 1000]})
         res = res.get("result", res) if isinstance(res, dict) else {}
         for item in (res.get("items") if isinstance(res, dict) else None) or []:
-            offer = item.get("offer_id")
+            offer = item.get("offer_id") or item.get("offerId")
             if not offer:
                 continue
             for sku in [item.get("sku")] + [src.get("sku") for src in item.get("sources") or []]:
