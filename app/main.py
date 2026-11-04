@@ -3190,7 +3190,7 @@ async def penalties_loop() -> None:
         await asyncio.sleep(10 * 60)
 
 
-def _pen_args(date_from: str, date_to: str, cabinet: str, q: str, brand: str, category: str, group: str, reason: str):
+def _pen_args(date_from: str, date_to: str, cabinet: str, q: str, brand: str, category: str, group: str, reason: str, warehouse: str = ""):
     from datetime import date as _date
     try:
         a, b = _date.fromisoformat(date_from), _date.fromisoformat(date_to)
@@ -3198,13 +3198,13 @@ def _pen_args(date_from: str, date_to: str, cabinet: str, q: str, brand: str, ca
         raise HTTPException(400, "Даты в формате ГГГГ-ММ-ДД")
     if b < a or (b - a).days > 400:
         raise HTTPException(400, "Период — от 1 до 400 дней")
-    return a.isoformat(), b.isoformat(), {"cabinet": cabinet, "q": q, "brand": brand, "category": category, "group": group, "reason": reason}
+    return a.isoformat(), b.isoformat(), {"cabinet": cabinet, "q": q, "brand": brand, "category": category, "group": group, "reason": reason, "warehouse": warehouse}
 
 
 @app.get("/api/penalties")
 async def penalties_report(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", q: str = "",
-                           brand: str = "", category: str = "", group: str = "", reason: str = "", prev_from: str = "", prev_to: str = "") -> dict[str, object]:
-    a, b, f = _pen_args(date_from, date_to, cabinet, q, brand, category, group, reason)
+                           brand: str = "", category: str = "", group: str = "", reason: str = "", warehouse: str = "", prev_from: str = "", prev_to: str = "") -> dict[str, object]:
+    a, b, f = _pen_args(date_from, date_to, cabinet, q, brand, category, group, reason, warehouse)
     if penalties.state["status"] != "running" and penalties.stale() and penalties._sources():
         await asyncio.to_thread(penalties.sync)
     data = await asyncio.to_thread(penalties.report, a, b, f, (prev_from, prev_to) if prev_from and prev_to else None)
@@ -3214,16 +3214,16 @@ async def penalties_report(date_from: str = Query(..., alias="from"), date_to: s
 
 @app.get("/api/penalties/items")
 async def penalties_feed(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", q: str = "",
-                         brand: str = "", category: str = "", group: str = "", reason: str = "", sort: str = "day", desc: bool = True,
+                         brand: str = "", category: str = "", group: str = "", reason: str = "", warehouse: str = "", sort: str = "day", desc: bool = True,
                          limit: int = 100, offset: int = 0) -> dict[str, object]:
-    a, b, f = _pen_args(date_from, date_to, cabinet, q, brand, category, group, reason)
+    a, b, f = _pen_args(date_from, date_to, cabinet, q, brand, category, group, reason, warehouse)
     return await asyncio.to_thread(penalties.feed, a, b, f, sort, desc, max(1, min(limit, 500)), max(0, offset))
 
 
 @app.get("/api/penalties/items.csv")
 async def penalties_csv(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", q: str = "",
-                        brand: str = "", category: str = "", group: str = "", reason: str = ""):
-    a, b, f = _pen_args(date_from, date_to, cabinet, q, brand, category, group, reason)
+                        brand: str = "", category: str = "", group: str = "", reason: str = "", warehouse: str = ""):
+    a, b, f = _pen_args(date_from, date_to, cabinet, q, brand, category, group, reason, warehouse)
     data = await asyncio.to_thread(penalties.feed, a, b, f, "day", True, 100000, 0)
     table = [["Дата", "Кабинет", "Причина", "Группа", "Сумма, ₽", "Артикул", "WB ID", "Бренд", "Предмет", "srid", "Отчёт WB",
               "Задание FBS", "Склад", "Заказ создан", "Статус WB"]]

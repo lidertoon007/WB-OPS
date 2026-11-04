@@ -254,12 +254,15 @@ class Penalties:
             sales = c.execute("SELECT account, day, nm_id, article, brand, subject, revenue, qty FROM pen_sales WHERE day>=? AND day<=?",
                               (start, end)).fetchall()
         out = []
+        links = self._fbs_links({r[11] for r in rows if r[11]}) if f.get("warehouse") else {}
         for acc, rid, day, kind, reason, grp, amount, nm, art, brand, subject, srid, rep in rows:
             if f.get("cabinet") and acc != f["cabinet"]:
                 continue
             if f.get("brand") and brand != f["brand"]:
                 continue
             if f.get("category") and subject != f["category"]:
+                continue
+            if f.get("warehouse") and (links.get(srid) or {}).get("warehouse") != f["warehouse"]:
                 continue
             if f.get("group") and kind == "penalty" and grp != f["group"]:
                 continue
@@ -414,6 +417,7 @@ class Penalties:
             brands = [x[0] for x in c.execute("SELECT DISTINCT brand FROM pen_sales WHERE brand<>'' UNION SELECT DISTINCT brand FROM pen_rows WHERE brand<>'' ORDER BY 1")]
             subjects = [x[0] for x in c.execute("SELECT DISTINCT subject FROM pen_sales WHERE subject<>'' UNION SELECT DISTINCT subject FROM pen_rows WHERE subject<>'' ORDER BY 1")]
             all_reasons = [x[0] for x in c.execute("SELECT DISTINCT reason FROM pen_rows WHERE kind='penalty' ORDER BY 1")]
+            warehouses = [x[0] for x in c.execute("SELECT DISTINCT name FROM fbs_warehouses WHERE name<>'' ORDER BY name")]
         reconcile = None
         if not any(f.get(k) for k in ("brand", "category", "q", "group", "reason")):
             reps = [r for r in reps if not f.get("cabinet") or r[0] == f["cabinet"]]
@@ -424,7 +428,7 @@ class Penalties:
                 "previous": self._summary(prev_rows, prev_sales) if prev else None, "prev_period": list(prev) if prev else None,
                 "timeline": timeline, "reasons": reason_rows, "articles": articles, "deductions": deductions, "reconcile": reconcile,
                 "groups": [{"key": k, "title": t, "color": c} for k, t, c in GROUPS],
-                "options": {"cabinets": accounts, "brands": brands, "categories": subjects, "reasons": all_reasons},
+                "options": {"cabinets": accounts, "warehouses": warehouses, "brands": brands, "categories": subjects, "reasons": all_reasons},
                 "last_day": last_day, "last_sale": last_sale, "state": dict(self.state), "stale": self.stale(),
                 "synced_at": self.store.get_setting("penalties_synced_at", "")}
 

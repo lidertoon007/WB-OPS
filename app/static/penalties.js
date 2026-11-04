@@ -7,7 +7,7 @@ window.WBOPSPenalties = (() => {
   const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
   const ru = s => s ? s.slice(0, 10).split('-').reverse().join('.') : '';
   const dt = s => s ? new Date(s).toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'}) : '—';
-  const st = {tab: 'summary', f: {preset: 'days:90', from: '', to: '', cabinet: '', brand: '', category: '', group: '', reason: '', q: ''},
+  const st = {tab: 'summary', f: {preset: 'days:90', from: '', to: '', cabinet: '', warehouse: '', brand: '', category: '', group: '', reason: '', q: ''},
     data: null, fs: {sort: 'day', desc: true, offset: 0}, as: {sort: 'sum', desc: true, q: ''}, poll: null};
   let root = null;
   try { Object.assign(st.f, JSON.parse(localStorage.getItem('wbops.pen.f') || '{}'), {reason: ''}); } catch (e) { /* без хранилища */ }
@@ -32,7 +32,7 @@ window.WBOPSPenalties = (() => {
   }
   function query(extra = {}) {
     const [from, to] = period(), q = new URLSearchParams({from, to});
-    ['cabinet', 'brand', 'category', 'group', 'reason', 'q'].forEach(k => st.f[k] && q.set(k, st.f[k]));
+    ['cabinet', 'warehouse', 'brand', 'category', 'group', 'reason', 'q'].forEach(k => st.f[k] && q.set(k, st.f[k]));
     Object.entries(extra).forEach(([k, v]) => v !== '' && v != null && q.set(k, v));
     return q;
   }
@@ -72,6 +72,7 @@ window.WBOPSPenalties = (() => {
       <select data-f="preset" aria-label="Период" class="db-period">${presets().map(([k, t]) => opt(k, t, f.preset)).join('')}</select>
       ${f.preset === 'custom' ? `<label class="db-date">с <input type="date" data-f="from" value="${from}"></label><label class="db-date">по <input type="date" data-f="to" value="${to}"></label>` : ''}
       ${o.cabinets.length > 1 ? `<select data-f="cabinet" aria-label="Кабинет">${opt('', 'Все кабинеты', f.cabinet)}${o.cabinets.map(c => opt(c, c, f.cabinet)).join('')}</select>` : ''}
+      ${o.warehouses?.length ? `<select data-f="warehouse" aria-label="Склад">${opt('', 'Все склады', f.warehouse)}${o.warehouses.map(w => opt(w, w, f.warehouse)).join('')}</select>` : ''}
       <select data-f="group" aria-label="Тип штрафа">${opt('', 'Все типы штрафов', f.group)}${st.data.groups.map(g => opt(g.key, g.title, f.group)).join('')}</select>
       <select data-f="brand" aria-label="Бренд">${opt('', 'Все бренды', f.brand)}${o.brands.map(b => opt(b, b, f.brand)).join('')}</select>
       <select data-f="category" aria-label="Предмет">${opt('', 'Все предметы', f.category)}${o.categories.map(b => opt(b, b, f.category)).join('')}</select>

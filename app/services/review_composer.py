@@ -100,6 +100,15 @@ ASPECTS = {
     "price_bad": r"не за эту цену|цена (?:явно )?завышен|дорого|красная цена|переплат",
     "delivery_issue": r"\bпвз\b|пункт выдачи|на почт|почтой|не дали пример|примерять не|курьер|долго (?:шл|вез|достав)|не привез|потерял",
     "smell": r"запах|воня",
+    # прислали не тот цвет (ошибка сборки, а не «оттенок на экране»)
+    "wrong_color_sent": r"вместо [а-я]+\s+(?:цвет\w*\s+)?(?:прислали|пришл\w*|привезли|положили|отправили|выдали)|(?:прислали|пришл\w*|привезли|положили|отправили|выдали) (?:не (?:тот|те|того|такой|такие|того) цвет|другого цвета|друг\w+ цвет)|перепутали цвет|цвет перепутал",
+    # общая похвала модели: «джинсы хорошие, но…»
+    "liked": r"(?:джинсы|брюки|джоггеры|модель|сами|вещь|штаны|товар)\s+(?:очень\s+|в целом\s+|вроде\s+)?(?:хорош|отличн|классн|супер|красив|понрав|норм)|понравил|(?:хорошие|отличные|классные|красивые),? но",
+    # быстро износились, «решето», протёрлись после пары носок
+    "wear_out": r"решет|превратил\w* в (?:тряпк|решет|лохмот)|протерл|протер(?:лись|ся|ась)|износил|располз|разлез|катышк|скатал|облез|лопнул|порвал[аи]?с|порвались|(?:через|после) (?:\d+|пары|двух|тр[её]х|нескольких|перв\w*) (?:раз|носк|надеван|стир)\w*[^.!?]{0,40}(?:дыр|порв|протер|рвал|облез|располз)",
+    "quality_bad": r"что за качество|(?:ужасн|отвратит|плох|низк|никак|отврат)\w* качеств|качеств\w* (?:ужасн|отвратит|плох|низк|никак|оставля|отврат)|не стоит (?:своих )?денег|за такие (?:немалые |большие )?деньги",
+    "refund": r"верните (?:мне |нам )?(?:мои |наши )?деньги|вернуть деньги|возврат (?:денег|средств)|заберите",
+    "angry": r"(?<!не )ужасн(?!о (?:понрав|рад|довол|удобн|красив))|кошмар|отврат|разочаров|обман|позор|не (?:покупайте|советую|рекомендую)|деньги на ветер",
 }
 
 
@@ -112,11 +121,13 @@ class ReviewFacts:
     product: str                    # «джинсы», «джоггеры», «брюки»
     warm_model: bool
     aspects: set[str] = field(default_factory=set)
+    height: int | None = None       # рост покупателя, если указан («на 188 рост»)
 
     @property
     def negative(self) -> bool:
         return bool(self.aspects & {"defect", "not_as_described", "thin", "color_diff", "price_bad", "smell",
-                                    "size_small", "size_big", "length_short", "delivery_issue"}) \
+                                    "size_small", "size_big", "length_short", "delivery_issue",
+                                    "wear_out", "quality_bad", "refund", "angry"}) \
             or (self.rating is not None and self.rating <= 3)
 
 
@@ -143,10 +154,19 @@ def analyze(item: InboxItem) -> ReviewFacts:
         aspects.discard("length_short")
     if "size_wrong" in aspects or "size_small" in aspects or "size_big" in aspects:
         aspects.discard("fit_good")
-    if aspects & {"defect", "not_as_described"}:
-        aspects -= {"quality_good", "recommend"}
+    if "wear_out" in aspects and re.search(r"(?:без|нет|не (?:появ|образ)\w*|ни одного) катышк|катышк\w* (?:нет|не)", text) \
+            and not re.search(r"решет|протер|износил|располз|разлез|облез|лопнул|порвал", text):
+        aspects.discard("wear_out")
+    if "wear_out" in aspects:                      # «протёрлись после пары носок» — про износ, а не про брак при получении
+        aspects.discard("defect")
+    if aspects & {"defect", "not_as_described", "wear_out", "quality_bad"}:
+        aspects -= {"quality_good", "recommend", "looks_good", "color_good", "fit_good", "price_good"}
     if "light" in aspects and "thin" in aspects and re.search(r"на лето|летн", text) and not re.search(r"слишком тонк|как лосины|очень тонк|для осени", text):
         aspects.discard("thin")
+    if "wrong_color_sent" in aspects:              # прислали не тот цвет — не оправдываемся освещением
+        aspects.discard("color_diff")
+    hm = re.search(r"(?:рост\w*\s*(?:в\s*)?|на\s+)(1[4-9]\d|20\d)\b|\b(1[4-9]\d|20\d)\s*(?:см\s*)?(?:рост|см\b)", text)
+    height = int(hm.group(1) or hm.group(2)) if hm and re.search(r"рост", text) else None
     status = {OrderStatus.BUYOUT: "buyout", OrderStatus.REJECTED: "rejected", OrderStatus.RETURNED: "returned"}.get(item.order_status, "unknown")
     if re.search(r"\b(вернул[аи]?|вернули|возврат|сдал[аи]? обратно)\b", text):
         status = "returned" if status in ("buyout", "unknown", "returned") else status
@@ -154,7 +174,7 @@ def analyze(item: InboxItem) -> ReviewFacts:
         status = "rejected"
     warm = bool(re.search(r"утепл|флис", (item.product_name or "").lower()))
     return ReviewFacts(name=first_name(item.author_name), status=status, rating=item.rating, text=text,
-                       product=product_word(item.product_name), warm_model=warm, aspects=aspects)
+                       product=product_word(item.product_name), warm_model=warm, aspects=aspects, height=height)
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +250,24 @@ DEFAULT_PHRASES: dict[str, list[str]] = {
     "length_long_bad": ["Жаль, что модель оказалась длинновата.", "Нам жаль, что по длине модель не подошла."],
     "negative_general": ["Нам жаль, что покупка не оправдала ожиданий. Будем благодарны, если напишете в чат продавца, что именно не понравилось, — это поможет нам стать лучше.",
                          "Спасибо за честную оценку. Если расскажете подробнее, что не понравилось, мы обязательно учтём это."],
+    "wear_out": ["Нам очень жаль, что так получилось. Мы шьём {product} из плотного качественного денима, каждая партия проходит контроль, и при обычной носке изделие служит долго. Быстрый износ ткани, как правило, связан с условиями носки и ухода: сильным трением (ремень сумки, сиденье, обувь), стиркой в горячей воде, отбеливателями или сушкой на батарее.",
+                 "Нам жаль, что {product} так быстро потеряли вид. Ткань, из которой мы шьём, плотная и проходит контроль качества, поэтому при соблюдении норм носки и ухода такого быть не должно. Чаще всего деним повреждается из-за сильного трения, агрессивных моющих средств или стирки при высокой температуре."],
+    "care_rules": ["Чтобы деним дольше сохранял вид, стирайте {product} при 30 °C, вывернув наизнанку, без отбеливателей и сушите в расправленном виде вдали от батареи. Правила ухода указаны на ярлыке изделия.",
+                   "Рекомендуем стирать {product} при температуре не выше 30 °C, наизнанку, без отбеливателей, и не сушить на батарее — правила ухода есть на ярлыке изделия."],
+    "quality_bad": ["Мы внимательно следим за качеством: ткань и пошив каждой партии проверяются перед отправкой. Нам жаль, что у вас сложилось другое впечатление."],
+    "refund": ["Если, на ваш взгляд, это производственный дефект, пришлите, пожалуйста, фото в чат продавца — передадим их технологу, разберёмся и подскажем, как поступить.",
+               "Если вы считаете, что это брак, пришлите фото повреждений в чат продавца — мы внимательно разберёмся в ситуации."],
+    "photo_request": ["Будем благодарны, если пришлёте фото повреждений в чат продавца — передадим их технологу и разберёмся в ситуации.",
+                      "Пришлите, пожалуйста, фото в чат продавца — мы разберёмся в ситуации."],
+    "negative_strong": ["Нам жаль, что покупка вас расстроила. Напишите, пожалуйста, в чат продавца, что произошло, — мы разберёмся и поможем."],
+    "wrong_color_sent": ["Все заказы мы собираем под видеокамерами и перед отправкой сверяем артикул и цвет, поэтому с нашей стороны такая ошибка исключена. Скорее всего, путаница произошла на этапе доставки или выдачи заказа.",
+                         "Сборка каждого заказа у нас идёт под видеонаблюдением со сверкой артикула и цвета, поэтому при упаковке товар перепутать не могли. Вероятно, заказ перепутали уже на этапе доставки или в пункте выдачи."],
+    "liked": ["Рады, что {product} вам понравились.", "Приятно, что модель пришлась вам по душе."],
+    "length_short_height": ["Жаль, что при росте {height} см длины не хватило. Перед заказом сверьте длину по внутреннему шву в таблице замеров в карточке — а если напишете свой рост в чат продавца, подскажем модель с подходящей длиной.",
+                            "Нам жаль, что для роста {height} см модель оказалась коротковата. Длина по внутреннему шву указана в таблице замеров в карточке, а в чате продавца подскажем, какая модель подойдёт по длине."],
+    "length_advice": ["Подобрать длину поможет таблица замеров в карточке: сравните длину по внутреннему шву с джинсами, которые хорошо на вас сидят.",
+                      "Длина по внутреннему шву указана в таблице замеров в карточке — а в чате продавца подскажем модель с подходящей длиной."],
+    "closing_problem": ["Приносим извинения за неудобства.", "Нам важно, чтобы вы остались довольны покупкой."],
     "empty_low": ["Спасибо за оценку. Если расскажете, что не понравилось, — мы обязательно учтём ваше мнение.",
                   "Будем благодарны, если поделитесь, что можно улучшить, — напишите нам в чат продавца."],
 }
@@ -247,14 +285,18 @@ PHRASE_TITLES = {
     "size_advice": "Совет по размеру", "reorder": "Перезаказали другой размер", "rejected_quality": "Отказ, но хвалят качество", "rejected_positive": "Отказ, но модель понравилась", "thin": "Тонкие", "color_diff": "Не тот цвет",
     "defect": "Брак", "not_as_described": "Не соответствует описанию, подмена", "price_bad": "Дорого",
     "delivery_issue": "Доставка, ПВЗ", "smell": "Запах", "negative_general": "Негатив без деталей", "empty_low": "Отзыв без текста, 1–3★",
+    "wear_out": "Быстро износились, «решето», протёрлись", "care_rules": "Правила ухода и стирки", "quality_bad": "Ругают качество",
+    "refund": "Требуют вернуть деньги", "photo_request": "Просьба прислать фото", "negative_strong": "Резкий негатив без деталей",
+    "closing_problem": "Прощание при жалобе", "wrong_color_sent": "Прислали не тот цвет (сборка под камерами)", "liked": "Модель понравилась",
+    "length_short_height": "Коротки, указан рост", "length_advice": "Совет по длине",
 }
 
-POSITIVE_ORDER = ["repeat", "fit_good", "length_ok", "quality_good", "stretch", "warm", "light", "color_good", "looks_good",
+POSITIVE_ORDER = ["repeat", "liked", "fit_good", "length_ok", "quality_good", "stretch", "warm", "light", "color_good", "looks_good",
                   "wash_ok", "price_good", "delivery_fast", "length_long", "long_wait_wear"]
 FOR_WHOM = ["for_husband", "for_son", "for_teen", "for_grandson", "for_father"]
 SIZE_KEYS = ("size_small", "size_big", "length_short", "size_wrong")
 TIP_KEYS = ("size_small", "size_big", "length_short")   # «маломерят, берите на размер больше» при выкупе и 4–5★
-NEGATIVE_ORDER = ["defect", "not_as_described", "delivery_issue", "size_small", "size_big", "length_short", "size_wrong",
+NEGATIVE_ORDER = ["wear_out", "defect", "not_as_described", "wrong_color_sent", "quality_bad", "delivery_issue", "size_small", "size_big", "length_short", "size_wrong",
                   "thin", "color_diff", "price_bad", "smell"]
 
 
@@ -324,7 +366,7 @@ class ReviewComposer:
     def _pick(self, bank, item_id, key, facts) -> str:
         variants = bank.get(key) or DEFAULT_PHRASES.get(key) or [""]
         text = variants[self._seed(item_id, key) % len(variants)]
-        return text.replace("{product}", facts.product).replace("{name}", facts.name)
+        return text.replace("{product}", facts.product).replace("{name}", facts.name).replace("{height}", str(facts.height or ""))
 
     def compose(self, item: InboxItem) -> tuple[str, ReviewFacts]:
         facts = analyze(item)
@@ -348,8 +390,9 @@ class ReviewComposer:
         cons = re.search(r"недостатки:\s*(.+)", facts.text)
         has_cons = bool(cons and cons.group(1).strip(" .!,-"))
         tip_only = received and not has_cons and (facts.rating or 0) >= 4 and problems and "size_wrong" not in a \
-            and all(k in TIP_KEYS for k in problems)
-        if (problems and not tip_only) or (facts.rating is not None and facts.rating <= 3):
+            and all(k in TIP_KEYS for k in problems) \
+            and bool(re.search(r"бер(?:ите|и)\b|советую|рекомендую (?:брать|взять)|на размер (?:больше|меньше)|на (?:пол)?размера? (?:больше|меньше)|размер в размер|учитывайте", facts.text))
+        if (problems and not tip_only) or (facts.rating is not None and facts.rating <= 3) or a & {"angry", "refund"}:
             parts.append(pick("thanks_neutral"))
         elif len(facts.text) > 140:
             parts.append(pick("thanks_long"))
@@ -367,34 +410,62 @@ class ReviewComposer:
             size_keys = [k for k in SIZE_KEYS if k in a]
             if not size_keys and "length_long" in a:
                 size_keys = ["length_long_bad"]
-            serious = [k for k in problems if k in ("defect", "not_as_described", "delivery_issue")]
+            serious = [k for k in problems if k in ("defect", "not_as_described", "wrong_color_sent", "delivery_issue")]
+            blocks_praise = [k for k in serious if k in ("defect", "not_as_described")]
+            liked = a & {"quality_good", "color_good", "looks_good", "stretch", "warm", "light", "recommend", "fit_good", "liked"}
+            praising = (facts.rating or 0) >= 4 and not problems
+            if "quality_good" in a and not blocks_praise:              # сначала — что понравилось
+                body.append(pick("rejected_quality"))
+            elif (liked or praising) and not blocks_praise:
+                body.append(pick("rejected_positive"))
             for key in serious[:2]:
                 body.append(pick(key))
+            length_done = False
             if size_keys:
-                body.append(pick(size_keys[0]))
+                if size_keys[0] == "length_short" and facts.height:
+                    body.append(pick("length_short_height"))
+                    length_done = True
+                else:
+                    body.append(pick(size_keys[0]))
             elif not serious:
                 other = [k for k in problems if k not in size_keys][:1]
                 body.extend(pick(k) for k in other)
-            liked = a & {"quality_good", "color_good", "looks_good", "stretch", "warm", "light", "recommend", "fit_good"}
-            praising = (facts.rating or 0) >= 4 and not problems
-            if "quality_good" in a and not serious:
-                body.append(pick("rejected_quality"))
-            elif (liked or praising) and not serious:
-                body.append(pick("rejected_positive"))
             if "reorder_size" in a or (size_keys and "repeat" in a):
                 body.append(pick("reorder"))
+            elif length_done:
+                pass
+            elif size_keys and size_keys[0] in ("length_short", "length_long_bad") and not (a & {"size_small", "size_big", "size_wrong"}):
+                body.append(pick("length_advice"))
             elif size_keys or "размер" in facts.text:
                 body.append(pick("size_advice"))
             closing = pick("wish_other")
         elif problems:
-            for key in problems[:2]:
+            serious = a & {"wear_out", "defect", "not_as_described", "quality_bad"}
+            liked_first = "liked" in a and not serious
+            main = [k for k in problems if not ("wear_out" in a and k == "quality_bad")]   # про износ уже сказано про качество
+            for key in main[:2]:
                 body.append(pick(key))
-            if any(k in a for k in ("size_small", "size_big", "length_short", "size_wrong")):
+            if "wear_out" in a:
+                body.append(pick("care_rules"))
+            if "length_short" in a and facts.height and not (a & {"size_small", "size_big", "size_wrong"}):
+                body = [pick("length_short_height") if x == pick("length_short") else x for x in body]
+                if pick("length_short_height") not in body:
+                    body.append(pick("length_short_height"))
+            elif "length_short" in a and not (a & {"size_small", "size_big", "size_wrong"}):
+                body.append(pick("length_advice"))
+            elif any(k in a for k in ("size_small", "size_big", "length_short", "size_wrong")):
                 body.append(pick("size_advice"))
+            if "refund" in a and serious:
+                body.append(pick("refund"))
+            elif serious:
+                body.append(pick("photo_request"))
             positives = [k for k in POSITIVE_ORDER if k in a and k not in ("length_long",)]
-            if positives and not (a & {"defect", "not_as_described"}):
+            if positives and not serious:
                 body.insert(0, pick(positives[0]))
-            closing = pick("wish_other")
+            closing = pick("closing_problem") if serious else pick("wish_other")
+        elif a & {"angry", "refund"}:
+            body.append(pick("negative_strong"))
+            closing = pick("closing_problem")
         elif facts.rating is not None and facts.rating <= 3:
             body.append(pick("negative_general"))
             closing = pick("wish_other")

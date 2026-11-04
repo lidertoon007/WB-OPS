@@ -99,6 +99,41 @@ class ComposerTests(unittest.TestCase):
         self.assertNotEqual(service.draft(item).text, self.composer.compose(item)[0])
 
 
+    def test_wear_out_complaint_even_with_five_stars(self):
+        t = ("Приобрели джинсы 5.10, успели надеть 2 раза и материал превратился в решето!!! Это что за качество ткани "
+             "за такие немалые деньги??? Верните деньги и заберите свое \"изделие\"!!!")
+        for rating in (5, 1):
+            reply = self.text(t, rating=rating, name="Галина")
+            self.assertIn("Галина", reply)
+            self.assertRegex(reply, "контрол[ья] качества|проходит контроль")
+            self.assertIn("30 °C", reply)
+            self.assertIn("фото", reply)
+            self.assertNotIn("возврат", reply.lower())
+            for bad in ("Если расскажете подробнее", "Ждём вас снова", "Спасибо за честную оценку", "пять звёзд", "высокую оценку"):
+                self.assertNotIn(bad, reply)
+
+    def test_wrong_color_and_short_for_tall_rejected(self):
+        reply = self.text("Джинсы хорошие, но на 188 рост коротки, и вместо синих прислали черные. Отказ.", rating=5, status="rejected", name="Лидия")
+        self.assertRegex(reply, "понравил|по душе")
+        self.assertIn("видео", reply)                      # сборка под камерами — ошибка не наша
+        self.assertNotRegex(reply.lower(), "извин|ошибка комплектации|проверим сборку")
+        self.assertNotIn("освещени", reply)                 # а не «оттенок на экране»
+        self.assertIn("188 см", reply)
+        self.assertIn("по внутреннему шву", reply)
+        self.assertNotIn("обхваты талии", reply)            # про длину, а не про обхваты
+        self.assertNotIn("комфортной носки", reply)
+
+    def test_short_for_tall_buyout_is_not_a_tip(self):
+        reply = self.text("Джинсы хорошие, но на 188 рост коротки.", rating=5, status="buyout")
+        self.assertIn("188 см", reply)
+        self.assertNotIn("совет по размеру", reply)
+
+    def test_positive_reviews_are_not_complaints(self):
+        for t in ("Отличные джинсы!!! Рекомендую!!!", "После 3 стирок как новые, катышков нет", "Ужасно понравились, сидят идеально"):
+            facts = analyze(review(t))
+            self.assertFalse(facts.aspects & {"wear_out", "angry", "quality_bad", "refund"}, t)
+            self.assertFalse(facts.negative, t)
+
 class AIWriterTests(unittest.TestCase):
     def setUp(self):
         self.cfg = {"provider": "anthropic", "api_key": "k-123", "model": "claude-test", "tone": "дружелюбный", "length": "", "use_emojis": False}

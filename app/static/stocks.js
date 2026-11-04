@@ -192,6 +192,7 @@ window.WBOPSStocks = (() => {
         <button type="button" data-add="10" data-id="${esc(r.id)}" aria-label="Плюс 10">+10</button>
         <button type="button" data-add="50" data-id="${esc(r.id)}" aria-label="Плюс 50">+50</button>
         <input data-qty="${esc(r.id)}" inputmode="numeric" placeholder="+N / =N" title="Число — добавить, =N — установить точно. Enter — применить" aria-label="Добавить или установить количество">
+        <button type="button" class="sk-zero" data-zero-size="${esc(r.id)}" ${a === 0 ? 'disabled' : ''} aria-label="Обнулить размер ${esc(r.size || 'без размера')}" title="Поставить 0 для этого размера и сразу отправить на WB">⦸ Обнулить</button>
         ${changed ? `<button type="button" class="rv-link" data-undo="${esc(r.id)}" title="Вернуть как было">↺</button>` : ''}</div></td>
       <td><input class="sk-thr" type="number" min="0" data-thr="${esc(r.id)}" value="${r.threshold ?? ''}" placeholder="${st.data.settings.threshold}" aria-label="Порог оповещения"></td>
       <td><button type="button" class="st-switch ${r.muted ? '' : 'on'}" role="switch" aria-checked="${!r.muted}" data-watch="${esc(r.id)}" aria-label="Следить за размером"><i></i></button></td>
@@ -261,6 +262,18 @@ window.WBOPSStocks = (() => {
     body.querySelectorAll('[data-sel]').forEach(cb => cb.onchange = () => { cb.checked ? st.sel.add(cb.dataset.sel) : st.sel.delete(cb.dataset.sel); drawStocks(); });
     body.querySelectorAll('[data-add]').forEach(b => b.onclick = () => {
       const r = st.data.rows.find(x => x.id === b.dataset.id); setPending(r.id, amountOf(r) + Number(b.dataset.add)); drawStocks();
+    });
+    body.querySelectorAll('[data-zero-size]').forEach(b => b.onclick = async () => {
+      const r = st.data.rows.find(x => x.id === b.dataset.zeroSize);
+      if (!r || amountOf(r) === 0) return;
+      if (!confirm(`Обнулить размер «${r.size || 'без размера'}» для ${r.vendor}?\n\nИзменение сразу уйдёт на WB.`)) return;
+      b.disabled = true; b.textContent = '…';
+      try {
+        const res = await api('/api/stocks', {method: 'PUT', body: {changes: [{id: r.id, amount: 0}]}});
+        if (res.errors?.[r.id]) throw new Error(res.errors[r.id]);
+        st.pending.delete(r.id);
+        await load();
+      } catch (err) { alert(err.message); b.disabled = false; b.textContent = '⦸ Обнулить'; }
     });
     body.querySelectorAll('[data-qty]').forEach(inp => inp.onkeydown = e => {
       if (e.key !== 'Enter') return;
@@ -396,6 +409,7 @@ window.WBOPSStocks = (() => {
 .sk-quick{display:flex;gap:4px;align-items:center;flex-wrap:nowrap}
 .sk-quick button:not(.rv-link){height:30px;min-width:38px;border:1px solid #e3e5ea;background:#fff;border-radius:8px;font:inherit;font-size:12px;font-weight:700;color:#374151;cursor:pointer}
 .sk-quick button:not(.rv-link):hover{border-color:#8b5cf6;color:#5b21b6}.sk-quick button:disabled{opacity:.4;cursor:not-allowed}
+.sk-quick button.sk-zero{color:#b42323}.sk-quick button.sk-zero:hover{border-color:#e03131;color:#b42323;background:#fdf2f2}
 .sk-quick input{width:84px;height:30px;border:1px solid #e3e5ea;border-radius:8px;padding:0 8px;font:inherit;font-size:13px}.sk-quick input:focus{outline:2px solid #ddd6fe;border-color:#8b5cf6}
 .sk-quick input.err{border-color:#e03131}
 .sk-thr{width:70px;height:30px;border:1px solid #e3e5ea;border-radius:8px;padding:0 8px;font:inherit}.sk-upd{font-size:12px;white-space:nowrap}
