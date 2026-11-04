@@ -3445,7 +3445,7 @@ def _campaign_status(advert_id):
 
 async def ab_loop() -> None:
     """Каждые 10 минут: статистика вариантов, вердикт, смена главного фото по расписанию."""
-    await asyncio.sleep(200)
+    await asyncio.sleep(30)
     while True:
         try:
             await asyncio.to_thread(abtests.tick, _campaign_status)
@@ -3465,8 +3465,8 @@ def _ab(fn, *args, **kwargs):
 def ab_list() -> dict[str, object]:
     with draft_store._connect() as c:
         try:
-            camps = [{"id": r[0], "name": r[1], "status": r[2], "payment_type": r[3], "nms": [n.get("nm_id") for n in json.loads(r[4] or "[]")]}
-                     for r in c.execute("SELECT id, name, status, payment_type, nms FROM ads_campaigns WHERE status IN (9, 11) ORDER BY name")]
+            camps = [{"id": r[0], "name": r[1], "status": r[2], "payment_type": r[3], "account": r[4], "nms": [n.get("nm_id") for n in json.loads(r[5] or "[]")]}
+                     for r in c.execute("SELECT id, name, status, payment_type, account, nms FROM ads_campaigns WHERE status IN (9, 11) ORDER BY account, name")]
         except Exception:
             camps = []
     return {"tests": abtests.list(), "campaigns": camps, "has_tokens": bool(_rnp_tokens()), "ads_synced_at": draft_store.get_setting("ads_synced_at", "")}
@@ -3481,9 +3481,10 @@ class ABCreate(BaseModel):
     nm_id: int
     advert_id: int
     photos: list[int] = Field(default_factory=list, max_length=30)
-    mode: str = "timer"
+    mode: str = "clusters"
     interval_hours: float = Field(default=6, ge=2, le=72)
-    views_per_step: float = Field(default=1000, ge=300, le=1000000)
+    views_per_step: float = Field(default=100, ge=100, le=1000000)
+    clusters: list[str] = Field(default_factory=lambda: ["Джинсы мужские классические", "Джинсы мужские прямые", "Джинсы мужские прямые классические"], max_length=50)
     metric: str = "ctr"
     max_days: float = Field(default=14, ge=1, le=90)
 
@@ -3491,7 +3492,7 @@ class ABCreate(BaseModel):
 @app.post("/api/ab/tests")
 async def ab_create(body: ABCreate) -> dict[str, object]:
     result = await asyncio.to_thread(_ab, abtests.create, body.nm_id, body.advert_id, body.photos, body.mode, body.interval_hours, body.views_per_step,
-                                     body.metric, body.max_days)
+                                     body.metric, body.max_days, body.clusters)
     draft_store.audit("ab_create", str(body.nm_id), f"test={result['id']}")
     return result
 
@@ -3532,6 +3533,13 @@ async def ab_start(test_id: int) -> dict[str, object]:
 @app.post("/api/ab/tests/{test_id}/pause")
 async def ab_pause(test_id: int) -> dict[str, object]:
     return await asyncio.to_thread(_ab, abtests.pause, test_id)
+
+
+@app.post("/api/ab/tests/{test_id}/refresh")
+async def ab_refresh(test_id: int) -> dict[str, object]:
+    result = await asyncio.to_thread(_ab, abtests.refresh, test_id)
+    draft_store.audit("ab_refresh", details=f"test={test_id}")
+    return result
 
 
 @app.post("/api/ab/tests/{test_id}/variants/{variant_id}/exclude")
