@@ -1,0 +1,47 @@
+Изменения для Google Apps Script
+
+1) В таблице в строке 1 добавьте новый заголовок:
+Остаток FBS Ставрополь
+
+2) В коде замените блок констант:
+const WAREHOUSE_ID = 1854666; // FBS Москва
+
+на:
+const MOSCOW_WAREHOUSE_ID = 1854666; // FBS Москва
+const STAVROPOL_WAREHOUSE_ID = 165353; // FBS Ставрополь (МГТ Маркетплейс (FBS))
+const STAVROPOL_STOCK_HEADER = 'Остаток FBS Ставрополь';
+
+3) Замените updateWbAll() на:
+function updateWbAll() {
+  const token = wbToken_();
+  const msgs = [];
+  msgs.push(fillColumn_(PRICE_HEADER, 'Цены', fetchWbPrices_(token)));
+  msgs.push(fillColumn_(STOCK_HEADER, 'Остатки FBS Москва', fetchWbStocks_(token, MOSCOW_WAREHOUSE_ID)));
+  msgs.push(fillColumn_(STAVROPOL_STOCK_HEADER, 'Остатки FBS Ставрополь', fetchWbStocks_(token, STAVROPOL_WAREHOUSE_ID)));
+  msgs.push(fillSales_(token));
+  SpreadsheetApp.getActive().toast(msgs.join('\n'), 'WB', 15);
+}
+
+4) Замените updateWbStocks() на:
+function updateWbStocks() {
+  SpreadsheetApp.getActive().toast('Загружаю остатки WB…', 'WB', 60);
+  const token = wbToken_();
+  const msgs = [];
+  msgs.push(fillColumn_(STOCK_HEADER, 'Остатки FBS Москва', fetchWbStocks_(token, MOSCOW_WAREHOUSE_ID)));
+  msgs.push(fillColumn_(STAVROPOL_STOCK_HEADER, 'Остатки FBS Ставрополь', fetchWbStocks_(token, STAVROPOL_WAREHOUSE_ID)));
+  SpreadsheetApp.getActive().toast(msgs.join('\n'), 'WB', 15);
+}
+
+5) В объявлении функции fetchWbStocks_ замените строку:
+function fetchWbStocks_(token) {
+
+на:
+function fetchWbStocks_(token, warehouseId) {
+
+6) Внутри этой функции замените URL:
+'https://marketplace-api.wildberries.ru/api/v3/stocks/' + WAREHOUSE_ID,
+
+на:
+'https://marketplace-api.wildberries.ru/api/v3/stocks/' + warehouseId,
+
+После этого «Обновить всё» и «Только остатки» будут заполнять оба столбца.

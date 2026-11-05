@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "WB OPS Browser Agent",
+  "version": "0.2.0",
+  "description": "Чат с браузерным агентом для исследований маркетплейсов.",
+  "permissions": ["storage", "tabs", "activeTab", "scripting"],
+  "host_permissions": ["http://127.0.0.1:8787/*", "https://*.wildberries.ru/*", "https://*.ozon.ru/*", "https://*.market.yandex.ru/*", "https://market.yandex.ru/*"],
+  "background": {"service_worker": "background.js"},
+  "action": {"default_popup": "popup.html"},
+  "content_scripts": [{"matches": ["https://*.wildberries.ru/*", "https://*.ozon.ru/*", "https://*.market.yandex.ru/*", "https://market.yandex.ru/*"], "js": ["content.js"], "run_at": "document_idle"}]
+}
