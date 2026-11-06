@@ -454,13 +454,13 @@ class ReportRunner:
         self.lock = threading.Lock()
         self.process: subprocess.Popen | None = None
         self.log: deque[str] = deque(maxlen=400)
-        self.state = {"status": "idle", "mode": None, "started_at": None, "finished_at": None, "code": None}
+        self.state = {"status": "idle", "mode": None, "marketplace": None, "started_at": None, "finished_at": None, "code": None}
 
     def status(self) -> dict:
         with self.lock:
             return {**self.state, "log": list(self.log)[-60:]}
 
-    def start(self, project: Path, python: str, mode: str, note: str = "") -> dict:
+    def start(self, project: Path, python: str, mode: str, note: str = "", marketplace: str | None = None) -> dict:
         with self.lock:
             if self.state["status"] == "running":
                 raise FinanceError("Отчёт уже собирается. Дождитесь окончания.")
@@ -469,6 +469,9 @@ class ReportRunner:
                 cmd += ["--from-cache", "--fill-missing"]   # чего нет в кэше — загрузить из API
             elif mode == "reload":
                 cmd += ["--reload"]   # WB: все недели заново (full догружает к кэшу только новые)
+            if marketplace:
+                cache_for = ",".join(key for key in ("wb", "ym", "ozon") if key != marketplace)
+                cmd += ["--cache-for", cache_for]
             env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
             try:
                 self.process = subprocess.Popen(cmd, cwd=project, env=env, stdout=subprocess.PIPE,
@@ -479,7 +482,8 @@ class ReportRunner:
             self.log.clear()
             if note:
                 self.log.append(note)
-            self.state = {"status": "running", "mode": mode, "started_at": time.time(), "finished_at": None, "code": None}
+            self.state = {"status": "running", "mode": mode, "marketplace": marketplace,
+                          "started_at": time.time(), "finished_at": None, "code": None}
         threading.Thread(target=self._pump, daemon=True).start()
         return self.status()
 

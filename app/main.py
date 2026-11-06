@@ -2019,7 +2019,7 @@ def sync_opiu_keys(project) -> dict[str, int]:
     return finance.sync_accounts(project, configured_cabinets())
 
 
-def start_finance_report(project, mode: str) -> dict[str, object]:
+def start_finance_report(project, mode: str, marketplace: str | None = None) -> dict[str, object]:
     """Пересборка ОПиУ: сначала ключи API из кабинетов панели — в конфиги расчёта, потом запуск."""
     synced = sync_opiu_keys(project)
     titles = {"wildberries": "WB", "ozon": "Ozon", "yandex": "Я.Маркет"}
@@ -2027,7 +2027,7 @@ def start_finance_report(project, mode: str) -> dict[str, object]:
             if synced else "В кабинетах панели нет ключей API — расчёт возьмёт ключи из своих конфигов")
     if synced and not any(synced.values()):
         note += " (сбор статистики и продаж выключен во всех кабинетах)"
-    return finance_runner.start(project, finance_settings()["python"] or finance.default_python(), mode, note)
+    return finance_runner.start(project, finance_settings()["python"] or finance.default_python(), mode, note, marketplace)
 
 
 @app.get("/api/finance/settings")
@@ -3717,12 +3717,15 @@ async def finance_update(request: Request) -> dict[str, object]:
     mode = (payload or {}).get("mode", "cache")
     if mode not in ("cache", "full", "reload"):
         raise HTTPException(400, "mode: cache, full или reload")
+    marketplace = (payload or {}).get("marketplace")
+    if marketplace not in (None, "wb", "ym", "ozon"):
+        raise HTTPException(400, "marketplace: wb, ym или ozon")
     project = finance_project()
     try:
-        result = start_finance_report(project, mode)
+        result = start_finance_report(project, mode, marketplace)
     except finance.FinanceError as exc:
         raise HTTPException(409, str(exc)) from exc
-    draft_store.audit("finance_update_started", details=mode)
+    draft_store.audit("finance_update_started", details=mode + (f" ({marketplace})" if marketplace else ""))
     return result
 
 

@@ -123,10 +123,12 @@ window.WBOPSFinance = (() => {
     root.querySelectorAll('[data-f-update]').forEach(b => b.disabled = running);
     if (st.status === 'idle') { out.hidden = true; return; }
     out.hidden = false;
+    const mpTitles = {wb: ' WB', ym: ' Яндекс Маркета', ozon: ' Ozon'};
     const how = {full: ' с догрузкой новых данных маркетплейсов', reload: ' с полной перезагрузкой данных маркетплейсов'};
+    const scope = (st.marketplace || st.only) ? (mpTitles[st.marketplace || st.only] || ` ${st.marketplace || st.only}`) : '';
     const title = running ? `Собираю отчёт${how[st.mode] || ' из кэша'}…`
       : st.status === 'done' ? 'Отчёт собран.' : `Сборка завершилась с ошибкой (код ${st.code}).`;
-    out.innerHTML = `<b>${esc(title)}</b><pre>${esc((st.log || []).slice(-15).join('\n'))}</pre>`;
+    out.innerHTML = `<b>${esc(title.replace('маркетплейсов', 'маркетплейса' + scope))}</b><pre>${esc((st.log || []).slice(-15).join('\n'))}</pre>`;
   }
 
   async function poll() {
@@ -139,10 +141,17 @@ window.WBOPSFinance = (() => {
     } catch (e) { polling = setTimeout(poll, 5000); }
   }
 
-  async function startUpdate(mode) {
-    if (mode === 'full' && !confirm('Обновить данные всех маркетплейсов через API? Для Ozon отключите VPN. Wildberries догрузит только новые недели к уже скачанным; Ozon и Яндекс Маркет загружаются целиком — это может занять до часа.')) return;
+  async function startUpdate(mode, only = '') {
+    const labels = {wb: 'Wildberries', ym: 'Яндекс Маркета', ozon: 'Ozon'};
+    if (mode === 'full' && only && !confirm(`Обновить данные ${labels[only] || only} через API? Для Ozon отключите VPN.`)) return;
+    if (mode === 'full' && !only && !confirm('Обновить данные всех маркетплейсов через API? Для Ozon отключите VPN. Wildberries догрузит только новые недели к уже скачанным; Ozon и Яндекс Маркет загружаются целиком — это может занять до часа.')) return;
     if (mode === 'reload' && !confirm('Загрузить все данные Wildberries заново за весь период? Нужно, только если в кэше что-то не так: при ~200 тыс. строк это несколько минут с паузами из-за лимита WB.')) return;
-    try { const st = await api('/api/finance/update', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode})}); root.dataset.waiting = '1'; showRun(st); poll(); }
+    try {
+      const body = {mode};
+      if (only) body.marketplace = only;
+      const st = await api('/api/finance/update', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+      root.dataset.waiting = '1'; showRun(st); poll();
+    }
     catch (e) { root.querySelector('[data-f-run]').hidden = false; root.querySelector('[data-f-run]').textContent = e.message; }
   }
 
@@ -168,6 +177,9 @@ window.WBOPSFinance = (() => {
     root.innerHTML = `<div class="r-head"><h2>ОПиУ маркетплейсов</h2><div class="toolbar">
         <button class="btn" data-f-update="cache" title="Из кэша — 1–2 минуты; кабинеты, которых нет в кэше, загрузятся из API">Собрать из кэша</button>
         <button class="btn secondary" data-f-update="full" title="Загрузить из API только новые данные: закрытые недели WB берутся из кэша">Обновить данные МП</button>
+        <button class="btn secondary" data-f-update="full" data-f-only="wb" title="Загрузить данные Wildberries через API">WB</button>
+        <button class="btn secondary" data-f-update="full" data-f-only="ym" title="Загрузить данные Яндекс Маркета через API">ЯМ</button>
+        <button class="btn secondary" data-f-update="full" data-f-only="ozon" title="Загрузить данные Ozon через API">Ozon</button>
         <button class="btn secondary" data-f-update="reload" title="Загрузить все недели WB заново за весь период — если в кэше что-то не так">Полная перезагрузка</button>
         <a class="btn secondary" href="/api/finance/report/download">⇩ Excel</a></div></div>
       <p class="muted">Расчёт ОПиУ — в папке <b>WB OPS\\opiu</b> (opiu_all.py); здесь — последний собранный отчёт. Ключи API берутся из кабинетов панели. Налог считается от фактической цены покупки.</p>
@@ -177,7 +189,7 @@ window.WBOPSFinance = (() => {
         <label>Python для запуска<input name="python" placeholder="Пусто — Python из WB OPS"></label>
         <small class="muted" data-f-resolved></small><button class="btn secondary" type="submit">Сохранить</button></form></details>
       <div data-f-report></div>`;
-    root.querySelectorAll('[data-f-update]').forEach(b => b.onclick = () => startUpdate(b.dataset.fUpdate));
+    root.querySelectorAll('[data-f-update]').forEach(b => b.onclick = () => startUpdate(b.dataset.fUpdate, b.dataset.fOnly || ''));
     loadSettings(); loadReport(); poll();
   }
 
