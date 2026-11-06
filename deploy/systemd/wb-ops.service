@@ -1,0 +1,34 @@
+[Unit]
+Description=WB OPS FastAPI service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wbops
+Group=wbops
+WorkingDirectory=/opt/wb-ops/current
+EnvironmentFile=/etc/wb-ops/wb-ops.env
+ExecStart=/opt/wb-ops/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 2
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Keep the service confined while allowing SQLite and runtime data under the app tree.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/opt/wb-ops/current/data /opt/wb-ops/current/exports /opt/wb-ops/current/fbs_reports /opt/wb-ops/current/opiu /opt/wb-ops/current/app/knowledge
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
