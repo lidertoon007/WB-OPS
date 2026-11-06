@@ -291,6 +291,33 @@ class Nomenclature:
         self._drop_missing(key)
         return target
 
+    def fill_missing_cost(self, value: float = 1000) -> int:
+        """Задаёт себестоимость только артикулам, у которых она не указана."""
+        if not (0 <= value <= 1_000_000):
+            raise NomenclatureError("Себестоимость: число от 0 до 1 000 000")
+        missing = [item["article"] for item in self.items()["items"] if not item["has_cost"]]
+        done = 0
+        for article in missing:
+            # Повторно проверяем текущую цену перед записью: параллельное ручное
+            # изменение не будет перезаписано значением по умолчанию.
+            _, rows = self.read_cost_rows()
+            own = [r for r in rows if art_key(r.get("артикул")) == art_key(article)]
+            current = self.current_price(own)
+            if current and num(current.get(COST_COL)) is not None:
+                continue
+            self.update_price(article, cost=value)
+            done += 1
+        return done
+
+    def set_prep_all(self, value: float = 85) -> int:
+        """Задаёт подготовку всем артикулам справочника без ограничения размера пачки."""
+        if not (0 <= value <= 100_000):
+            raise NomenclatureError("Подготовка: число от 0 до 100 000")
+        articles = [item["article"] for item in self.items()["items"] if item["article"]]
+        for article in articles:
+            self.update_price(article, prep=value)
+        return len(articles)
+
     @staticmethod
     def _insert(rows: list[dict], own: list[dict], new: dict) -> None:
         """Новая строка — сразу после строк того же артикула (порядок файла сохраняется)."""

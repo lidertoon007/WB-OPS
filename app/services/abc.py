@@ -105,6 +105,7 @@ def analysis(boards: dict[str, Dashboard], start: date, end: date, book: dict[st
                      "brand": b.get("brand") or c.get("brand") or "", "category": b.get("category") or c.get("category") or "",
                      "marketplaces": sorted(mps[k]), "sold": sold, "revenue": s["revenue"], "profit": s["profit"],
                      "share": s["revenue"] / total_revenue * 100 if total_revenue and s["revenue"] > 0 else 0.0,
+                     "buyout": s["net_qty"] / s["orders_qty"] * 100 if s["orders_qty"] else None,
                      "abc_revenue": revenue[k], "abc_turnover": turnover[k], "abc_profit": profit[k],
                      "abc": code, "group": group, "stock": stock, "unit_cost": cost,
                      "stock_cost": stock * cost if cost is not None else None, "per_day": per_day,

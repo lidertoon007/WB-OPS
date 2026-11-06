@@ -47,7 +47,17 @@ def metric_rate(v: dict, metric: str) -> float | None:
     views = v.get("views") or 0
     if not views:
         return None
-    return (v.get("atbs") if metric == "cart" else v.get("clicks") or 0) / views
+    if metric == "cart":
+        value = v.get("atbs") or 0
+    elif metric == "order_rate":
+        value = v.get("orders") or 0
+    elif metric == "revenue_rate":
+        value = v.get("sum_price") or 0
+    elif metric == "profit_rate":
+        value = (v.get("sum_price") or 0) - (v.get("spend") or 0)
+    else:
+        value = v.get("clicks") or 0
+    return value / views
 
 
 def norm_cluster(value: str) -> str:
@@ -56,6 +66,8 @@ def norm_cluster(value: str) -> str:
 
 def z_better(a: dict, b: dict, metric: str) -> float | None:
     """z-статистика гипотезы «a лучше b» по доле на показ."""
+    if metric in ("order_rate", "revenue_rate", "profit_rate"):
+        return None
     na, nb = a.get("views") or 0, b.get("views") or 0
     if not na or not nb:
         return None
@@ -294,7 +306,7 @@ class ABTests:
         clusters = list(dict.fromkeys(str(x).strip() for x in raw_clusters if str(x).strip()))[:50]
         if not clusters:
             raise ABError("Добавьте хотя бы один поисковый кластер")
-        if metric not in ("ctr", "cart"):
+        if metric not in ("ctr", "cart", "order_rate", "revenue_rate", "profit_rate"):
             raise ABError("Метрика: CTR или CTR × конверсия в корзину")
         with self.store._connect() as c:
             busy = c.execute("SELECT id FROM ab_tests WHERE nm_id=? AND status IN ('running', 'paused', 'auto_paused')", (nm_id,)).fetchone()
@@ -786,6 +798,9 @@ class ABTests:
                "cart_cr": round(v["atbs"] / v["clicks"] * 100, 2) if v["clicks"] else None,
                "ctr_cart": round(v["atbs"] / views * 100, 3) if views else None,
                "order_cr": round(v["orders"] / v["clicks"] * 100, 2) if v["clicks"] else None,
+               "order_rate": round(v["orders"] / views * 1000, 3) if views else None,
+               "revenue_rate": round(v["sum_price"] / views * 1000, 2) if views else None,
+               "profit_rate": round(((v["sum_price"] or 0) - (v["spend"] or 0)) / views * 1000, 2) if views else None,
                "is_current": v["id"] == t["current_variant"], "is_winner": v["id"] == t.get("winner"),
                "has_file": bool(v["local_file"])}
         if t.get("mode") == "clusters":

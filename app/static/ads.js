@@ -12,7 +12,7 @@ window.WBOPSAds = (() => {
   const STC = {9: '#2f9e44', 11: '#f59f00', 7: '#adb5bd', 4: '#4c6ef5', 8: '#e03131', '-1': '#adb5bd'};
   const PAY = {cpm: 'CPM · за показы', cpc: 'CPC · за клики'}, BID = {manual: 'ручная ставка', unified: 'единая ставка'};
   const PLC = {search: 'поиск', recommendations: 'рекомендации', combined: 'поиск + рекомендации'};
-  const st = {tab: 'summary', f: {preset: 'days:14', from: '', to: '', cabinet: '', campaign: '', status: '', payment: '', brand: '', category: '', q: ''},
+  const st = {tab: 'summary', insightLevel: 'all', f: {preset: 'days:14', from: '', to: '', cabinet: '', campaign: '', status: '', payment: '', brand: '', category: '', q: ''},
     data: null, cs: {sort: 'spend', desc: true, st: 'live'}, as: {sort: 'spend', desc: true, q: ''}, qs: {sort: 'spend', desc: true, q: '', mode: ''}, poll: null};
   let root = null;
   try { Object.assign(st.f, JSON.parse(localStorage.getItem('wbops.ads.f') || '{}')); } catch (e) { /* без хранилища */ }
@@ -153,6 +153,7 @@ window.WBOPSAds = (() => {
         <section class="tr-box"><h3>Площадки</h3><p class="muted fb-sub">Где показывалась реклама</p>${platforms()}</section>
       </div>
       <section class="tr-box"><h3>Кампании с наибольшим расходом</h3>${campTable(d.campaigns.slice(0, 6), true)}</section>`;
+    body.querySelectorAll('[data-insight-filter]').forEach(b => b.onclick = () => { st.insightLevel = b.dataset.insightFilter; drawSummary(); });
     bindCamp(body);
     body.querySelectorAll('[data-goins]').forEach(b => b.onclick = () => {
       const k = b.dataset.goins, id = b.dataset.id;
@@ -164,8 +165,13 @@ window.WBOPSAds = (() => {
   function insights() {
     const ins = st.data.insights;
     if (!ins.length) return '<div class="pn-check ok">✓ Явных проблем в рекламе за период не найдено.</div>';
-    return `<section class="tr-box ad-ins"><h3>Что улучшить</h3><div class="ad-ins-list">${ins.slice(0, 8).map(i => `<button type="button" class="ad-ins-item ${i.level}" data-goins="${i.kind}" data-id="${esc(i.id ?? '')}">
-      <b>${i.level === 'bad' ? '⚠' : '•'} ${esc(i.title)}</b><span>${esc(i.text)}</span></button>`).join('')}</div>${ins.length > 8 ? `<p class="muted fb-sub">И ещё ${ins.length - 8}.</p>` : ''}</section>`;
+    const priority = {bad: 0, warn: 1};
+    const ordered = ins.map((item, index) => ({item, index})).sort((a, b) => (priority[a.item.level] ?? 2) - (priority[b.item.level] ?? 2) || a.index - b.index).map(({item}) => item);
+    const counts = {all: ordered.length, bad: ordered.filter(i => i.level === 'bad').length, warn: ordered.filter(i => i.level === 'warn').length};
+    const visible = st.insightLevel === 'all' ? ordered : ordered.filter(i => i.level === st.insightLevel);
+    const empty = '<div class="ad-ins-empty muted">Для выбранного фильтра проблем не найдено.</div>';
+    return `<section class="tr-box ad-ins"><h3>Что улучшить</h3><div class="ad-ins-legend"><span class="ad-ins-legend-item bad"><i></i><b>Критично</b> — подтверждена потеря эффективности или денег</span><span class="ad-ins-legend-item warn"><i></i><b>Требует внимания</b> — сигнал для проверки</span></div><div class="ad-ins-filters" role="group" aria-label="Фильтр проблем"><button type="button" class="ad-ins-filter ${st.insightLevel === 'all' ? 'active' : ''}" data-insight-filter="all">Все <b>${counts.all}</b></button><button type="button" class="ad-ins-filter bad ${st.insightLevel === 'bad' ? 'active' : ''}" data-insight-filter="bad">Критичные <b>${counts.bad}</b></button><button type="button" class="ad-ins-filter warn ${st.insightLevel === 'warn' ? 'active' : ''}" data-insight-filter="warn">Требуют внимания <b>${counts.warn}</b></button></div><div class="ad-ins-list">${visible.length ? visible.map(i => `<button type="button" class="ad-ins-item ${i.level}" data-goins="${i.kind}" data-id="${esc(i.id ?? '')}">
+      <b>${i.level === 'bad' ? '⚠' : '•'} ${esc(i.title)}</b><span>${esc(i.text)}</span></button>`).join('') : empty}</div></section>`;
   }
   function spendChart() {
     const t = st.data.timeline, max = Math.max(1, ...t.map(x => x.spend || 0));
@@ -312,15 +318,22 @@ window.WBOPSAds = (() => {
   style.textContent = `
 .ad-hero{background:linear-gradient(135deg,#f3f0ff,#eef2ff);border-color:#d9d2fb}.ad-hero b{color:#5b21b6}.ad-hero span,.ad-hero p{color:#4c3d7a}.ad-hero .fb-lost-side{border-color:#d9d2fb}
 .ad-camp-sel{max-width:260px}
-.ad-ins-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:10px}
-.ad-ins-item{display:flex;flex-direction:column;gap:4px;text-align:left;border:1px solid #e5e7eb;border-left:4px solid #f59f00;border-radius:12px;padding:10px 12px;background:#fff;font:inherit;cursor:pointer}
+.ad-ins-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(340px,100%),1fr));gap:10px}
+.ad-ins-item{display:flex;flex-direction:column;gap:4px;text-align:left;border:1px solid #e5e7eb;border-left:4px solid #f59f00;border-radius:12px;padding:10px 12px;background:#fff;font:inherit;cursor:pointer;min-width:0;min-height:112px;height:100%;box-sizing:border-box;overflow:hidden}
 .ad-ins-item.bad{border-left-color:#e03131}.ad-ins-item:hover{background:#faf7ff}.ad-ins-item b{font-size:14px}.ad-ins-item span{font-size:13px;color:#4b5563;line-height:1.4}
+.ad-ins-legend{display:flex;flex-wrap:wrap;gap:6px 16px;margin:-4px 0 12px;color:#6b7280;font-size:12px;line-height:1.4}.ad-ins-legend-item{display:inline-flex;align-items:center;gap:5px}.ad-ins-legend-item i{display:inline-block;width:8px;height:8px;border-radius:50%;background:#f59f00;flex:none}.ad-ins-legend-item.bad i{background:#e03131}.ad-ins-legend-item b{color:#374151}
+.ad-ins-filters{display:flex;flex-wrap:wrap;gap:6px;margin:-4px 0 12px}.ad-ins-filter{border:1px solid #e5e7eb;border-radius:999px;background:#f8f9fb;color:#4b5563;padding:6px 10px;font:inherit;font-size:12px;cursor:pointer}.ad-ins-filter b{margin-left:3px}.ad-ins-filter.active{background:#111827;border-color:#111827;color:#fff}.ad-ins-filter.bad.active{background:#e03131;border-color:#e03131}.ad-ins-filter.warn.active{background:#f59f00;border-color:#f59f00;color:#111827}.ad-ins-empty{grid-column:1/-1;padding:16px;border:1px dashed #d1d5db;border-radius:10px;text-align:center}
 .ad-funnel{display:grid;gap:10px}.ad-fstep{display:grid;grid-template-columns:80px 1fr 90px 120px;align-items:center;gap:10px;font-size:13px}
 .ad-fbar{height:16px;background:#f1f2f4;border-radius:6px;overflow:hidden}.ad-fbar i{display:block;height:100%;background:#7c3aed;border-radius:6px}.ad-fstep b{text-align:right;font-variant-numeric:tabular-nums}
 .ad-name small{display:block;font-size:11px;font-weight:400;margin-top:2px}.ad-name{min-width:280px;max-width:420px;white-space:normal}
+.ad-table{min-width:1180px}.ad-table th,.ad-table td{vertical-align:middle}.ad-table th:not(.l),.ad-table td:not(.l){white-space:nowrap}.ad-table .ad-name{width:30%;min-width:280px;max-width:420px;text-align:left}.ad-table .ad-name b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ad-table .ad-name small{overflow-wrap:anywhere}.ad-table tbody tr{height:48px}
+.ad-page .db-filters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));align-items:stretch;gap:10px}.ad-page .db-filters select,.ad-page .db-filters input{width:100%;min-width:0;max-width:none;box-sizing:border-box}.ad-page .db-filters .db-period{min-width:0}.ad-page .db-filters .db-date{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;min-width:0}.ad-page .db-filters .db-date input{width:100%}.ad-page .db-filters .rp-tools{display:flex;align-items:center;min-width:0;margin-left:0}.ad-page .db-filters .rp-tools .db-ghost{width:100%;white-space:nowrap}
 .ad-st{display:inline-flex;align-items:center;gap:4px;font-weight:600;color:#374151}.ad-st::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--c)}
 .ad-qsearch{height:34px;border:1px solid #e3e5ea;border-radius:9px;padding:0 10px;font:inherit;margin-left:auto}
-@media(max-width:700px){.ad-fstep{grid-template-columns:64px 1fr 70px}.ad-fstep small{display:none}.ad-ins-list{grid-template-columns:1fr}}`;
+@media(max-width:1100px){.ad-page .db-filters{grid-template-columns:repeat(3,minmax(0,1fr))}.ad-fstep{grid-template-columns:72px minmax(0,1fr) 80px}.ad-fstep small{display:none}}
+@media(max-width:760px){.ad-page .db-filters{grid-template-columns:repeat(2,minmax(0,1fr))}.ad-fstep{grid-template-columns:64px minmax(0,1fr) 70px}.ad-ins-list{grid-template-columns:1fr}.ad-table{min-width:980px}.ad-table .ad-name{min-width:240px}}
+@media(max-width:520px){.ad-page .db-filters{grid-template-columns:1fr}.ad-fstep{grid-template-columns:1fr auto;gap:6px}.ad-fstep .ad-fbar{grid-column:1/-1}.ad-fstep b{grid-column:2;grid-row:1}.ad-table{min-width:900px}}
+`;
   document.head.appendChild(style);
 
   return {render};

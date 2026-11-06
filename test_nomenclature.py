@@ -48,6 +48,20 @@ class NomenclatureTests(unittest.TestCase):
         self.assertNotIn("NEW-1", (self.dir / "cost_missing.csv").read_text(encoding="utf-8-sig"))   # больше не «без цены»
         self.assertTrue((self.dir / "cost.csv.bak").exists())
 
+    def test_fill_missing_cost_only_fills_empty_articles(self):
+        self.n.fill_missing_cost(1000)
+        items = self.by_key()
+        self.assertEqual(items["DE-90"]["cost"], 1091.0)
+        self.assertEqual(items["B012"]["cost"], 1041.0)
+        self.assertEqual(items["NEW-1"]["cost"], 1000.0)
+        # Повторный запуск не создаёт новую цену и не меняет существующую.
+        self.assertEqual(self.n.fill_missing_cost(1000), 0)
+
+    def test_set_prep_all_updates_every_article(self):
+        self.assertEqual(self.n.set_prep_all(85), 3)
+        items = self.by_key()
+        self.assertEqual({items[k]["prep"] for k in items}, {85.0})
+
     def test_dated_price_and_order(self):
         self.n.update_price("de-90", cost=1200, effective_from="2099-01")
         rows = list(csv.reader((self.dir / "cost.csv").read_text(encoding="utf-8-sig").splitlines(), delimiter=";"))

@@ -33,6 +33,8 @@ window.WBOPSProducts = (() => {
     root.innerHTML = `<div class="rv-head"><div class="rv-counters" data-counters></div>
         <div class="rv-head-actions"><label class="rv-dark pr-import" role="button" tabindex="0" title="Excel или CSV: колонки «Артикул», «Себестоимость», по желанию «Подготовка» (или «ФФ»), «Бренд», «Категория», «Наименование». Один справочник на все кабинеты и юрлица — новые кабинеты берут себестоимость отсюда же">Загрузить себестоимость<input type="file" accept=".xlsx,.xlsm,.csv" data-import hidden></label>
           <button type="button" class="rv-dark" data-refresh title="Загрузить названия, фото и WB ID из карточек товаров Wildberries">Обновить из WB</button>
+          <button type="button" class="rv-dark" data-fill-missing title="Установить 1000 ₽ только товарам без себестоимости">Заполнить отсутствующую себестоимость</button>
+          <button type="button" class="rv-dark" data-fill-prep title="Установить подготовку 85 ₽ всем артикулам">Подготовка 85 ₽ всем</button>
           <div class="rv-menu-wrap"><button type="button" class="rv-dark rv-sq" data-export aria-label="Скачать" title="Скачать номенклатуру">⇩</button>
           <div class="rv-menu" role="menu" hidden><a role="menuitem" href="/api/nomenclature/export?format=xlsx">Excel (.xlsx)</a><a role="menuitem" href="/api/nomenclature/export?format=csv">CSV</a></div></div></div></div>
       <div data-banner></div>
@@ -46,6 +48,8 @@ window.WBOPSProducts = (() => {
     root.querySelector('[data-search]').oninput = e => { clearTimeout(timer); timer = setTimeout(() => { st.search = e.target.value.trim().toLowerCase(); draw(); }, 200); };
     root.querySelectorAll('[data-f]').forEach(s => s.onchange = () => { st[s.dataset.f] = s.value; draw(); });
     root.querySelector('[data-refresh]').onclick = refreshCards;
+    root.querySelector('[data-fill-missing]').onclick = fillMissingCost;
+    root.querySelector('[data-fill-prep]').onclick = fillPrep;
     root.querySelector('[data-import]').onchange = e => importCosts(e.target);
     root.querySelector('.pr-import').onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); root.querySelector('[data-import]').click(); } };
     const menu = root.querySelector('.rv-menu');
@@ -190,6 +194,34 @@ window.WBOPSProducts = (() => {
       await load();
       setTimeout(() => { delete st.saved[i.key]; const s = root.querySelector(`.pr-row[data-key="${CSS.escape(i.key)}"] [data-state]`); if (s) s.textContent = ''; }, 2500);
     } catch (e) { if (state) state.textContent = ''; toast(e.message); }
+  }
+
+  async function fillMissingCost() {
+    const count = st.data?.items?.filter(i => !i.has_cost).length || 0;
+    if (!count) { toast('Артикулов без себестоимости нет'); return; }
+    const button = root.querySelector('[data-fill-missing]');
+    button.disabled = true;
+    try {
+      const result = await api('/api/nomenclature/fill-missing-cost', {method: 'POST'});
+      st.dirty = st.dirty || result.updated > 0;
+      toast(`Заполнено артикулов: ${result.updated}`);
+      await load();
+    } catch (e) { toast(e.message); }
+    finally { if (button) button.disabled = false; }
+  }
+
+  async function fillPrep() {
+    const articles = st.data?.items?.map(i => i.article).filter(Boolean) || [];
+    if (!articles.length) { toast('Артикулы не найдены'); return; }
+    const button = root.querySelector('[data-fill-prep]');
+    button.disabled = true;
+    try {
+      const result = await api('/api/nomenclature/set-prep-all', {method: 'POST'});
+      st.dirty = st.dirty || result.updated > 0;
+      toast(`Подготовка 85 ₽ установлена: ${result.updated}`);
+      await load();
+    } catch (e) { toast(e.message); }
+    finally { if (button) button.disabled = false; }
   }
 
   function drawBulk() {

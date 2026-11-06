@@ -17,6 +17,8 @@ def wb_dump():
                        ["2026-10-01", "", "Хранение и приёмка", "Хранение", -100.0]],
         "orders": [["2026-10-01", "2026-10-01", "o1", "a-1", 20.0, 8000.0], ["2026-10-01", "2026-10-01", "o2", "b-2", 3.0, 3000.0],
                    ["2026-10-02", "2026-10-02", "o3", "c-3", 1.0, 1000.0]],
+        "ordered": [["2026-10-01", "a-1", 20.0, 8000.0, 0.0, 0.0], ["2026-10-01", "b-2", 3.0, 3000.0, 0.0, 0.0],
+                    ["2026-10-02", "c-3", 1.0, 1000.0, 0.0, 0.0]],
         "stocks": [["a-1", "FBS Москва", "own", 2], ["b-2", "Коледино", "mp", 30], ["d-4", "FBS Москва", "own", 7]]}}}
 
 
@@ -58,6 +60,7 @@ class AbcAnalysisTests(unittest.TestCase):
         ozon = {"months": ["2026-10-01"], "cabinets": {"Магазин": {
             "by_article": [["2026-10-01", "a-1", "Выручка", "Продажи (цена продавца)", 2000.0]],
             "orders": [["2026-10-01", "2026-10-01", "p1", "A-1", 4.0, 2000.0]],
+            "ordered": [["2026-10-01", "A-1", 4.0, 2000.0, 0.0, 0.0]],
             "stocks": [["A-1", "Свой склад (FBS)", "own", 1], ["A-1", "Склады Ozon (FBO)", "mp", 3]]}}}
         (root / "Ozon" / "cache" / DUMP_NAME).write_text(json.dumps(ozon), encoding="utf-8")
         costs = [{"артикул": "A-1", "кратность": "1", "сс_за_ед": "100", "подготовка_за_ед": "0", "действует_с": ""}]
@@ -73,6 +76,7 @@ class AbcAnalysisTests(unittest.TestCase):
         self.assertEqual(set(rows), {"A-1", "B-2", "C-3", "D-4", "E-5"})     # продажи, остатки и справочник
         a = rows["A-1"]
         self.assertEqual((a["sold"], a["revenue"], a["marketplaces"]), (24, 10000, ["Ozon", "Wildberries"]))
+        self.assertAlmostEqual(a["buyout"], 100.0)
         self.assertEqual(a["profit"], 10000 - 800 - 2400)                   # без хранения без артикула; себест. 24 × 100
         self.assertEqual(a["stock"], 3 + 2)                                 # FBO Ozon + свой склад один раз (больший: 2)
         self.assertEqual((a["abc_revenue"], a["abc"]), ("A", "ABA"))     # 71% выручки, 86% штук, 64% прибыли
@@ -112,7 +116,7 @@ class AbcExportApiTests(unittest.TestCase):
         from openpyxl import load_workbook
 
         from app import main
-        rows = [{"key": k, "article": k, "brand": "", "category": "", "name": "", "marketplaces": ["Ozon"], "sold": 1, "revenue": 1,
+        rows = [{"key": k, "article": k, "brand": "", "category": "", "name": "", "marketplaces": ["Ozon"], "sold": 1, "buyout": 100.0, "revenue": 1,
                  "share": 1, "cum_share": 1, "abc_revenue": "A", "abc_turnover": "A", "abc_profit": "A", "abc": "AAA", "group": "A", "profit": 1,
                  "stock": 0, "unit_cost": None, "stock_cost": None, "per_day": 0, "days_left": 0, "status": "Нет остатка", "restock": 0}
                 for k in ("A-1", "B-2", "C-3")]
@@ -122,6 +126,7 @@ class AbcExportApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertIn("abc_2026-10-01_2026-10-30_filtered.xlsx", r.headers["content-disposition"])
         ws = load_workbook(io.BytesIO(r.content)).active
+        self.assertEqual(ws.cell(1, 7).value, "Процент выкупа, %")
         self.assertEqual([row[2] for row in ws.iter_rows(min_row=2, values_only=True)], ["C-3", "A-1"])   # порядок экрана, без лишних
 
 

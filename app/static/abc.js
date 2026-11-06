@@ -18,7 +18,7 @@ window.WBOPSAbc = (() => {
   const COLS = [
     ['brand', 'Бренд', r => esc(r.brand), 'l'], ['category', 'Категория', r => esc(r.category), 'l'],
     ['article', 'Артикул', r => `<b>${esc(r.article)}</b>`, 'l'], ['name', 'Наименование', r => `<span class="ab-name" title="${esc(r.name)}">${esc(r.name)}</span>`, 'l'],
-    ['sold', 'Продажи, шт', r => num(r.sold)], ['revenue', 'Выручка, ₽', r => rub(r.revenue)], ['share', 'Доля выручки', r => pct(r.share)],
+    ['sold', 'Продажи, шт', r => num(r.sold)], ['buyout', 'Процент выкупа', r => pct(r.buyout)], ['revenue', 'Выручка, ₽', r => rub(r.revenue)], ['share', 'Доля выручки', r => pct(r.share)],
     ['cum_share', 'Накоп. доля', r => pct(r.cum_share)],
     ['abc_revenue', 'ABC выручка', r => badge(r.abc_revenue), 'c'], ['abc_turnover', 'ABC оборач.', r => badge(r.abc_turnover), 'c'],
     ['abc_profit', 'ABC прибыль', r => badge(r.abc_profit), 'c'], ['abc', 'ABC', r => `<b>${esc(r.abc)}</b>`, 'c'], ['group', 'Группа', r => badge(r.group), 'c'],

@@ -61,6 +61,7 @@ from app.services.penalties import Penalties
 from app.services.ads import AdsAnalytics
 from app.services.planfact import PlanFact, PlanFactError
 from app.services.abtests import ABError, ABTests
+from app.services.ab_hypotheses import ABHypothesisError, ABHypotheses, PRIMARY_METRICS
 from app.services.transfer.service import TransferService
 from pydantic import BaseModel, Field
 from app.storage import DraftStore
@@ -68,7 +69,7 @@ from app.storage import DraftStore
 settings = get_settings()
 STATIC_DIR = Path(__file__).parent / "static"
 DASHBOARD_FILE = STATIC_DIR / "dashboard.html"
-DASHBOARD_PAGES = ("workspace", "abc", "products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "notifications", "team", "complaints", "nomenclature", "dashboard", "dashboard-ozon", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads", "planfact", "ab")
+DASHBOARD_PAGES = ("workspace", "abc", "products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "notifications", "team", "complaints", "nomenclature", "dashboard", "dashboard-ozon", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads", "planfact", "ab", "hypotheses")
 DASHBOARD_PATHS = {"/", *(f"/{page}" for page in DASHBOARD_PAGES)}
 app = FastAPI(
     title=settings.app_name,
@@ -402,7 +403,7 @@ async def inject_knowledge_workspace(request: Request, call_next):
     body = b"".join([chunk async for chunk in response.body_iterator])
     html = body.decode("utf-8")
     if request.url.path in DASHBOARD_PATHS:
-        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "fbs_ozon.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "home.js", "abc.js", "router.js", "knowledge.js"))
+        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "fbs_ozon.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "hypotheses.js", "home.js", "abc.js", "router.js", "knowledge.js"))
         html = html.replace("</body>", scripts + "</body>")
     return Response(content=html, status_code=response.status_code, headers={"content-type": "text/html; charset=utf-8"})
 
@@ -2160,6 +2161,30 @@ def nomenclature_bulk(value: dict) -> dict[str, object]:
     return {"updated": done}
 
 
+@app.post("/api/nomenclature/fill-missing-cost")
+def nomenclature_fill_missing_cost() -> dict[str, object]:
+    """Установить 1000 ₽ только артикулам без действующей себестоимости."""
+    _nomenclature_guard()
+    try:
+        done = nomenclature.fill_missing_cost(1000)
+    except NomenclatureError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("cost_missing_filled", details=f"count={done};cost=1000")
+    return {"updated": done, "cost": 1000}
+
+
+@app.post("/api/nomenclature/set-prep-all")
+def nomenclature_set_prep_all() -> dict[str, object]:
+    """Установить подготовку 85 ₽ всем артикулам справочника."""
+    _nomenclature_guard()
+    try:
+        done = nomenclature.set_prep_all(85)
+    except NomenclatureError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("prep_all_updated", details=f"count={done};prep=85")
+    return {"updated": done, "prep": 85}
+
+
 @app.post("/api/nomenclature/import")
 async def nomenclature_import(file: UploadFile = File(...)) -> dict[str, object]:
     """Единый справочник себестоимости и подготовки из Excel/CSV — один на все кабинеты и юрлица."""
@@ -2354,13 +2379,13 @@ def abc_export_selected(value: dict) -> Response:
 
 
 def _abc_export(d: dict, date_from: str, date_to: str, format: str, suffix: str = "") -> Response:
-    rows = [["Бренд", "Категория", "Артикул", "Наименование", "Маркетплейсы", f"Продажи {d['days']} дн, шт", f"Выручка {d['days']} дн, ₽",
+    rows = [["Бренд", "Категория", "Артикул", "Наименование", "Маркетплейсы", f"Продажи {d['days']} дн, шт", "Процент выкупа, %", f"Выручка {d['days']} дн, ₽",
              "Доля выручки, %", "Накопительная доля, %", "ABC (выручка)", "ABC (оборачиваемость)", "ABC (прибыль)", "ABC", "Группа",
              "Прибыль, ₽", "Остаток, шт", "Себестоимость ед., ₽", "Себестоимость остатка, ₽", "Продажи в день, шт", "Запас, дн",
              "Статус", f"Подсорт ({abc_module.RESTOCK_DAYS} дн), шт"]]
     for r in d["rows"]:
         rows.append([r["brand"], r["category"], r["article"], r["name"], ", ".join(r["marketplaces"]), round(r["sold"], 2),
-                     round(r["revenue"], 2), round(r["share"], 2), round(r["cum_share"], 2), r["abc_revenue"], r["abc_turnover"],
+                     None if r["buyout"] is None else round(r["buyout"], 2), round(r["revenue"], 2), round(r["share"], 2), round(r["cum_share"], 2), r["abc_revenue"], r["abc_turnover"],
                      r["abc_profit"], r["abc"], r["group"], round(r["profit"], 2), round(r["stock"], 2), r["unit_cost"],
                      None if r["stock_cost"] is None else round(r["stock_cost"], 2), round(r["per_day"], 2), r["days_left"],
                      r["status"], r["restock"]])
@@ -3432,6 +3457,7 @@ async def planfact_test() -> dict[str, object]:
 
 # ---------------------------------------------------------------- A/B-тесты главного фото
 abtests = ABTests(draft_store, _rnp_tokens, Path(__file__).resolve().parent.parent / "data" / "ab")
+ab_hypotheses = ABHypotheses(draft_store, _rnp_tokens, card_loader=abtests.card, runner=abtests)
 
 
 def _campaign_status(advert_id):
@@ -3563,6 +3589,121 @@ async def ab_finish(test_id: int, body: ABFinish) -> dict[str, object]:
 def ab_delete(test_id: int) -> dict[str, object]:
     _ab(abtests.delete, test_id)
     return {"deleted": True}
+
+
+# ---------------------------------------------------------------- A/B-тесты Гипотезы (изолированный безопасный workflow)
+def _abh(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except ABHypothesisError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/ab-hypotheses")
+def ab_hypotheses_list() -> dict[str, object]:
+    with draft_store._connect() as c:
+        try:
+            campaigns = [{"id": r[0], "name": r[1], "status": r[2], "payment_type": r[3], "account": r[4],
+                          "nms": [n.get("nm_id") for n in json.loads(r[5] or "[]") if isinstance(n, dict)]}
+                         for r in c.execute("SELECT id,name,status,payment_type,account,nms FROM ads_campaigns ORDER BY account,name")]
+        except Exception:
+            campaigns = []
+    cabinets = [{"id": c.id, "name": c.name} for c in configured_cabinets() if c.marketplace == "wildberries" and c.enabled]
+    return {"hypotheses": ab_hypotheses.list(), "campaigns": campaigns, "cabinets": cabinets,
+            "metrics": list(PRIMARY_METRICS), "has_tokens": bool(_rnp_tokens())}
+
+
+@app.get("/api/ab-hypotheses/preflight")
+def ab_hypotheses_preflight(nm: int, advert: int, account: str = "") -> dict[str, object]:
+    return _abh(ab_hypotheses.preflight, nm, advert, account or None)
+
+
+@app.get("/api/ab-hypotheses/card")
+def ab_hypotheses_card(nm: int, account: str = "") -> dict[str, object]:
+    return _abh(ab_hypotheses._card, nm, account or None)
+
+
+class ABHypothesisCreate(BaseModel):
+    nm_id: int
+    advert_id: int
+    hypothesis: str = Field(min_length=3, max_length=2000)
+    owner: str = Field(min_length=1, max_length=200)
+    account: str = ""
+    primary_metric: str = "ctr"
+    guardrails: dict[str, object] = Field(default_factory=dict)
+    variants: list[dict[str, object]] = Field(default_factory=list, max_length=20)
+    mde: float = Field(default=10, gt=0, le=100)
+    power: float = Field(default=80, ge=50, le=99.9)
+    alpha: float = Field(default=5, gt=0, le=20)
+    min_days: float = Field(default=7, ge=1, le=365)
+    min_views: float = Field(default=5000, ge=100, le=100000000)
+    max_days: float = Field(default=30, ge=1, le=365)
+
+
+@app.post("/api/ab-hypotheses")
+async def ab_hypotheses_create(body: ABHypothesisCreate) -> dict[str, object]:
+    result = await asyncio.to_thread(_abh, ab_hypotheses.create, **body.model_dump())
+    draft_store.audit("ab_hypothesis_create", details=f"id={result['id']};nm={body.nm_id}")
+    return result
+
+
+@app.get("/api/ab-hypotheses/{hypothesis_id}")
+def ab_hypotheses_detail(hypothesis_id: int) -> dict[str, object]:
+    return _abh(ab_hypotheses.detail, hypothesis_id)
+
+
+@app.get("/api/ab-hypotheses/{hypothesis_id}/report")
+def ab_hypotheses_report(hypothesis_id: int) -> dict[str, object]:
+    """Отчёт гипотезы: те же данные detail в стабильной ручке отчётности."""
+    return _abh(ab_hypotheses.detail, hypothesis_id)
+
+
+@app.post("/api/ab-hypotheses/{hypothesis_id}/start")
+async def ab_hypotheses_start(hypothesis_id: int) -> dict[str, object]:
+    result = await asyncio.to_thread(_abh, ab_hypotheses.start, hypothesis_id)
+    draft_store.audit("ab_hypothesis_start", details=f"id={hypothesis_id}")
+    return result
+
+
+class ABHypothesisPause(BaseModel):
+    reason: str = "Пауза вручную"
+
+
+@app.post("/api/ab-hypotheses/{hypothesis_id}/pause")
+async def ab_hypotheses_pause(hypothesis_id: int, body: ABHypothesisPause | None = None) -> dict[str, object]:
+    return await asyncio.to_thread(_abh, ab_hypotheses.pause, hypothesis_id, (body or ABHypothesisPause()).reason)
+
+
+class ABHypothesisFinish(BaseModel):
+    decision_note: str = ""
+    winner_variant: int | None = None
+    force: bool = False
+
+
+@app.post("/api/ab-hypotheses/{hypothesis_id}/finish")
+async def ab_hypotheses_finish(hypothesis_id: int, body: ABHypothesisFinish) -> dict[str, object]:
+    result = await asyncio.to_thread(_abh, ab_hypotheses.finish, hypothesis_id, body.decision_note, body.winner_variant, body.force)
+    draft_store.audit("ab_hypothesis_finish", details=f"id={hypothesis_id}")
+    return result
+
+
+class ABHypothesisDecision(BaseModel):
+    reason: str = Field(min_length=3, max_length=2000)
+
+
+@app.post("/api/ab-hypotheses/{hypothesis_id}/no-decision")
+async def ab_hypotheses_no_decision(hypothesis_id: int, body: ABHypothesisDecision) -> dict[str, object]:
+    result = await asyncio.to_thread(_abh, ab_hypotheses.no_decision, hypothesis_id, body.reason)
+    draft_store.audit("ab_hypothesis_no_decision", details=f"id={hypothesis_id}")
+    return result
+
+
+@app.post("/api/ab-hypotheses/{hypothesis_id}/rollback")
+async def ab_hypotheses_rollback(hypothesis_id: int, body: ABHypothesisDecision | None = None) -> dict[str, object]:
+    reason = (body.reason if body else "Откат к исходной карточке")
+    result = await asyncio.to_thread(_abh, ab_hypotheses.rollback, hypothesis_id, reason)
+    draft_store.audit("ab_hypothesis_rollback", details=f"id={hypothesis_id}")
+    return result
 
 
 @app.get("/api/finance/update")

@@ -64,7 +64,9 @@ window.WBOPSStocks = (() => {
   function visible() {
     const f = st.f, q = f.q.trim().toLowerCase();
     const whs = whList();
-    const wh = whs.some(w => String(w.id) === String(f.warehouse)) ? String(f.warehouse) : String(whs[0]?.id ?? '');
+    // Пустой выбор означает все склады. Раньше он автоматически подменялся
+    // первым складом, поэтому остальные склады нельзя было показать вместе.
+    const wh = whs.some(w => String(w.id) === String(f.warehouse)) ? String(f.warehouse) : '';
     const rows = st.data.rows.filter(r => (!f.cabinet || r.cabinet_id === f.cabinet) && (!wh || String(r.warehouse_id) === wh)
       && (!f.brand || r.brand === f.brand) && (!f.category || r.category === f.category)
       && (!q || `${r.vendor} ${r.nm_id} ${r.title} ${r.barcode} ${r.size} ${r.ru_size}`.toLowerCase().includes(q))
@@ -110,7 +112,7 @@ window.WBOPSStocks = (() => {
       ${notifyBanner(n, cfg)}
       <div class="db-filters sk-filters">
         ${d.cabinets.length > 1 ? `<select data-f="cabinet" aria-label="Магазин">${opt('', 'Все магазины', f.cabinet)}${d.cabinets.map(c => opt(c.id, c.name, f.cabinet)).join('')}</select>` : ''}
-        ${whs.length > 1 ? `<select data-f="warehouse" aria-label="Склад">${whs.map(w => opt(w.id, w.name, wh)).join('')}</select>` : ''}
+        ${whs.length > 1 ? `<select data-f="warehouse" aria-label="Склад">${opt('', 'Все склады', wh)}${whs.map(w => opt(w.id, w.name, wh)).join('')}</select>` : ''}
         <select data-f="brand" aria-label="Бренд">${opt('', 'Все бренды', f.brand)}${brands.map(b => opt(b, b, f.brand)).join('')}</select>
         <select data-f="category" aria-label="Категория">${opt('', 'Все категории', f.category)}${cats.map(b => opt(b, b, f.category)).join('')}</select>
         <input type="search" data-f="q" placeholder="Артикул, баркод, размер" value="${esc(f.q)}" aria-label="Поиск">
