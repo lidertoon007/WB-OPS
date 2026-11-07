@@ -3594,6 +3594,13 @@ async def ab_exclude(test_id: int, variant_id: int) -> dict[str, object]:
     return await asyncio.to_thread(_ab, abtests.exclude, test_id, variant_id)
 
 
+@app.post("/api/ab/tests/{test_id}/variants/{variant_id}/switch")
+async def ab_switch_variant(test_id: int, variant_id: int) -> dict[str, object]:
+    result = await asyncio.to_thread(_ab, abtests.switch_variant, test_id, variant_id)
+    draft_store.audit("ab_switch", details=f"test={test_id}; variant={variant_id}")
+    return result
+
+
 class ABFinish(BaseModel):
     winner_id: int | None = None
     remove_uploaded: bool = True

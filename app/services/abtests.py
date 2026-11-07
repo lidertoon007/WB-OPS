@@ -699,14 +699,21 @@ class ABTests:
                 out.append(v["id"])
         return out
 
-    def _switch(self, test_id: int) -> None:
+    def _switch(self, test_id: int, variant_id: int | None = None) -> None:
         with self.store._connect() as c:
             t = self._test(c, test_id)
             vs = [v for v in self._variants(c, test_id) if not v["excluded"]]
         if not vs:
             return
-        others = [v for v in vs if v["id"] != t["current_variant"]] or vs
-        nxt = min(others, key=lambda v: (v["views"], v["turns"], v["position"]))
+        if variant_id is None:
+            others = [v for v in vs if v["id"] != t["current_variant"]] or vs
+            nxt = min(others, key=lambda v: (v["views"], v["turns"], v["position"]))
+        else:
+            nxt = next((v for v in vs if v["id"] == int(variant_id)), None)
+            if not nxt:
+                raise ABError("Вариант не найден или исключён")
+            if nxt["id"] == t["current_variant"]:
+                raise ABError("Этот вариант уже стоит главным")
         cur = next((v for v in vs if v["id"] == t["current_variant"]), None)
         token, _ads = self._token(t["account"])
         card = self.card(t["nm_id"], t["account"])
@@ -722,6 +729,26 @@ class ABTests:
             c.execute("UPDATE ab_variants SET turns=turns+1 WHERE id=?", (nxt["id"],))
             c.execute("UPDATE ab_tests SET current_variant=?, switched_at=?, views_at_switch=0 WHERE id=?", (nxt["id"], now_iso(), test_id))
             self.log(c, test_id, "switch", f"Главным поставлено: {nxt['label']}", nxt["id"])
+
+    def switch_variant(self, test_id: int, variant_id: int) -> dict:
+        """Принудительно поставить вариант главным и продолжить тот же тест."""
+        with self.store._connect() as c:
+            t = self._test(c, test_id)
+            if t["status"] not in ("running", "paused", "auto_paused"):
+                raise ABError("Переключение доступно только для запущенного или приостановленного теста")
+            variants = self._variants(c, test_id)
+            target = next((v for v in variants if v["id"] == int(variant_id)), None)
+            if not target:
+                raise ABError("Вариант не найден")
+            if target["excluded"]:
+                raise ABError("Нельзя переключиться на исключённый вариант")
+            if target["id"] == t["current_variant"]:
+                raise ABError("Этот вариант уже стоит главным")
+        self._collect(test_id)
+        self._switch(test_id, int(variant_id))
+        with self.store._connect() as c:
+            self.log(c, test_id, "manual_switch", f"Ручное переключение на: {target['label']}", int(variant_id))
+        return self.detail(test_id)
 
     def tick(self, campaign_status=lambda advert_id: None) -> None:
         """Раз в несколько минут: пауза/продолжение по кампании, сбор статистики, вердикт, смена фото, завершение."""

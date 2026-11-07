@@ -123,6 +123,18 @@ class ABTestsTests(unittest.TestCase):
         self.ab.delete(tid)
         self.assertEqual(self.ab.list(), [])
 
+    def test_manual_switch_keeps_test_running_and_collects_data(self):
+        t = self.ab.create(111, 77, [1], mode="views", views_per_step=1000)
+        tid = t["id"]
+        started = self.ab.start(tid)
+        target = next(v for v in started["variants"] if v["url"] == "https://wb/p2.jpg")
+        d = self.ab.switch_variant(tid, target["id"])
+        self.assertEqual(d["status"], "running")
+        self.assertEqual(self.wb.photos[0], "https://wb/p2.jpg")
+        control = next(v for v in d["variants"] if v["position"] == 0)
+        self.assertGreater(control["views"], 0)
+        self.assertEqual(next(v for v in d["variants"] if v["id"] == target["id"])["is_current"], True)
+
     def test_cluster_report_includes_extra_received_phrases(self):
         t = self.ab.create(111, 77, [1], mode="clusters", views_per_step=1000, clusters=["Selected"])
         d = self.ab.start(t["id"])
