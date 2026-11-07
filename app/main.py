@@ -2019,7 +2019,8 @@ def sync_opiu_keys(project) -> dict[str, int]:
     return finance.sync_accounts(project, configured_cabinets())
 
 
-def start_finance_report(project, mode: str, marketplace: str | None = None) -> dict[str, object]:
+def start_finance_report(project, mode: str, marketplace: str | None = None,
+                         cabinet: str | None = None) -> dict[str, object]:
     """Пересборка ОПиУ: сначала ключи API из кабинетов панели — в конфиги расчёта, потом запуск."""
     synced = sync_opiu_keys(project)
     titles = {"wildberries": "WB", "ozon": "Ozon", "yandex": "Я.Маркет"}
@@ -2027,7 +2028,7 @@ def start_finance_report(project, mode: str, marketplace: str | None = None) -> 
             if synced else "В кабинетах панели нет ключей API — расчёт возьмёт ключи из своих конфигов")
     if synced and not any(synced.values()):
         note += " (сбор статистики и продаж выключен во всех кабинетах)"
-    return finance_runner.start(project, finance_settings()["python"] or finance.default_python(), mode, note, marketplace)
+    return finance_runner.start(project, finance_settings()["python"] or finance.default_python(), mode, note, marketplace, cabinet)
 
 
 @app.get("/api/finance/settings")
@@ -2064,7 +2065,27 @@ def finance_report(cabinet: str = "") -> dict[str, object]:
     except finance.FinanceError as exc:
         raise HTTPException(500, str(exc)) from exc
     data["cabinets"] = finance.cabinet_options(data["cabinets"], project, configured_cabinets())
-    return {**data, "project_dir": str(project)}
+    # Status is persisted by ReportRunner, so the UI can explain partial/cache/API runs
+    # even after the activity panel has disappeared or the process restarted.
+    raw_status = finance_runner.status()
+    known_names = {c.name for c in configured_cabinets() if c.token}
+    run_status = {**raw_status, "cabinets": {
+        k: dict(v) for k, v in (raw_status.get("cabinets") or {}).items() if k in known_names
+    }}
+    seen = run_status.setdefault("cabinets", {})
+    reported = {(c.get("marketplace"), c.get("cabinet")) for c in data.get("cabinets", [])}
+    for c in configured_cabinets():
+        if not c.token:
+            continue
+        key = c.name
+        if key in seen:
+            continue
+        mp = finance.REPORT_MP.get(c.marketplace, c.marketplace)
+        if (mp, c.name) in reported:
+            seen[key] = {"status": "complete", "message": "Есть лист кабинета в отчёте"}
+        else:
+            seen[key] = {"status": "skipped", "message": "Кабинет отсутствует в отчёте"}
+    return {**data, "project_dir": str(project), "finance_status": run_status}
 
 
 @app.get("/api/finance/report/download")
@@ -3720,12 +3741,23 @@ async def finance_update(request: Request) -> dict[str, object]:
     marketplace = (payload or {}).get("marketplace")
     if marketplace not in (None, "wb", "ym", "ozon"):
         raise HTTPException(400, "marketplace: wb, ym или ozon")
+    cabinet = str((payload or {}).get("cabinet") or "").strip() or None
+    if cabinet:
+        known = {str(c.id).casefold(): c for c in configured_cabinets()}
+        known.update({str(c.name).casefold(): c for c in configured_cabinets()})
+        if cabinet.casefold() not in known:
+            raise HTTPException(400, f"Кабинет «{cabinet}» не найден")
+        selected = known[cabinet.casefold()]
+        cabinet = selected.name
+        if marketplace is None:
+            marketplace = {"wildberries": "wb", "yandex": "ym", "ozon": "ozon"}.get(selected.marketplace)
     project = finance_project()
     try:
-        result = start_finance_report(project, mode, marketplace)
+        result = start_finance_report(project, mode, marketplace, cabinet)
     except finance.FinanceError as exc:
         raise HTTPException(409, str(exc)) from exc
-    draft_store.audit("finance_update_started", details=mode + (f" ({marketplace})" if marketplace else ""))
+    scope = "; cabinet=" + cabinet if cabinet else ""
+    draft_store.audit("finance_update_started", details=mode + (f" ({marketplace})" if marketplace else "") + scope)
     return result
 
 

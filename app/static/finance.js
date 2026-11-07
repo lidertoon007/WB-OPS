@@ -25,6 +25,12 @@ window.WBOPSFinance = (() => {
       ${[...groups].map(([g, list]) => `<optgroup label="${esc(g)}">${list.map(c => opt(c.key, c.cabinet, flt.cabinet)).join('')}</optgroup>`).join('')}</select>`;
   }
 
+  function runCabinetSelect(cabs) {
+    const options = cabs.filter(c => c.panel_id || c.cabinet).map(c =>
+      opt(c.panel_id || c.cabinet, c.cabinet, '')).join('');
+    return options ? `<select data-f-run-cabinet class="btn secondary" aria-label="Кабинет для загрузки"><option value="">Все кабинеты</option>${options}</select>` : '';
+  }
+
   async function api(url, options) {
     const r = await fetch(url, options);
     let d = {};
@@ -46,21 +52,21 @@ window.WBOPSFinance = (() => {
       ${kpiCard('Результат по данным МП', k.mp_result?.total, share(k.mp_result?.total))}
       ${kpiCard('Себестоимость', k.cogs?.total, share(k.cogs?.total))}
       ${kpiCard('Налог', k.tax?.total, share(k.tax?.total))}
-      ${kpiCard('Прибыль', k.profit?.total, `рентабельность ${pct(k.margin?.total)}`, 'f-kpi-main')}
+      ${kpiCard('Прибыль', k.profit?.total, `${s.quality?.reliable ? 'рентабельность' : 'оценка, данные неполные'} ${pct(k.margin?.total)}`, 'f-kpi-main' + (s.quality?.reliable ? '' : ' f-kpi-warn'))}
     </div>`;
   }
 
   function renderTable(s) {
     const n = s.periods.length, from = flt.lastMonths ? Math.max(0, n - flt.lastMonths) : 0;
-    const periods = s.periods.slice(from), fc = s.forecast_title;
-    const head = `<tr><th class="f-sticky">Статья</th><th>Итого</th><th>% выр.</th>${periods.map(p => `<th>${esc(p)}</th>`).join('')}${fc ? `<th class="f-fc">${esc(fc)}</th>` : ''}</tr>`;
+    const periods = s.periods.slice(from).reverse(), fc = s.forecast_title;
+    const head = `<tr><th class="f-sticky">Статья</th><th>Итого</th><th>% выр.</th>${fc ? `<th class="f-fc">${esc(fc)}</th>` : ''}${periods.map(p => `<th>${esc(p)}</th>`).join('')}</tr>`;
     const body = s.rows.map(r => {
       if (r.kind === 'section') return `<tr class="f-section"><td class="f-sticky" colspan="${3 + periods.length + (fc ? 1 : 0)}">${esc(r.label)}</td></tr>`;
       if (r.kind === 'detail' && !flt.showDetails) return '';
       const isShare = r.kind === 'share', fmt = isShare ? pct : rub;
-      const cells = r.values.slice(from).map(v => `<td${neg(v)}>${fmt(v)}</td>`).join('');
+      const cells = r.values.slice(from).reverse().map(v => `<td${neg(v)}>${fmt(v)}</td>`).join('');
       return `<tr class="f-${r.kind}${/^ПРИБЫЛЬ/.test(r.label) ? ' f-profit' : ''}"><td class="f-sticky">${esc(r.label)}</td>
-        <td${neg(r.total)}>${fmt(r.total)}</td><td>${isShare ? '' : pct(r.pct)}</td>${cells}${fc ? `<td class="f-fc"${neg(r.forecast)}>${fmt(r.forecast)}</td>` : ''}</tr>`;
+        <td${neg(r.total)}>${fmt(r.total)}</td><td>${isShare ? '' : pct(r.pct)}</td>${fc ? `<td class="f-fc"${neg(r.forecast)}>${fmt(r.forecast)}</td>` : ''}${cells}</tr>`;
     }).join('');
     return `<div class="f-scroll"><table class="f-table">${head}${body}</table></div>`;
   }
@@ -88,12 +94,20 @@ window.WBOPSFinance = (() => {
     const box = root.querySelector('[data-f-report]');
     if (!report) return;
     const s = report.summary, problems = report.control.filter(r => r.problem);
+    const fs = report.finance_status || {}, cabs = Object.entries(fs.cabinets || {});
+    const quality = report.quality || {};
+    const statusTitle = {complete: 'полностью загружен', cache: 'из кэша', api_error: 'ошибка API', skipped: 'пропущен', loading: 'загружается', interrupted: 'прерван'};
+    const statusClass = st => st === 'complete' ? 'f-status-ok' : (st === 'cache' ? 'f-status-cache' : 'f-status-bad');
+    const activity = cabs.length ? `<div class="f-cab-status"><b>Кабинеты в последнем запуске:</b>${cabs.map(([name, c]) => `<span class="f-status ${statusClass(c.status)}"><b>${esc(name)}</b> — ${esc(statusTitle[c.status] || c.status || 'неизвестно')}${c.rows != null ? `, ${rub(c.rows)} строк` : ''}</span>`).join('')}</div>` : '';
     box.innerHTML = `
       <p class="muted">${esc(s.subtitle)} Файл: <b>${esc(report.file)}</b>, собран ${esc(report.updated_at.replace('T', ' '))}.</p>
+      ${activity}
+      ${!quality.reliable ? `<div class="f-alert"><b>Прибыль нельзя считать надёжной.</b> ${esc((quality.reasons || []).slice(0, 3).join('; '))}</div>` : ''}
       ${problems.length ? `<div class="f-alert"><b>На листе «Контроль» есть замечания (${problems.length}):</b><ul>${problems.slice(0, 6).map(p => `<li>${esc(p.marketplace)}${p.cabinet && p.cabinet !== '—' ? ' · ' + esc(p.cabinet) : ''}: ${esc(p.metric)} — ${esc(typeof p.value === 'number' ? rub(p.value) : p.value)} <i>${esc(p.status)}</i></li>`).join('')}</ul></div>` : '<div class="f-ok">Сверки сошлись, замечаний нет.</div>'}
       ${renderKpi(s)}
       <div class="f-head"><h3>ОПиУ по месяцам</h3><div class="toolbar">
         ${cabinetSelect(report.cabinets || [])}
+        ${runCabinetSelect(report.cabinets || [])}
         <label class="r-check"><input type="checkbox" data-f-details ${flt.showDetails ? 'checked' : ''}> ${flt.cabinet ? 'Расшифровка статей' : 'По маркетплейсам'}</label>
         <select data-f-months class="btn secondary"><option value="6"${flt.lastMonths === 6 ? ' selected' : ''}>Последние 6 мес.</option><option value="12"${flt.lastMonths === 12 ? ' selected' : ''}>Последние 12 мес.</option><option value="0"${!flt.lastMonths ? ' selected' : ''}>Весь период</option></select></div></div>
       ${renderTable(s)}
@@ -101,6 +115,8 @@ window.WBOPSFinance = (() => {
       <div class="f-head"><h3>Товары за период</h3><input data-f-goods-search placeholder="Поиск по артикулу"></div>
       <div data-f-goods>${renderGoods(report.goods)}</div>`;
     box.querySelector('[data-f-cabinet]').onchange = e => { flt.cabinet = e.target.value; remember(); loadReport(); };
+    const runCab = box.querySelector('[data-f-run-cabinet]');
+    if (runCab) runCab.onchange = e => { root.dataset.financeCabinet = e.target.value; };
     box.querySelector('[data-f-details]').onchange = e => { flt.showDetails = e.target.checked; remember(); renderReport(); };
     box.querySelector('[data-f-months]').onchange = e => { flt.lastMonths = Number(e.target.value); remember(); renderReport(); };
     box.querySelector('[data-f-goods-search]').oninput = e => { box.querySelector('[data-f-goods]').innerHTML = renderGoods(report.goods, e.target.value.trim()); };
@@ -127,7 +143,9 @@ window.WBOPSFinance = (() => {
     const how = {full: ' с догрузкой новых данных маркетплейсов', reload: ' с полной перезагрузкой данных маркетплейсов'};
     const scope = (st.marketplace || st.only) ? (mpTitles[st.marketplace || st.only] || ` ${st.marketplace || st.only}`) : '';
     const title = running ? `Собираю отчёт${how[st.mode] || ' из кэша'}…`
-      : st.status === 'done' ? 'Отчёт собран.' : `Сборка завершилась с ошибкой (код ${st.code}).`;
+      : st.status === 'done' ? 'Отчёт собран.'
+      : st.status === 'interrupted' ? `Сборка прервана${st.code != null ? ` (код ${st.code})` : ''}.`
+      : `Сборка завершилась с ошибкой (код ${st.code}).`;
     out.innerHTML = `<b>${esc(title.replace('маркетплейсов', 'маркетплейса' + scope))}</b><pre>${esc((st.log || []).slice(-15).join('\n'))}</pre>`;
   }
 
@@ -137,11 +155,11 @@ window.WBOPSFinance = (() => {
       const st = await api('/api/finance/update');
       showRun(st);
       if (st.status === 'running') { polling = setTimeout(poll, 2000); return; }
-      if (st.status === 'done' && root.dataset.waiting) { delete root.dataset.waiting; loadReport(); }
+      if ((st.status === 'done' || st.status === 'interrupted') && root.dataset.waiting) { delete root.dataset.waiting; loadReport(); }
     } catch (e) { polling = setTimeout(poll, 5000); }
   }
 
-  async function startUpdate(mode, only = '') {
+  async function startUpdate(mode, only = '', cabinet = '') {
     const labels = {wb: 'Wildberries', ym: 'Яндекс Маркета', ozon: 'Ozon'};
     if (mode === 'full' && only && !confirm(`Обновить данные ${labels[only] || only} через API? Для Ozon отключите VPN.`)) return;
     if (mode === 'full' && !only && !confirm('Обновить данные всех маркетплейсов через API? Для Ozon отключите VPN. Wildberries догрузит только новые недели к уже скачанным; Ozon и Яндекс Маркет загружаются целиком — это может занять до часа.')) return;
@@ -149,6 +167,7 @@ window.WBOPSFinance = (() => {
     try {
       const body = {mode};
       if (only) body.marketplace = only;
+      if (cabinet) body.cabinet = cabinet;
       const st = await api('/api/finance/update', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
       root.dataset.waiting = '1'; showRun(st); poll();
     }
@@ -189,13 +208,13 @@ window.WBOPSFinance = (() => {
         <label>Python для запуска<input name="python" placeholder="Пусто — Python из WB OPS"></label>
         <small class="muted" data-f-resolved></small><button class="btn secondary" type="submit">Сохранить</button></form></details>
       <div data-f-report></div>`;
-    root.querySelectorAll('[data-f-update]').forEach(b => b.onclick = () => startUpdate(b.dataset.fUpdate, b.dataset.fOnly || ''));
+    root.querySelectorAll('[data-f-update]').forEach(b => b.onclick = () => startUpdate(b.dataset.fUpdate, b.dataset.fOnly || '', root.dataset.financeCabinet || ''));
     loadSettings(); loadReport(); poll();
   }
 
   const style = document.createElement('style');
   style.textContent = `#finances .r-head{flex-wrap:wrap}#finances .r-head .toolbar{flex-wrap:wrap}@media(max-width:600px){#finances .r-head .btn{white-space:nowrap}}.f-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:16px 0}.f-kpi{border:1px solid #e5e7eb;border-radius:12px;padding:14px}.f-kpi small{display:block;color:#6b7280;min-height:30px}.f-kpi strong{display:block;font-size:22px;color:#111827;margin:4px 0}.f-kpi-main{border-color:#8b5cf6;background:#faf5ff}.f-kpi-main strong{color:#6d28d9}
-.f-neg,.f-kpi strong.f-neg{color:#b91c1c!important}.f-scroll{overflow-x:auto;border:1px solid #eef0f5;border-radius:10px;margin:8px 0 20px}
+.f-neg,.f-kpi strong.f-neg{color:#b91c1c!important}.f-kpi-warn{border-color:#f59e0b;background:#fffbeb}.f-kpi-warn strong{color:#b45309}.f-cab-status{display:flex;flex-wrap:wrap;gap:7px;align-items:center;padding:10px 12px;border:1px solid #e5e7eb;border-radius:10px;background:#f9fafb;margin:10px 0}.f-status{padding:4px 8px;border-radius:999px;font-size:12px}.f-status-ok{background:#dcfce7;color:#166534}.f-status-cache{background:#fef3c7;color:#92400e}.f-status-bad{background:#fee2e2;color:#991b1b}.f-scroll{overflow-x:auto;border:1px solid #eef0f5;border-radius:10px;margin:8px 0 20px}
 .f-table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}.f-table th,.f-table td{padding:7px 10px;text-align:right;border-bottom:1px solid #f1f2f6}.f-table th{background:#f9fafb;font-weight:700;position:sticky;top:0}.f-table td:first-child,.f-table th:first-child{text-align:left}
 .f-sticky{position:sticky;left:0;background:#fff;z-index:1;max-width:340px;white-space:normal}.f-table th.f-sticky{background:#f9fafb}.f-section td{background:#f3f0ff;font-weight:700;color:#5b21b6;text-align:left}.f-section .f-sticky{background:#f3f0ff}
 .f-total td{font-weight:700;background:#fffbeb}.f-total .f-sticky{background:#fffbeb}.f-profit td{background:#ecfdf5;font-weight:700}.f-profit .f-sticky{background:#ecfdf5}.f-detail td{color:#6b7280;font-size:12px}.f-detail .f-sticky{padding-left:26px}.f-share td{color:#4b5563}.f-fc{background:#fdf4ff}

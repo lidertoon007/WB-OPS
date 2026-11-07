@@ -26,4 +26,4 @@ Upload each release to `/opt/wb-ops/releases/<timestamp>`, install dependencies 
 
 ## TLS and access
 
-Use a real DNS name and a certificate before exposing the service publicly. After TLS is installed, redirect HTTP to HTTPS and add HSTS. Allow only SSH, HTTP, and HTTPS in the firewall; keep port 8000 loopback-only. Validate `nginx -t`, `systemctl is-active wb-ops`, `curl -fsS http://127.0.0.1:8000/health`, and `curl -I https://<hostname>/health` after every release.
+The bundled nginx template listens on loopback only. Access it remotely with an SSH tunnel, for example `ssh -L 8080:127.0.0.1:80 ubuntu@<server-ip>` and open `http://127.0.0.1:8080`. Use a real DNS name, TLS, and an authentication layer before changing the `listen` directives to public interfaces. Keep port 8000 loopback-only. Validate `nginx -t`, `systemctl is-active wb-ops`, `curl -fsS http://127.0.0.1:8000/health`, and `curl -fsS http://127.0.0.1/health` after every release.

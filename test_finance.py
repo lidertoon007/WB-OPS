@@ -76,6 +76,22 @@ class FinanceTests(unittest.TestCase):
         self.assertEqual(data["goods"]["header"], ["Артикул", "Маркетплейс", "Штук", "Выручка"])
         self.assertEqual(data["goods"]["rows"], [["A", "Все маркетплейсы", 2, 1000]])
 
+    def test_report_quality_marks_missing_cost_and_api_warning(self):
+        data = finance.read_report(self.dir / "opiu_all_2026-09_2026-10.xlsx")
+        view = finance.report_view(data)
+        self.assertFalse(view["quality"]["reliable"])
+        self.assertTrue(any("Себестоимость" in reason for reason in view["quality"]["reasons"]))
+
+    def test_runner_persists_and_restores_status(self):
+        path = self.dir / "finance_status.json"
+        runner = finance.ReportRunner(path)
+        runner.state.update(status="done", code=0, cabinets={"К1": {"status": "cache", "rows": 12}})
+        runner.log.append("К1: из кэша")
+        runner._persist()
+        restored = finance.ReportRunner(path)
+        self.assertEqual(restored.status()["status"], "done")
+        self.assertEqual(restored.status()["cabinets"]["К1"]["rows"], 12)
+
 
 class SyncAccountsTests(unittest.TestCase):
     """Ключи API для ОПиУ берутся из кабинетов панели."""

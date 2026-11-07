@@ -273,7 +273,9 @@ def parse_summary(ws, articles: set | None = None) -> dict:
         fc = _num(r[forecast["col"]]) if forecast and forecast["col"] < len(r) else None
         has_numbers = total is not None or any(v is not None for v in values)
         if not has_numbers:
-            if label.isupper() and len(label) > 3:   # заголовок раздела: ВЫРУЧКА, РАСХОДЫ…, ДОЛЯ ОТ ВЫРУЧКИ
+            if (label.isupper() and len(label) > 3
+                    or label.upper().startswith(("СПРАВОЧНО", "ДОЛЯ ОТ ВЫРУЧКИ"))):
+                # Заголовок раздела: ВЫРУЧКА, ДОЛЯ ОТ ВЫРУЧКИ, «СПРАВОЧНО (в итоги не входит)».
                 section = label
                 out.append({"kind": "section", "label": label})
             continue                                  # пояснения и пустые строки
@@ -402,13 +404,27 @@ def report_view(data: dict, key: str = "") -> dict:
     key: "" — все кабинеты, «Ozon» — площадка, «Ozon|Еврозоо» — кабинет. Неизвестный ключ — все кабинеты.
     """
     views = data.get("views") or {}
+    control = data.get("control") or []
+    summary_all = data.get("summary") or {}
+    kpi_all = summary_all.get("kpi") or {}
+    reasons = []
+    for row in control:
+        if row.get("problem"):
+            text = " ".join(str(row.get(x) or "") for x in ("metric", "status"))
+            if any(x in text.lower() for x in ("api", "кэш", "кеш", "нет в отч", "не ответ", "ошиб")):
+                reasons.append(f"{row.get('marketplace') or ''} {row.get('cabinet') or ''}: {text}".strip())
+    cogs = (kpi_all.get("cogs") or {}).get("total")
+    if cogs is None or cogs == 0:
+        reasons.append("Себестоимость не загружена или равна нулю")
+    quality = {"level": "reliable" if not reasons else "partial", "reliable": not reasons,
+               "reasons": reasons[:20]}
     if key not in views:
         key = ""
     out = {k: v for k, v in data.items() if k != "views"}
     goods = data["goods"]
     if not key:
         out["goods"] = {**goods, "rows": goods["rows"][:GOODS_LIMIT], "scope": "Все маркетплейсы"}
-        return {**out, "selected": ""}
+        return {**out, "selected": "", "quality": quality}
     mp, _, cab = key.partition("|")
     summary = dict(views[key])
     period = summary["subtitle"].split(". Строки")[0].rstrip(".")
@@ -419,7 +435,7 @@ def report_view(data: dict, key: str = "") -> dict:
     i_mp = goods["header"].index("Маркетплейс") if "Маркетплейс" in goods["header"] else None
     rows = [r for r in goods["rows"] if i_mp is None or r[i_mp] == mp]
     out["goods"] = {**goods, "rows": rows[:GOODS_LIMIT], "scope": mp}
-    return {**out, "selected": key}
+    return {**out, "selected": key, "quality": quality}
 
 
 _cache: dict = {}
@@ -450,17 +466,91 @@ def read_report(path: Path) -> dict:
 class ReportRunner:
     """Пересборка ОПиУ в фоне: один запуск за раз, вывод скрипта сохраняется для панели."""
 
-    def __init__(self):
+    def __init__(self, status_path: Path | None = None):
         self.lock = threading.Lock()
         self.process: subprocess.Popen | None = None
+        self.stop_requested = False
         self.log: deque[str] = deque(maxlen=400)
-        self.state = {"status": "idle", "mode": None, "marketplace": None, "started_at": None, "finished_at": None, "code": None}
+        self.status_path = Path(status_path or "data/finance_status.json")
+        self.state = {"status": "idle", "mode": None, "marketplace": None, "cabinet": None, "started_at": None,
+                      "finished_at": None, "code": None, "cabinets": {}, "warnings": []}
+        self._load_state()
+
+    def _load_state(self):
+        try:
+            saved = json.loads(self.status_path.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                self.state.update({k: saved[k] for k in self.state if k in saved})
+                self.log.extend(str(x) for x in saved.get("log", [])[-400:])
+                interrupted = self.state.get("status") == "running" or (
+                    self.state.get("status") == "error" and self.state.get("code") == -15
+                )
+                if interrupted:
+                    for item in self.state.setdefault("cabinets", {}).values():
+                        if item.get("status") == "loading":
+                            item.update(status="interrupted", message="Сборка прервана")
+                    self.state.update(status="interrupted", finished_at=time.time(), code=-15)
+                    self._persist()
+                elif self.state.get("status") == "done":
+                    selected = self.state.get("cabinet")
+                    for name, item in self.state.setdefault("cabinets", {}).items():
+                        if item.get("status") != "loading":
+                            continue
+                        if selected and name == selected and self.state.get("code") == 0:
+                            item.update(status="complete", message="Загрузка завершена")
+                        else:
+                            item.update(status="cache", message="Сохранено из кэша")
+                    self._persist()
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _persist(self):
+        payload = {**self.state, "log": list(self.log)[-400:]}
+        try:
+            self.status_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.status_path.with_suffix(self.status_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.status_path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _cabinet_line(line: str) -> tuple[str, dict] | None:
+        # Only explicit ``[кабинет]`` prefixes are cabinet events.  Generic script
+        # output (paths, timings and JSON files) must not become fake cabinet names.
+        m = re.match(r"\s*\[([^\]]+)\]", line)
+        if not m:
+            return None
+        name = m.group(1).strip()
+        if (not name or name.lower().endswith((".json", ".csv"))
+                or name.lower() in {"api", "загрузка", "данные", "времени"}):
+            return None
+        if name.lower().startswith(("api ", "загрузка", "из кэша", "данные ")):
+            name = ""
+        if not name:
+            return None
+        low = line.lower()
+        state = "loading"
+        if "429" in low or "не ответ" in low or "ошиб" in low or "error" in low:
+            state = "api_error"
+        elif "нет в отч" in low or "пропущ" in low or "skip" in low:
+            state = "skipped"
+        elif "кэш" in low or "cache" in low:
+            state = "cache"
+        elif "готов" in low or "заверш" in low or "строк" in low:
+            state = "complete"
+        rows = None
+        rm = re.search(r"(\d[\d\s]*)\s*строк", line, re.I)
+        if rm:
+            rows = int(rm.group(1).replace(" ", ""))
+        return name, {"status": state, "message": line, **({"rows": rows} if rows is not None else {})}
 
     def status(self) -> dict:
         with self.lock:
             return {**self.state, "log": list(self.log)[-60:]}
 
-    def start(self, project: Path, python: str, mode: str, note: str = "", marketplace: str | None = None) -> dict:
+    def start(self, project: Path, python: str, mode: str, note: str = "", marketplace: str | None = None,
+              cabinet: str | None = None) -> dict:
         with self.lock:
             if self.state["status"] == "running":
                 raise FinanceError("Отчёт уже собирается. Дождитесь окончания.")
@@ -472,6 +562,8 @@ class ReportRunner:
             if marketplace:
                 cache_for = ",".join(key for key in ("wb", "ym", "ozon") if key != marketplace)
                 cmd += ["--cache-for", cache_for]
+            if cabinet:
+                cmd += ["--cabinet", cabinet]
             env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
             try:
                 self.process = subprocess.Popen(cmd, cwd=project, env=env, stdout=subprocess.PIPE,
@@ -480,10 +572,13 @@ class ReportRunner:
             except OSError as exc:
                 raise FinanceError(f"Не удалось запустить Python ({cmd[0]}): {exc}") from exc
             self.log.clear()
+            self.stop_requested = False
             if note:
                 self.log.append(note)
-            self.state = {"status": "running", "mode": mode, "marketplace": marketplace,
-                          "started_at": time.time(), "finished_at": None, "code": None}
+            self.state = {"status": "running", "mode": mode, "marketplace": marketplace, "cabinet": cabinet,
+                          "started_at": time.time(), "finished_at": None, "code": None,
+                          "cabinets": {}, "warnings": []}
+            self._persist()
         threading.Thread(target=self._pump, daemon=True).start()
         return self.status()
 
@@ -494,10 +589,41 @@ class ReportRunner:
             if line:
                 with self.lock:
                     self.log.append(line)
+                    parsed = self._cabinet_line(line)
+                    if parsed:
+                        name, item = parsed
+                        self.state.setdefault("cabinets", {})[name] = {**self.state["cabinets"].get(name, {}), **item}
+                        if item["status"] in ("api_error", "skipped"):
+                            self.state.setdefault("warnings", []).append(line)
+                    self._persist()
         code = process.wait()
         with self.lock:
-            self.state.update(status="done" if code == 0 else "error", code=code, finished_at=time.time())
+            interrupted = self.stop_requested or code == -15
+            if interrupted:
+                # A terminated worker must not leave its last cabinet marked as loading.
+                for item in self.state.setdefault("cabinets", {}).values():
+                    if item.get("status") == "loading":
+                        item.update(status="interrupted", message="Сборка прервана")
+            else:
+                # A script can finish without an explicit terminal line for every
+                # cabinet.  Cache baseline entries are complete as cache; the
+                # selected scoped cabinet gets the actual run result.
+                selected = self.state.get("cabinet")
+                for name, item in self.state.setdefault("cabinets", {}).items():
+                    if item.get("status") != "loading":
+                        continue
+                    if selected and name == selected:
+                        item.update(status="complete" if code == 0 else "api_error",
+                                    message="Загрузка завершена" if code == 0 else "Ошибка API")
+                    else:
+                        item.update(status="cache", message="Сохранено из кэша")
+            self.state.update(status="interrupted" if interrupted else ("done" if code == 0 else "error"),
+                              code=code, finished_at=time.time())
+            self._persist()
 
     def stop(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
+        with self.lock:
+            process = self.process
+            if process and process.poll() is None:
+                self.stop_requested = True
+                process.terminate()

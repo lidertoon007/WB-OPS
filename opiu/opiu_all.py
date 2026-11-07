@@ -875,6 +875,50 @@ def missing_config(mp, names):
     return cfg
 
 
+def _cabinet_names(mp, selector):
+    """Return enabled account names matching a cabinet selector (name or id)."""
+    if not selector:
+        return enabled_accounts(mp)
+    wanted = {s.strip().casefold() for s in str(selector).split(",") if s.strip()}
+    try:
+        cfg = json.loads((HERE / mp["config"]).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out = []
+    for account in cfg.get("accounts") or []:
+        if not account.get("enabled", True):
+            continue
+        name = str(account.get("name") or account.get("client_id") or "")
+        account_id = str(account.get("id") or account.get("cabinet_id") or "")
+        if name.casefold() in wanted or account_id.casefold() in wanted:
+            out.append(name)
+    return out
+
+
+def _scoped_config(mp, names, tmpdir):
+    """Write a temporary config containing only selected enabled accounts."""
+    cfg = json.loads((HERE / mp["config"]).read_text(encoding="utf-8"))
+    cfg["accounts"] = [a for a in cfg.get("accounts") or []
+                       if a.get("enabled", True) and str(a.get("name") or a.get("client_id") or "") in names]
+    path = Path(tmpdir) / f"{mp['key']}_cabinet.json"
+    path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _replace_cabinets(data, extra, names):
+    """Keep cached cabinets and replace only selected cabinets with fresh data."""
+    if not extra or not extra.get("cabinets"):
+        return data
+    if data is None:
+        return extra
+    selected = set(names)
+    data["months"] = sorted(set(data.get("months") or []) | set(extra.get("months") or []))
+    for cab, payload in extra.get("cabinets", {}).items():
+        if cab in selected or not selected:
+            data.setdefault("cabinets", {})[cab] = payload
+    return data
+
+
 def run_marketplace(mp, args, tmpdir):
     """(данные, пометка для «Контроля», строки ошибок из вывода скрипта)."""
     if not (HERE / mp["script"]).exists():
@@ -885,10 +929,33 @@ def run_marketplace(mp, args, tmpdir):
     cache_for = {k.strip().lower() for k in (args.cache_for or "").split(",") if k.strip()}
     from_cache = args.from_cache or mp["key"] in cache_for
     accounts = enabled_accounts(mp)
-    data, code, errors = run_script(mp, Path(tmpdir) / f"{mp['key']}.json", from_cache, args.grain)
+    selected = _cabinet_names(mp, args.cabinet)
+    if args.cabinet and not selected:
+        return None, f"кабинет «{args.cabinet}» не найден в {mp['name']}", []
+    if args.cabinet:
+        # Start from the complete cache so other cabinets remain in the report; only the
+        # selected cabinet is ever sent to the API or refreshed.
+        data, _, errors = run_script(mp, Path(tmpdir) / f"{mp['key']}_cache.json", True, args.grain)
+        if not from_cache:
+            config = _scoped_config(mp, selected, tmpdir)
+            fresh, code, fresh_errors = run_script(mp, Path(tmpdir) / f"{mp['key']}.json", False, args.grain,
+                                                   config=config)
+            errors += [f"(API) {e}" for e in fresh_errors]
+            data = _replace_cabinets(data, fresh, selected)
+        else:
+            code = 0
+            missing = [name for name in selected if name not in ((data or {}).get("cabinets") or {})]
+            if args.fill_missing and missing:
+                config = _scoped_config(mp, missing, tmpdir)
+                fresh, code, fresh_errors = run_script(mp, Path(tmpdir) / f"{mp['key']}_api.json", False, args.grain,
+                                                       config=config)
+                errors += [f"(API) {e}" for e in fresh_errors]
+                data = _replace_cabinets(data, fresh, missing)
+    else:
+        data, code, errors = run_script(mp, Path(tmpdir) / f"{mp['key']}.json", from_cache, args.grain)
     notes = [] if code == 0 else [f"скрипт завершился с кодом {code}"]
     got = len((data or {}).get("cabinets") or {})
-    if not from_cache and got < len(accounts):
+    if not args.cabinet and not from_cache and got < len(accounts):
         # API ответил не по всем кабинетам (VPN, сбой сети, лимиты) — недостающие берём из кэша,
         # чтобы отчёт собрался целиком, и помечаем их на листе «Контроль».
         print(f"\n  {mp['name']}: из API получено кабинетов {got} из {len(accounts)} — "
@@ -898,7 +965,7 @@ def run_marketplace(mp, args, tmpdir):
         data, restored = merge_cabinets(data, cached, "Данные из кэша: API не ответил при обновлении")
         if restored:
             notes.insert(0, "API не ответил, из кэша: " + ", ".join(restored))
-    elif from_cache and args.fill_missing:
+    elif not args.cabinet and from_cache and args.fill_missing:
         missing = [a for a in accounts if a and a not in ((data or {}).get("cabinets") or {})]
         if missing:
             # Кэша по кабинету нет (новый кабинет, первая сборка на этом компьютере) — загружаем его из API.
@@ -2392,6 +2459,7 @@ def main():
     ap.add_argument("--only", help="Через запятую: ozon, wb, ym")
     ap.add_argument("--cache-for", help="Для этих маркетплейсов взять данные только из кэша (через запятую: ozon, wb, ym), "
                                         "остальные обновить из API — например, --cache-for ozon при включённом VPN")
+    ap.add_argument("--cabinet", help="Обновить только указанный кабинет (имя или id); остальные взять из кэша")
     ap.add_argument("--out", help="Путь к Excel-файлу")
     ap.add_argument("--open", action="store_true", help="Открыть готовый Excel")
     ap.add_argument("--no-unit", action="store_true", help="Не собирать файл юнит-экономики по артикулам")
