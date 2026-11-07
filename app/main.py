@@ -62,6 +62,7 @@ from app.services.ads import AdsAnalytics
 from app.services.planfact import PlanFact, PlanFactError
 from app.services.abtests import ABError, ABTests
 from app.services.ab_hypotheses import ABHypothesisError, ABHypotheses, PRIMARY_METRICS
+from app.services.card_compare import CardCompare, CardCompareError
 from app.services.transfer.service import TransferService
 from pydantic import BaseModel, Field
 from app.storage import DraftStore
@@ -69,7 +70,7 @@ from app.storage import DraftStore
 settings = get_settings()
 STATIC_DIR = Path(__file__).parent / "static"
 DASHBOARD_FILE = STATIC_DIR / "dashboard.html"
-DASHBOARD_PAGES = ("workspace", "abc", "products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "notifications", "team", "complaints", "nomenclature", "dashboard", "dashboard-ozon", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads", "planfact", "ab")
+DASHBOARD_PAGES = ("workspace", "abc", "products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "notifications", "team", "complaints", "nomenclature", "dashboard", "dashboard-ozon", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads", "planfact", "ab", "card-comparisons")
 DASHBOARD_PATHS = {"/", *(f"/{page}" for page in DASHBOARD_PAGES)}
 app = FastAPI(
     title=settings.app_name,
@@ -351,7 +352,7 @@ def process_auto_question(item: InboxItem) -> dict[str, object]:
 
 LOCAL_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
 # Только владельцу (на компьютере с WB OPS): команда, токены, ключи, финансы, резервные копии
-OWNER_ONLY = ("/api/team", "/api/admin", "/api/notifications", "/api/finance", "/api/home", "/api/abc", "/api/nomenclature", "/api/dashboard", "/api/rnp", "/api/transfer", "/api/repricer", "/api/penalties", "/api/ads", "/api/planfact", "/api/ab", "/api/settings/modules/telegram", "/docs", "/openapi.json",
+OWNER_ONLY = ("/api/team", "/api/admin", "/api/notifications", "/api/finance", "/api/home", "/api/abc", "/api/nomenclature", "/api/dashboard", "/api/rnp", "/api/transfer", "/api/repricer", "/api/penalties", "/api/ads", "/api/planfact", "/api/ab", "/api/card-comparisons", "/api/settings/modules/telegram", "/docs", "/openapi.json",
               "/api/complaint-browser")
 OWNER_ONLY_WRITE = ("/api/cabinets", "/api/ai/settings", "/api/account", "/api/settings/auto-sync")
 MEMBER_OPEN = ("/api/team/me", "/api/team/logout")
@@ -360,7 +361,7 @@ MEMBER_OPEN = ("/api/team/me", "/api/team/logout")
 def is_owner_only(path: str, method: str) -> bool:
     if path.startswith(MEMBER_OPEN):
         return False
-    if path.startswith(OWNER_ONLY) or path in ("/finances", "/nomenclature", "/dashboard", "/dashboard-ozon", "/abc", "/rnp", "/transfer", "/repricer", "/penalties", "/ads", "/planfact", "/ab"):
+    if path.startswith(OWNER_ONLY) or path in ("/finances", "/nomenclature", "/dashboard", "/dashboard-ozon", "/abc", "/rnp", "/transfer", "/repricer", "/penalties", "/ads", "/planfact", "/ab", "/card-comparisons"):
         return True
     return method not in ("GET", "HEAD") and path.startswith(OWNER_ONLY_WRITE)
 
@@ -403,7 +404,7 @@ async def inject_knowledge_workspace(request: Request, call_next):
     body = b"".join([chunk async for chunk in response.body_iterator])
     html = body.decode("utf-8")
     if request.url.path in DASHBOARD_PATHS:
-        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "fbs_ozon.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "home.js", "abc.js", "router.js", "knowledge.js"))
+        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "fbs_ozon.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "card_compare.js", "home.js", "abc.js", "router.js", "knowledge.js"))
         html = html.replace("</body>", scripts + "</body>")
     return Response(content=html, status_code=response.status_code, headers={"content-type": "text/html; charset=utf-8"})
 
@@ -2240,6 +2241,56 @@ def _opiu_wb_tokens() -> list[tuple[str, str]]:
         return [(a.get("name") or "WB", a.get("token") or "") for a in data.get("accounts", []) if a.get("enabled", True)]
     except Exception:
         return []
+
+
+card_compare = CardCompare(draft_store, _opiu_wb_tokens)
+
+
+def _card_compare(call, *args):
+    try:
+        return call(*args)
+    except (CardCompareError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class CardComparisonCreate(BaseModel):
+    title: str = "Сравнение карточек"
+    nm_ids: list[int] = Field(default_factory=list)
+
+
+class CardComparisonCards(BaseModel):
+    nm_ids: list[int] = Field(default_factory=list)
+
+
+@app.get("/api/card-comparisons")
+def card_comparisons_list() -> list[dict[str, object]]:
+    return card_compare.list()
+
+
+@app.post("/api/card-comparisons")
+async def card_comparisons_create(body: CardComparisonCreate) -> dict[str, object]:
+    return await asyncio.to_thread(_card_compare, card_compare.create, body.title, body.nm_ids)
+
+
+@app.get("/api/card-comparisons/{comparison_id}")
+async def card_comparisons_detail(comparison_id: int) -> dict[str, object]:
+    return await asyncio.to_thread(_card_compare, card_compare.detail, comparison_id)
+
+
+@app.post("/api/card-comparisons/{comparison_id}/refresh")
+async def card_comparisons_refresh(comparison_id: int) -> dict[str, object]:
+    return await asyncio.to_thread(_card_compare, card_compare.refresh, comparison_id)
+
+
+@app.post("/api/card-comparisons/{comparison_id}/cards")
+async def card_comparisons_add(comparison_id: int, body: CardComparisonCards) -> dict[str, object]:
+    return await asyncio.to_thread(_card_compare, card_compare.add, comparison_id, body.nm_ids)
+
+
+@app.delete("/api/card-comparisons/{comparison_id}")
+async def card_comparisons_delete(comparison_id: int) -> dict[str, object]:
+    await asyncio.to_thread(_card_compare, card_compare.delete, comparison_id)
+    return {"deleted": comparison_id}
 
 
 @app.post("/api/nomenclature/refresh")

@@ -15,6 +15,7 @@
     transfer:        {path: '/transfer',        title: 'Перенос карточек', sub: 'Перенос товаров между кабинетами Wildberries, Ozon и Яндекс Маркета по артикулу', show: ['transferPage']},
     'fbs-analytics': {path: '/fbs-analytics',   title: 'Аналитика FBS', sub: 'Wildberries и Ozon: статусы заказов FBS, скорость отгрузки, сроки, склады, % выкупа и скидки/штрафы за сроки', show: ['fbsPage']},
     ab:              {path: '/ab',              title: 'A/B-тесты', sub: 'Какое главное фото даёт больше кликов и корзин: варианты по очереди на живой карточке', show: ['abPage']},
+    'card-comparisons': {path: '/card-comparisons', title: 'Сравнение карточек', sub: 'Проверка характеристик, размеров и фотографий карточек WB', show: ['cardComparisonsPage']},
     abc:             {path: '/abc',             title: 'ABC-анализ', sub: 'Сегментация ассортимента по выручке, оборачиваемости и прибыли и контроль неликвида', show: ['abcPage']},
     planfact:        {path: '/planfact',        title: 'План-факт', sub: 'Планы на месяц по бизнесу и артикулам, отклонения и прогноз на конец месяца', show: ['planfactPage']},
     ads:             {path: '/ads',             title: 'Аналитика рекламы', sub: 'Расходы, ДРР, кампании, артикулы, поисковые запросы и списания WB за рекламу', show: ['adsPage']},
@@ -228,7 +229,12 @@
     if (window.WBOPSAB) window.WBOPSAB.render(s);
     else s.innerHTML = '<p class="muted">Не загрузился модуль ab.js.</p>';
   };
-  const rendered = {home: homePage, abc: abcPage, ab: abPage, planfact: planfactPage, ads: adsPage, penalties: penaltiesPage, 'fbs-analytics': fbsPage, stocks: stocksPage, repricer: repricerPage, transfer: transferPage, rnp: rnpPage, dashboard: dashboardPage, 'dashboard-ozon': ozonDashboardPage, nomenclature: nomenclaturePage, complaints: complaintsPage, reviews: reviewsPage, cabinets: settingsPage('cabinets', 'cabinets'), notifications: settingsPage('notificationsSettings', 'notifications'), team: settingsPage('team', 'team'), analytics: renderAnalytics, import: renderImport, profile: renderProfile, messengers: renderMessengers, finances: renderFinances};
+  const cardComparisonsPage = () => {
+    const s = section('cardComparisonsPage', '');
+    if (window.WBOPSCardCompare) window.WBOPSCardCompare.render(s);
+    else s.innerHTML = '<p class="muted">Не загрузился модуль сравнения карточек.</p>';
+  };
+  const rendered = {home: homePage, abc: abcPage, ab: abPage, 'card-comparisons': cardComparisonsPage, planfact: planfactPage, ads: adsPage, penalties: penaltiesPage, 'fbs-analytics': fbsPage, stocks: stocksPage, repricer: repricerPage, transfer: transferPage, rnp: rnpPage, dashboard: dashboardPage, 'dashboard-ozon': ozonDashboardPage, nomenclature: nomenclaturePage, complaints: complaintsPage, reviews: reviewsPage, cabinets: settingsPage('cabinets', 'cabinets'), notifications: settingsPage('notificationsSettings', 'notifications'), team: settingsPage('team', 'team'), analytics: renderAnalytics, import: renderImport, profile: renderProfile, messengers: renderMessengers, finances: renderFinances};
   const done = new Set();
   let applying = false;
   function apply() {
