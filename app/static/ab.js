@@ -13,6 +13,14 @@ window.WBOPSAB = (() => {
   const chip = s => `<span class="ab-st" style="--c:${(STATUS[s] || ['', '#adb5bd'])[1]}">${esc((STATUS[s] || [s])[0])}</span>`;
   const img = v => v.url || (v.has_file ? `/api/ab/file/${v.id}` : '');
   const change = (a, b, d = 2) => a == null || b == null ? '—' : `${pct(a, d)} → ${pct(b, d)}${a ? ` <small class="${b >= a ? 'pos' : 'neg'}">(${b >= a ? '+' : ''}${num((b / a - 1) * 100, 0)}%)</small>` : ''}`;
+  const strategy = t => t.mode === 'timer'
+    ? `По таймеру — смена каждые ${num(t.interval_hours, 0)} ч`
+    : t.mode === 'views'
+      ? `По показам — смена после ${num(t.views_per_step)} показов на вариант`
+      : `По кластерам — ${num(t.views_per_step)} показов на каждый выбранный кластер`;
+  const strategyNote = t => t.mode === 'clusters'
+    ? `<small>Выбрано кластеров: ${num((t.clusters || []).length)}</small><small>Дополнительные фразы с показами — только в отчёте</small>`
+    : '';
 
   async function render(section) {
     root = section;
@@ -35,10 +43,10 @@ window.WBOPSAB = (() => {
       <div class="ab-how">${[['1', 'Выберите артикул', 'и фото-варианты: из карточки или свои'], ['2', 'Привяжите кампанию', 'клики и заказы считаются на живом трафике рекламы'],
         ['3', 'Запустите', 'панель сама ставит варианты главным фото по очереди'], ['4', 'Смотрите метрики', 'худшие варианты исключаются при уверенности ≥95%, победитель встаёт на карточку']]
         .map(([n, t, s]) => `<div><b>${n}</b><span><strong>${t}</strong>${s}</span></div>`).join('')}</div>
-      ${d.tests.length ? `<div class="rnp-scroll"><table class="rnp-table fb-groups ab-table"><thead><tr><th class="l">Товар</th><th class="l">Статус</th><th class="l">Метрика</th>
+      ${d.tests.length ? `<div class="rnp-scroll"><table class="rnp-table fb-groups ab-table"><thead><tr><th class="l">Товар</th><th class="l">Статус</th><th class="l">Метрика</th><th class="l">Стратегия</th>
         <th>CTR: было → стало</th><th>Корзина: было → стало</th><th>Показы</th><th>Варианты</th><th class="l">Запущен</th></tr></thead><tbody>
         ${d.tests.map(t => `<tr class="pn-click" data-open="${t.id}"><td class="l ab-prod">${t.thumb ? `<img src="${esc(t.thumb)}" alt="" loading="lazy">` : '<i></i>'}<span><b>${esc(t.article || t.nm_id)}</b><small>${t.nm_id} · ${esc(t.title || '')}</small></span></td>
-          <td class="l">${chip(t.status)}${t.pause_reason ? `<small>${esc(t.pause_reason)}</small>` : ''}</td><td class="l">${esc(METRIC[t.metric])}<small>${t.mode === 'clusters' ? `по ${num(t.views_per_step)} показов на кластер` : t.mode === 'timer' ? 'смена по таймеру' : 'смена по показам'}</small></td>
+          <td class="l">${chip(t.status)}${t.pause_reason ? `<small>${esc(t.pause_reason)}</small>` : ''}</td><td class="l">${esc(METRIC[t.metric])}</td><td class="l"><b>${esc(strategy(t))}</b>${strategyNote(t)}</td>
           <td>${change(t.summary.control_ctr, t.summary.best_ctr)}</td><td>${change(t.summary.control_cart, t.summary.best_cart, 1)}</td><td>${num(t.summary.views)}</td>
           <td>${t.summary.alive} из ${t.variants}</td><td class="l">${dt(t.started_at)}</td></tr>`).join('')}</tbody></table></div>`
         : '<div class="rv-empty"><b>Тестов пока нет</b><p class="muted">Нажмите «Новый тест». Можно начать со второстепенного артикула.</p></div>'}
@@ -158,12 +166,12 @@ window.WBOPSAB = (() => {
   }
   function drawTest() {
     const t = st.test, s = t.summary, best = Math.max(0.0001, ...t.variants.map(v => (t.metric === 'cart' ? v.ctr_cart : v.ctr) || 0));
-    const modeText = t.mode === 'clusters' ? `по ${num(t.target_views_per_cluster || t.views_per_step)} показов на кластер` : t.mode === 'timer' ? `смена каждые ${num(t.interval_hours, 0)} ч` : `смена каждые ${num(t.views_per_step)} показов`;
+    const modeText = strategy(t);
     const actions = {draft: ['start', 'Запустить тест', 'btn'], running: ['pause', 'Пауза', 'db-ghost'], paused: ['start', 'Продолжить', 'btn'], auto_paused: ['pause', 'Пауза', 'db-ghost']};
     const a = actions[t.status];
     root.innerHTML = `<div class="db-head"><h2>${esc(t.article || t.nm_id)} <small class="muted">${t.nm_id}</small></h2><button type="button" class="db-ghost" data-back>← К списку</button></div>
       <div class="ab-top"><div>${chip(t.status)} <span class="muted">${esc(t.title || '')} · кампания ${t.advert_id} · ${esc(METRIC[t.metric])} · ${modeText} · до ${num(t.max_days)} дней</span>
-          ${t.mode === 'clusters' ? `<div class="ab-cluster-note"><b>Кластеры:</b> ${(t.clusters || []).map(esc).join(' · ')}<br><span class="muted">Фото меняются по очереди. Тест завершится, когда каждый вариант получит целевой объём показов по каждому кластеру.</span></div>` : ''}
+          <div class="ab-strategy-note"><b>Стратегия:</b> ${esc(modeText)}${t.mode === 'clusters' ? `<br><b>Выбранные кластеры:</b> ${(t.clusters || []).map(esc).join(' · ')}<br><span class="muted">Фото меняются по очереди. Дополнительные кластеры с показами попадут в отчёт и не управляют сменой фото.</span>` : ''}</div>
           ${t.pause_reason ? `<div class="db-note">${esc(t.pause_reason)}</div>` : ''}${t.next_switch ? `<div class="muted fb-sub">Следующая смена фото ${esc(t.next_switch)}</div>` : ''}</div>
         <div class="ab-actions">${a ? `<button type="button" class="${a[2]}" data-act="${a[0]}">${a[1]}</button>` : ''}
           ${['running', 'paused', 'auto_paused'].includes(t.status) ? '<button type="button" class="db-ghost" data-refresh>Обновить статистику</button>' : ''}
