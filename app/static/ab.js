@@ -6,7 +6,7 @@ window.WBOPSAB = (() => {
   const dt = s => s ? new Date(s).toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'}) : '—';
   const STATUS = {draft: ['Черновик', '#868e96'], running: ['Идёт', '#2f9e44'], paused: ['На паузе', '#f59f00'], auto_paused: ['Пауза: кампания', '#f59f00'], finished: ['Завершён', '#4c6ef5']};
   const METRIC = {ctr: 'CTR', cart: 'CTR × конверсия в корзину'};
-  const st = {view: 'list', id: null, data: null, test: null, form: null};
+  const st = {view: 'list', id: null, data: null, test: null, form: null, clusterSort: {}};
   let root = null;
   const api = async (url, opt) => { const r = await fetch(url, opt); const d = await r.json().catch(() => ({})); if (!r.ok) throw new Error(d.detail || 'Ошибка запроса'); return d; };
   const post = (url, body) => api(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})});
@@ -167,6 +167,15 @@ window.WBOPSAB = (() => {
   function drawTest() {
     const t = st.test, s = t.summary, best = Math.max(0.0001, ...t.variants.map(v => (t.metric === 'cart' ? v.ctr_cart : v.ctr) || 0));
     const modeText = strategy(t);
+    const sortKey = st.clusterSort[t.id] || 'views';
+    const clusterRows = v => {
+      const rows = [...(v.cluster_progress || [])];
+      const configured = rows.filter(p => t.mode === 'clusters' && p.configured);
+      const observed = rows.filter(p => !(t.mode === 'clusters' && p.configured));
+      const value = p => sortKey === 'ctr' ? (p.ctr == null ? -1 : Number(p.ctr)) : sortKey === 'clicks' ? Number(p.clicks || 0) : Number(p.views || 0);
+      observed.sort((a, b) => value(b) - value(a) || String(a.cluster).localeCompare(String(b.cluster), 'ru'));
+      return [...configured, ...observed];
+    };
     const actions = {draft: ['start', 'Запустить тест', 'btn'], running: ['pause', 'Пауза', 'db-ghost'], paused: ['start', 'Продолжить', 'btn'], auto_paused: ['pause', 'Пауза', 'db-ghost']};
     const a = actions[t.status];
     root.innerHTML = `<div class="db-head"><h2>${esc(t.article || t.nm_id)} <small class="muted">${t.nm_id}</small></h2><button type="button" class="db-ghost" data-back>← К списку</button></div>
@@ -190,7 +199,7 @@ window.WBOPSAB = (() => {
         <table class="fb-mini"><tr><td>Показы</td><td class="r">${num(v.views)}</td></tr><tr><td>Клики · CTR</td><td class="r">${num(v.clicks)} · <b>${pct(v.ctr)}</b></td></tr>
           <tr><td>Корзины · конверсия</td><td class="r">${num(v.atbs)} · ${pct(v.cart_cr, 1)}</td></tr><tr><td>CTR × корзина</td><td class="r">${pct(v.ctr_cart, 3)}</td></tr>
           <tr><td>Заказы</td><td class="r">${num(v.orders)}</td></tr><tr><td>Был главным</td><td class="r">${num(v.shown_hours, 1)} ч · ${v.turns} раз</td></tr></table>
-        <div class="ab-cluster-progress"><b>Кластеры и ключевые фразы</b><small class="ab-cluster-help">Показы, клики и CTR по всем фразам, которые получили показы${t.mode === 'clusters' ? '; выбранные для смены фото идут первыми.' : '.'}</small>${(v.cluster_progress || []).length ? (v.cluster_progress || []).map(p => `<div class="ab-cluster-line"><span title="${esc(p.cluster)}">${esc(p.cluster)}${p.configured ? '' : ' <em class="ab-cluster-observed">получил показы</em>'}</span><span>${p.configured ? `${num(p.views)} / ${num(p.target)}${p.done ? ' ✓' : ''}` : `${num(p.views)} показов`}</span><small>${num(p.clicks)} кликов · ${p.ctr == null ? 'CTR —' : `CTR ${pct(p.ctr)}`}</small></div>`).join('') : '<small class="ab-cluster-empty">Пока нет данных по кластерам. Нажмите «Обновить статистику» после появления показов.</small>'}</div>
+        <div class="ab-cluster-progress"><div class="ab-cluster-head"><b>Кластеры и ключевые фразы</b><label>Сортировка<select data-cluster-sort aria-label="Сортировка кластеров"><option value="views" ${sortKey === 'views' ? 'selected' : ''}>Показы</option><option value="ctr" ${sortKey === 'ctr' ? 'selected' : ''}>CTR</option><option value="clicks" ${sortKey === 'clicks' ? 'selected' : ''}>Клики</option></select></label></div><small class="ab-cluster-help">Показы, клики и CTR по всем фразам, которые получили показы${t.mode === 'clusters' ? '; выбранные для смены фото идут первыми.' : '.'}</small><div class="ab-cluster-scroll">${(v.cluster_progress || []).length ? clusterRows(v).map(p => `<div class="ab-cluster-line"><span title="${esc(p.cluster)}">${esc(p.cluster)}${p.configured ? '' : ' <em class="ab-cluster-observed">получил показы</em>'}</span><span>${p.configured ? `${num(p.views)} / ${num(p.target)}${p.done ? ' ✓' : ''}` : `${num(p.views)} показов`}</span><small>${num(p.clicks)} кликов · ${p.ctr == null ? 'CTR —' : `CTR ${pct(p.ctr)}`}</small></div>`).join('') : '<small class="ab-cluster-empty">Пока нет данных по кластерам. Нажмите «Обновить статистику» после появления показов.</small>'}</div></div>
         <small class="muted">${v.excluded ? esc(v.excluded_reason || '') : v.confidence_worse != null ? `Вероятность, что хуже лидера: ${num(v.confidence_worse, 0)}%` : v.needs_views ? `До вердикта ещё ${num(v.needs_views)} показов` : ''}</small>
         <div class="ab-vact">${t.status === 'draft' && v.position > 0 ? `<button type="button" class="db-ghost" data-rm="${v.id}">Убрать</button>` : ''}
           ${['running', 'paused', 'auto_paused'].includes(t.status) && !v.excluded ? `<button type="button" class="db-ghost" data-ex="${v.id}">Исключить</button><button type="button" class="db-ghost" data-win="${v.id}">Сделать победителем</button>` : ''}</div>
@@ -199,6 +208,7 @@ window.WBOPSAB = (() => {
       <p class="muted rp-note">${t.mode === 'clusters' ? 'По каждому кластеру сохраняются отдельные показы, клики и CTR. После завершения целевого объёма победитель определяется по суммарному CTR выбранных кластеров.' : 'Вариант исключается, когда с уверенностью ≥95% видно, что он хуже лидера, и у него не меньше 1000 показов.'} Если кампания остановится, тест встанет на паузу и продолжится с того же места.
         По завершении лучшее фото станет главным, а ваши загруженные фото-проигравшие будут убраны из карточки.</p>`;
     root.querySelector('[data-back]').onclick = () => { st.view = 'list'; st.id = null; show(); };
+    root.querySelectorAll('[data-cluster-sort]').forEach(select => select.onchange = () => { st.clusterSort[t.id] = select.value; drawTest(); });
     const act = (url, body, confirmText) => async e => {
       if (confirmText && !confirm(confirmText)) return;
       e.currentTarget.disabled = true;
@@ -251,7 +261,7 @@ window.WBOPSAB = (() => {
 .ab-bar{height:6px;background:#f1f2f4;border-radius:3px;overflow:hidden}.ab-bar i{display:block;height:100%;background:#7c3aed}
 .ab-vact{display:flex;gap:6px;flex-wrap:wrap}.ab-vact .db-ghost{font-size:12px;padding:5px 9px}
 .ab-log{max-height:260px;overflow:auto;font-size:13px;display:grid;gap:4px}
-.ab-cluster-note{margin-top:8px;padding:9px 11px;border-radius:10px;background:#f8f7ff;border:1px solid #e9e4ff;font-size:12px;line-height:1.55}.ab-cluster-progress{margin-top:4px;padding-top:8px;border-top:1px solid #f0f1f5;display:grid;gap:5px}.ab-cluster-progress>b{font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.05em}.ab-cluster-line{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:3px 8px;font-size:11px;line-height:1.25}.ab-cluster-line span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#374151}.ab-cluster-line span:nth-child(2){font-variant-numeric:tabular-nums;color:#111827}.ab-cluster-line small{grid-column:1/-1;color:#6b7280}
+.ab-cluster-note{margin-top:8px;padding:9px 11px;border-radius:10px;background:#f8f7ff;border:1px solid #e9e4ff;font-size:12px;line-height:1.55}.ab-cluster-progress{margin-top:4px;padding-top:8px;border-top:1px solid #f0f1f5;display:grid;gap:5px}.ab-cluster-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.ab-cluster-head>b{font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.05em}.ab-cluster-head label{display:flex;align-items:center;gap:5px;color:#6b7280;font-size:11px;font-weight:600}.ab-cluster-head select{height:27px;border:1px solid #e3e5ea;border-radius:7px;background:#fff;padding:0 6px;color:#374151;font:inherit}.ab-cluster-scroll{max-height:245px;overflow-y:auto;overflow-x:hidden;padding-right:4px;display:grid;gap:5px}.ab-cluster-line{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:3px 8px;font-size:11px;line-height:1.25}.ab-cluster-line span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#374151}.ab-cluster-line span:nth-child(2){font-variant-numeric:tabular-nums;color:#111827}.ab-cluster-line small{grid-column:1/-1;color:#6b7280}
 @container (max-width:1100px){.ab-product-row,.ab-settings-main{grid-template-columns:repeat(2,minmax(0,1fr))}.ab-product-row .btn{justify-self:start}.ab-settings-extra{grid-template-columns:minmax(150px,.8fr) minmax(260px,1.5fr) minmax(130px,.7fr)}}@media(max-width:900px){.ab-how{grid-template-columns:1fr 1fr}.ab-top{flex-direction:column}}@container (max-width:650px){.ab-product-row,.ab-settings-main,.ab-settings-extra{grid-template-columns:1fr}.ab-product-row .btn{width:100%;margin-top:0}}`;
   document.head.appendChild(style);
 
