@@ -50,6 +50,24 @@ class CardCompareTests(unittest.TestCase):
         self.assertFalse(result['cards'][0].get('error'))
         pause.assert_called_once()
 
+    def test_size_matrix_groups_same_international_size(self):
+        self.cards.update({
+            303: {"nmID": 303, "title": "D", "sizes": [
+                {"techSize": "30", "wbSize": "44"},
+                {"techSize": "32", "wbSize": "48"},
+            ]},
+            304: {"nmID": 304, "title": "E", "sizes": [
+                {"techSize": "30", "wbSize": "46"},
+            ]},
+            305: {"nmID": 305, "title": "F", "sizes": [
+                {"techSize": "30", "wbSize": "68"},
+            ]},
+        })
+        result = self.service.create('sizes', [303, 304, 305])
+        rows = {row['techSize']: row['values'] for row in result['size_rows']}
+        self.assertEqual(rows['30'], {'303': '44', '304': '46', '305': '68'})
+        self.assertEqual(rows['32'], {'303': '48', '304': '', '305': ''})
+
 if __name__ == '__main__': unittest.main()
 
 

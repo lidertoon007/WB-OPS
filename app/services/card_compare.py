@@ -84,6 +84,41 @@ def normalize_card(card: dict) -> dict:
             "sizes": sizes, "photos": photos}
 
 
+def size_matrix(cards: list[dict]) -> list[dict]:
+    """Group size rows by international size so cards can be compared side by side."""
+    grouped = {}
+    order = []
+    for card in cards:
+        card_key = str(card.get("nm_id") or "")
+        for item in card.get("sizes") or []:
+            if not isinstance(item, dict):
+                continue
+            tech_size = _value(item.get("techSize"))
+            if not tech_size:
+                continue
+            group_key = tech_size.casefold()
+            if group_key not in grouped:
+                grouped[group_key] = {"techSize": tech_size, "values": {}}
+                order.append(group_key)
+            wb_size = _value(item.get("wbSize"))
+            values = grouped[group_key]["values"].setdefault(card_key, [])
+            if wb_size and wb_size not in values:
+                values.append(wb_size)
+
+    rows = []
+    card_keys = [str(card.get("nm_id") or "") for card in cards]
+    for group_key in order:
+        row = grouped[group_key]
+        rows.append({
+            "techSize": row["techSize"],
+            "values": {
+                card_key: " / ".join(row["values"].get(card_key, []))
+                for card_key in card_keys
+            },
+        })
+    return rows
+
+
 class CardCompareError(Exception):
     pass
 
@@ -187,7 +222,7 @@ class CardCompare:
         for name in sorted(keys, key=str.casefold):
             rows.append({"name": name, "kind": "characteristic", "values": {str(c["nm_id"]): c.get("characteristics", {}).get(name, "") for c in cards}})
         rows.append({"name": "Габариты", "kind": "metadata", "values": {str(c["nm_id"]): c.get("dimensions", {}) for c in cards}})
-        return {**meta, "cards": cards, "rows": rows}
+        return {**meta, "cards": cards, "rows": rows, "size_rows": size_matrix(cards)}
 
     def refresh(self, comparison_id: int) -> dict:
         self._get(comparison_id)
