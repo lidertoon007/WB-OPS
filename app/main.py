@@ -69,7 +69,7 @@ from app.storage import DraftStore
 settings = get_settings()
 STATIC_DIR = Path(__file__).parent / "static"
 DASHBOARD_FILE = STATIC_DIR / "dashboard.html"
-DASHBOARD_PAGES = ("workspace", "abc", "products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "notifications", "team", "complaints", "nomenclature", "dashboard", "dashboard-ozon", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads", "planfact", "ab", "hypotheses")
+DASHBOARD_PAGES = ("workspace", "abc", "products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "notifications", "team", "complaints", "nomenclature", "dashboard", "dashboard-ozon", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads", "planfact", "ab")
 DASHBOARD_PATHS = {"/", *(f"/{page}" for page in DASHBOARD_PAGES)}
 app = FastAPI(
     title=settings.app_name,
@@ -403,7 +403,7 @@ async def inject_knowledge_workspace(request: Request, call_next):
     body = b"".join([chunk async for chunk in response.body_iterator])
     html = body.decode("utf-8")
     if request.url.path in DASHBOARD_PATHS:
-        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "fbs_ozon.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "hypotheses.js", "home.js", "abc.js", "router.js", "knowledge.js"))
+        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "fbs_ozon.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "home.js", "abc.js", "router.js", "knowledge.js"))
         html = html.replace("</body>", scripts + "</body>")
     return Response(content=html, status_code=response.status_code, headers={"content-type": "text/html; charset=utf-8"})
 
