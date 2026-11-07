@@ -6,7 +6,7 @@ window.WBOPSAB = (() => {
   const dt = s => s ? new Date(s).toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'}) : '—';
   const STATUS = {draft: ['Черновик', '#868e96'], running: ['Идёт', '#2f9e44'], paused: ['На паузе', '#f59f00'], auto_paused: ['Пауза: кампания', '#f59f00'], finished: ['Завершён', '#4c6ef5']};
   const METRIC = {ctr: 'CTR', cart: 'CTR × конверсия в корзину'};
-  const st = {view: 'list', id: null, data: null, test: null, form: null, clusterSort: {}};
+  const st = {view: 'list', id: null, data: null, test: null, form: null, clusterSort: {}, forceWinner: {}};
   let root = null;
   const api = async (url, opt) => { const r = await fetch(url, opt); const d = await r.json().catch(() => ({})); if (!r.ok) throw new Error(d.detail || 'Ошибка запроса'); return d; };
   const post = (url, body) => api(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})});
@@ -167,6 +167,10 @@ window.WBOPSAB = (() => {
   function drawTest() {
     const t = st.test, s = t.summary, best = Math.max(0.0001, ...t.variants.map(v => (t.metric === 'cart' ? v.ctr_cart : v.ctr) || 0));
     const modeText = strategy(t);
+    const availableWinner = t.variants.filter(v => !v.excluded);
+    const defaultWinner = (availableWinner.find(v => v.is_current) || availableWinner[0] || t.variants[0] || {}).id;
+    const selectedWinner = st.forceWinner[t.id] != null && t.variants.some(v => String(v.id) === String(st.forceWinner[t.id]))
+      ? String(st.forceWinner[t.id]) : String(defaultWinner ?? '');
     const sortKey = st.clusterSort[t.id] || 'views';
     const clusterRows = v => {
       const rows = [...(v.cluster_progress || [])];
@@ -186,6 +190,7 @@ window.WBOPSAB = (() => {
           ${['running', 'paused', 'auto_paused'].includes(t.status) ? '<button type="button" class="db-ghost" data-refresh>Обновить статистику</button>' : ''}
           ${t.status !== 'finished' && t.status !== 'draft' ? '<button type="button" class="db-ghost" data-finish>Завершить и поставить лучшее</button>' : ''}
           ${t.status !== 'running' ? '<button type="button" class="db-ghost ab-del" data-del>Удалить</button>' : ''}</div></div>
+      ${['running', 'paused', 'auto_paused'].includes(t.status) ? `<section class="ab-force-winner"><b>Принудительный выбор главного</b><span class="muted">Выберите фото и завершите тест сразу, даже если статистики ещё недостаточно.</span><div><select data-force-select aria-label="Фото для принудительного выбора">${t.variants.map(v => `<option value="${v.id}" ${String(v.id) === selectedWinner ? 'selected' : ''}>${esc(v.label)}${v.is_current ? ' · сейчас главное' : ''}${v.excluded ? ' · исключён' : ''}</option>`).join('')}</select><button type="button" class="btn" data-force-winner>Сделать главным и завершить</button></div></section>` : ''}
       ${t.status === 'draft' ? `<section class="tr-box ab-upload"><h3>Свои варианты фото</h3><p class="muted fb-sub">JPG, PNG или WEBP до 10 МБ, всего до 20 вариантов. При запуске они загрузятся в конец карточки, а во время теста по очереди станут главным фото.</p>
         <label class="btn ab-file">+ Добавить фото<input type="file" accept=".jpg,.jpeg,.png,.webp" multiple data-files hidden></label></section>` : ''}
       <div class="db-grid fb-grid">${[['Показы', num(s.views)], ['Клики', num(s.clicks)], ['CTR теста', pct(s.ctr)], ['Корзины', num(s.atbs)], ['Заказы', num(s.orders)]]
@@ -208,6 +213,8 @@ window.WBOPSAB = (() => {
       <p class="muted rp-note">${t.mode === 'clusters' ? 'По каждому кластеру сохраняются отдельные показы, клики и CTR. После завершения целевого объёма победитель определяется по суммарному CTR выбранных кластеров.' : 'Вариант исключается, когда с уверенностью ≥95% видно, что он хуже лидера, и у него не меньше 1000 показов.'} Если кампания остановится, тест встанет на паузу и продолжится с того же места.
         По завершении лучшее фото станет главным, а ваши загруженные фото-проигравшие будут убраны из карточки.</p>`;
     root.querySelector('[data-back]').onclick = () => { st.view = 'list'; st.id = null; show(); };
+    const forceSelect = root.querySelector('[data-force-select]');
+    if (forceSelect) forceSelect.onchange = () => { st.forceWinner[t.id] = Number(forceSelect.value); };
     root.querySelectorAll('[data-cluster-sort]').forEach(select => select.onchange = () => { st.clusterSort[t.id] = select.value; drawTest(); });
     const act = (url, body, confirmText) => async e => {
       if (confirmText && !confirm(confirmText)) return;
@@ -220,6 +227,16 @@ window.WBOPSAB = (() => {
     if (refresh) refresh.onclick = act(`/api/ab/tests/${t.id}/refresh`, {}, null);
     const fin = root.querySelector('[data-finish]');
     if (fin) fin.onclick = act(`/api/ab/tests/${t.id}/finish`, {remove_uploaded: true}, 'Завершить тест и поставить главным лучший вариант?');
+    const forceButton = root.querySelector('button[data-force-winner]');
+    if (forceButton) forceButton.onclick = async () => {
+      const winnerId = Number(forceSelect.value);
+      const winner = t.variants.find(v => v.id === winnerId);
+      if (!winner) return;
+      if (!confirm(`Принудительно поставить «${winner.label}» главным и завершить тест?`)) return;
+      forceButton.disabled = true;
+      try { st.test = await post(`/api/ab/tests/${t.id}/finish`, {winner_id: winnerId, remove_uploaded: true}); delete st.forceWinner[t.id]; drawTest(); }
+      catch (err) { alert(err.message); forceButton.disabled = false; }
+    };
     root.querySelectorAll('[data-win]').forEach(b => b.onclick = act(`/api/ab/tests/${t.id}/finish`, {winner_id: Number(b.dataset.win), remove_uploaded: true}, 'Завершить тест и поставить это фото главным?'));
     root.querySelectorAll('[data-ex]').forEach(b => b.onclick = act(`/api/ab/tests/${t.id}/variants/${b.dataset.ex}/exclude`, {}, 'Исключить вариант из теста?'));
     root.querySelectorAll('[data-rm]').forEach(b => b.onclick = async () => { try { st.test = await api(`/api/ab/tests/${t.id}/variants/${b.dataset.rm}`, {method: 'DELETE'}); drawTest(); } catch (e) { alert(e.message); } });
@@ -251,6 +268,7 @@ window.WBOPSAB = (() => {
 .ab-photos{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px}.ab-ph{border:2px solid #e5e7eb;border-radius:12px;overflow:hidden;cursor:pointer;background:#fff}
 .ab-ph.on{border-color:#7c3aed}.ab-ph img{width:100%;aspect-ratio:3/4;object-fit:cover;display:block}.ab-ph span{display:flex;gap:6px;align-items:center;padding:6px 8px;font-size:12px}
 .ab-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px}.ab-actions{display:flex;gap:8px;flex-wrap:wrap}.ab-del{color:#b42323}
+.ab-force-winner{display:grid;gap:7px;margin:-4px 0 12px;padding:11px 13px;border:1px solid #f0c36d;border-radius:11px;background:#fffaf0}.ab-force-winner>b{color:#7c4a03}.ab-force-winner>span{font-size:12px}.ab-force-winner>div{display:flex;gap:8px;flex-wrap:wrap}.ab-force-winner select{min-width:230px;height:36px;border:1px solid #e3e5ea;border-radius:8px;background:#fff;padding:0 9px;font:inherit}.ab-force-winner .btn{height:36px}
 .ab-file{display:inline-flex;cursor:pointer}
 .ab-variants{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px;margin:14px 0}
 .ab-var{border:1px solid #e5e7eb;border-radius:14px;padding:10px;background:#fff;display:flex;flex-direction:column;gap:8px}
