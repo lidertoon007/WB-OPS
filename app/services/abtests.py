@@ -417,6 +417,7 @@ class ABTests:
                     if t["mode"] == "clusters":
                         totals = self._cluster_snapshot_totals(snap, t["clusters"])
                         aggregate = {field: 0.0 for field in FIELDS}
+                        configured_keys = {norm_cluster(cluster) for cluster in t["clusters"]}
                         for cluster in t["clusters"]:
                             values = totals.get(norm_cluster(cluster), {field: 0.0 for field in FIELDS})
                             aggregate = {field: aggregate[field] + values[field] for field in FIELDS}
@@ -424,6 +425,18 @@ class ABTests:
                                       (test_id, first["id"], cluster))
                             c.execute(f"UPDATE ab_variant_clusters SET {', '.join(f'{field}=?' for field in FIELDS)} WHERE test_id=? AND variant_id=? AND cluster=?",
                                       (*[values[field] for field in FIELDS], test_id, first["id"], cluster))
+                        # Keep every observed cluster for the report.  Only the
+                        # configured clusters participate in the test target.
+                        for key, days in snap.items():
+                            if key in configured_keys:
+                                continue
+                            values = {field: sum(float(day.get(field) or 0) for day in days.values()) for field in FIELDS}
+                            if values["views"] <= 0:
+                                continue
+                            c.execute("INSERT OR IGNORE INTO ab_variant_clusters(test_id, variant_id, cluster) VALUES(?,?,?)",
+                                      (test_id, first["id"], key))
+                            c.execute(f"UPDATE ab_variant_clusters SET {', '.join(f'{field}=?' for field in FIELDS)} WHERE test_id=? AND variant_id=? AND cluster=?",
+                                      (*[values[field] for field in FIELDS], test_id, first["id"], key))
                         c.execute(f"UPDATE ab_variants SET {', '.join(f'{field}=?' for field in FIELDS)} WHERE id=?",
                                   (*[aggregate[field] for field in FIELDS], first["id"]))
                         retro_views = sum(values["views"] for values in totals.values())
@@ -591,9 +604,10 @@ class ABTests:
         with httpx.Client(timeout=120) as client:
             snap = self._cluster_stats(client, ads, t["advert_id"], t["nm_id"], since)
         configured = {norm_cluster(x): x for x in (t.get("clusters") or DEFAULT_CLUSTERS)}
+        all_keys = set(configured) | set(snap_old) | set(snap)
         delta_total = {k: 0.0 for k in FIELDS}
         merged = {key: dict(days) for key, days in snap_old.items()}
-        for key in configured:
+        for key in sorted(all_keys):
             old_days = snap_old.get(key) or {}
             new_days = snap.get(key) or {}
             merged_days = dict(old_days)
@@ -601,13 +615,15 @@ class ABTests:
                 old = old_days.get(day) or {}
                 for field in FIELDS:
                     delta = max(0.0, float(vals.get(field, 0)) - float(old.get(field, 0) or 0))
-                    delta_total[field] += delta
+                    if key in configured:
+                        delta_total[field] += delta
                 merged_days[day] = vals
             merged[key] = merged_days
         keep = (datetime.now(MSK).date() - timedelta(days=3)).isoformat()
         merged = {key: {day: vals for day, vals in days.items() if day >= keep} for key, days in merged.items()}
         with self.store._connect() as c:
-            for key, cluster_name in configured.items():
+            for key in sorted(all_keys):
+                cluster_name = configured.get(key, key)
                 vals = {k: 0.0 for k in FIELDS}
                 old_days = snap_old.get(key) or {}
                 new_days = snap.get(key) or {}
@@ -615,6 +631,13 @@ class ABTests:
                     old = old_days.get(day) or {}
                     for field in FIELDS:
                         vals[field] += max(0.0, float(current.get(field, 0)) - float(old.get(field, 0) or 0))
+                # Configured rows are kept even at zero for progress.  Extra
+                # rows are retained only once WB reports at least one view.
+                if key not in configured and vals["views"] <= 0:
+                    existing = c.execute("SELECT id FROM ab_variant_clusters WHERE test_id=? AND variant_id=? AND cluster=?",
+                                         (test_id, t["current_variant"], cluster_name)).fetchone()
+                    if not existing:
+                        continue
                 row = c.execute("SELECT id FROM ab_variant_clusters WHERE test_id=? AND variant_id=? AND cluster=?",
                                 (test_id, t["current_variant"], cluster_name)).fetchone()
                 if row:
@@ -779,15 +802,30 @@ class ABTests:
     def _cluster_progress(self, t: dict, v: dict) -> list[dict]:
         with self.store._connect() as c:
             rows = {norm_cluster(r["cluster"]): r for r in self._cluster_rows(c, t["id"], v["id"])}
+        configured = {norm_cluster(cluster): cluster for cluster in (t.get("clusters") or DEFAULT_CLUSTERS)}
         out = []
-        for cluster in t.get("clusters") or []:
-            row = rows.get(norm_cluster(cluster), {})
+        # Show configured clusters first, including zero-view rows needed to
+        # understand progress, then every additional cluster that received a
+        # view from WB.
+        for key, cluster in configured.items():
+            row = rows.get(key, {})
             views = float(row.get("views") or 0)
             clicks = float(row.get("clicks") or 0)
             out.append({"cluster": cluster, "views": round(views, 2), "clicks": round(clicks, 2),
                         "atbs": round(float(row.get("atbs") or 0), 2), "orders": round(float(row.get("orders") or 0), 2),
                         "ctr": round(clicks / views * 100, 2) if views else None,
-                        "target": float(t["views_per_step"]), "done": views >= float(t["views_per_step"])})
+                        "target": float(t["views_per_step"]), "done": views >= float(t["views_per_step"]), "configured": True})
+        for key, row in rows.items():
+            if key in configured:
+                continue
+            views = float(row.get("views") or 0)
+            if views <= 0:
+                continue
+            clicks = float(row.get("clicks") or 0)
+            out.append({"cluster": row.get("cluster") or key, "views": round(views, 2), "clicks": round(clicks, 2),
+                        "atbs": round(float(row.get("atbs") or 0), 2), "orders": round(float(row.get("orders") or 0), 2),
+                        "ctr": round(clicks / views * 100, 2) if views else None,
+                        "target": None, "done": False, "configured": False})
         return out
 
     def _variant_out(self, t, v, leader):
@@ -834,7 +872,7 @@ class ABTests:
             elif t["mode"] == "clusters":
                 current = next((v for v in vs if v["id"] == t["current_variant"]), None)
                 progress = self._cluster_progress(t, current) if current else []
-                remaining = max([max(0, p["target"] - p["views"]) for p in progress] or [0])
+                remaining = max([max(0, p["target"] - p["views"]) for p in progress if p.get("configured") and p.get("target") is not None] or [0])
                 out["next_switch"] = f"после ещё {remaining:.0f} показов в самом отстающем кластере"
             else:
                 out["next_switch"] = f"после ещё {max(0, t['views_per_step'] - (t['views_at_switch'] or 0)):.0f} показов"

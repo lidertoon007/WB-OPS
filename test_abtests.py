@@ -45,6 +45,12 @@ class FakeWB:
             today = datetime.now(MSK).date().isoformat()
             return httpx.Response(200, json=[{"advertId": 77, "days": [{"date": today, "apps": [{"appType": 1, "nms": [
                 {"nmId": 111, "views": self.cum["views"], "clicks": self.cum["clicks"], "atbs": self.cum["clicks"] / 4, "orders": 0, "sum": 0, "sum_price": 0}]}]}]}])
+        if p == "/adv/v1/normquery/stats":
+            today = datetime.now(MSK).date().isoformat()
+            return httpx.Response(200, json={"items": [{"dailyStats": [
+                {"date": today, "normQuery": "selected", "views": 120, "clicks": 12, "atbs": 3, "orders": 0, "sum": 0, "sum_price": 0},
+                {"date": today, "normQuery": "extra phrase", "views": 37, "clicks": 4, "atbs": 1, "orders": 0, "sum": 0, "sum_price": 0},
+            ]}]})
         return httpx.Response(404)
 
 
@@ -116,6 +122,20 @@ class ABTestsTests(unittest.TestCase):
         self.assertEqual(d["status"], "finished")
         self.ab.delete(tid)
         self.assertEqual(self.ab.list(), [])
+
+    def test_cluster_report_includes_extra_received_phrases(self):
+        t = self.ab.create(111, 77, [1], mode="clusters", views_per_step=1000, clusters=["Selected"])
+        d = self.ab.start(t["id"])
+        variant = d["variants"][0]
+        rows = {row["cluster"]: row for row in variant["cluster_progress"]}
+        self.assertIn("Selected", rows)
+        self.assertIn("extra phrase", rows)
+        self.assertFalse(rows["extra phrase"]["configured"])
+        self.assertEqual(rows["extra phrase"]["views"], 37)
+        self.assertEqual(rows["extra phrase"]["clicks"], 4)
+        self.assertAlmostEqual(rows["extra phrase"]["ctr"], 10.81, places=2)
+        # Extra phrases are report-only and do not affect the configured test total.
+        self.assertEqual(d["summary"]["views"], 120)
 
 
 if __name__ == "__main__":
