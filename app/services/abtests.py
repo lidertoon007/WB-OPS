@@ -404,18 +404,20 @@ class ABTests:
                         c.execute("UPDATE ab_tests SET original=?, video=? WHERE id=?", (json.dumps(card["photos"]), card["video"], test_id))
                         self.log(c, test_id, "upload", f"Загружено в карточку фото: {len(urls)}")
                 today = datetime.now(MSK).date()
-                since = today - timedelta(days=RETRO_DAYS) if t["mode"] == "clusters" else today
-                snap = self._cluster_stats(client, ads, t["advert_id"], t["nm_id"], since) if t["mode"] == "clusters" else self._stats(client, ads, t["advert_id"], t["nm_id"], since)
+                full_since = today
+                cluster_since = today - timedelta(days=RETRO_DAYS)
+                snap = self._stats(client, ads, t["advert_id"], t["nm_id"], full_since) if t["mode"] != "clusters" else {}
+                cluster_snap = self._cluster_stats(client, ads, t["advert_id"], t["nm_id"], cluster_since)
                 with self.store._connect() as c:
                     first = self._variants(c, test_id)[0]
                     c.execute("UPDATE ab_tests SET status='running', started_at=?, current_variant=?, switched_at=?, views_at_switch=0, snapshot=?, cluster_snapshot=?, pause_reason=NULL "
-                              "WHERE id=?", (now_iso(), first["id"], now_iso(), json.dumps(snap if t["mode"] != "clusters" else {}),
-                                               json.dumps(snap if t["mode"] == "clusters" else {}), test_id))
+                              "WHERE id=?", (now_iso(), first["id"], now_iso(), json.dumps(snap),
+                                               json.dumps(cluster_snap, ensure_ascii=False), test_id))
                     c.execute("UPDATE ab_variants SET turns=1 WHERE id=?", (first["id"],))
                     self.log(c, test_id, "start", "Тест запущен, первым главным стоит контроль", first["id"])
                     retro_complete = False
                     if t["mode"] == "clusters":
-                        totals = self._cluster_snapshot_totals(snap, t["clusters"])
+                        totals = self._cluster_snapshot_totals(cluster_snap, t["clusters"])
                         aggregate = {field: 0.0 for field in FIELDS}
                         configured_keys = {norm_cluster(cluster) for cluster in t["clusters"]}
                         for cluster in t["clusters"]:
@@ -427,7 +429,7 @@ class ABTests:
                                       (*[values[field] for field in FIELDS], test_id, first["id"], cluster))
                         # Keep every observed cluster for the report.  Only the
                         # configured clusters participate in the test target.
-                        for key, days in snap.items():
+                        for key, days in cluster_snap.items():
                             if key in configured_keys:
                                 continue
                             values = {field: sum(float(day.get(field) or 0) for day in days.values()) for field in FIELDS}
@@ -443,6 +445,17 @@ class ABTests:
                         if retro_views > 0:
                             self.log(c, test_id, "retro", f"Ретро-статистика текущего главного фото использована за последние {RETRO_DAYS} дней: {retro_views:.0f} показов по кластерам", first["id"])
                             retro_complete = all(values["views"] >= float(t["views_per_step"]) for values in totals.values())
+                    else:
+                        # Keep the historical cluster report for timer/views
+                        # tests without changing their aggregate metrics.
+                        for key, days in cluster_snap.items():
+                            values = {field: sum(float(day.get(field) or 0) for day in days.values()) for field in FIELDS}
+                            if values["views"] <= 0:
+                                continue
+                            c.execute("INSERT OR IGNORE INTO ab_variant_clusters(test_id, variant_id, cluster) VALUES(?,?,?)",
+                                      (test_id, first["id"], key))
+                            c.execute(f"UPDATE ab_variant_clusters SET {', '.join(f'{field}=?' for field in FIELDS)} WHERE test_id=? AND variant_id=? AND cluster=?",
+                                      (*[values[field] for field in FIELDS], test_id, first["id"], key))
                 if t["mode"] == "clusters" and retro_complete:
                     self._switch(test_id)
                     with self.store._connect() as c:
@@ -564,7 +577,11 @@ class ABTests:
             t = self._test(c, test_id)
         if t["mode"] == "clusters":
             return self._collect_clusters(test_id)
-        return self._collect_full(test_id)
+        # Aggregate campaign metrics and the independent report of search
+        # clusters.  Cluster rows are informational for timer/views modes.
+        full = self._collect_full(test_id)
+        self._collect_clusters(test_id)
+        return full
 
     def _collect_full(self, test_id: int) -> dict | None:
         """Снимок общей статистики кампании: прирост с прошлого снимка — текущему варианту."""
@@ -599,11 +616,15 @@ class ABTests:
             return None
         _token, ads = self._token(t["account"])
         snap_old = t.get("cluster_snapshot") or {}
-        since = min([date.fromisoformat(d) for days in snap_old.values() for d in days] or [datetime.now(MSK).date()])
+        # Existing tests created before cluster reporting have no snapshot;
+        # backfill the same historical window used at test creation.
+        since = min([date.fromisoformat(d) for days in snap_old.values() for d in days]
+                    or [datetime.now(MSK).date() - timedelta(days=RETRO_DAYS)])
         since = max(since, datetime.now(MSK).date() - timedelta(days=30))
         with httpx.Client(timeout=120) as client:
             snap = self._cluster_stats(client, ads, t["advert_id"], t["nm_id"], since)
-        configured = {norm_cluster(x): x for x in (t.get("clusters") or DEFAULT_CLUSTERS)}
+        configured = ({norm_cluster(x): x for x in (t.get("clusters") or DEFAULT_CLUSTERS)}
+                      if t["mode"] == "clusters" else {})
         all_keys = set(configured) | set(snap_old) | set(snap)
         delta_total = {k: 0.0 for k in FIELDS}
         merged = {key: dict(days) for key, days in snap_old.items()}
@@ -802,7 +823,8 @@ class ABTests:
     def _cluster_progress(self, t: dict, v: dict) -> list[dict]:
         with self.store._connect() as c:
             rows = {norm_cluster(r["cluster"]): r for r in self._cluster_rows(c, t["id"], v["id"])}
-        configured = {norm_cluster(cluster): cluster for cluster in (t.get("clusters") or DEFAULT_CLUSTERS)}
+        configured = ({norm_cluster(cluster): cluster for cluster in (t.get("clusters") or DEFAULT_CLUSTERS)}
+                      if t.get("mode") == "clusters" else {})
         out = []
         # Show configured clusters first, including zero-view rows needed to
         # understand progress, then every additional cluster that received a
@@ -841,8 +863,7 @@ class ABTests:
                "profit_rate": round(((v["sum_price"] or 0) - (v["spend"] or 0)) / views * 1000, 2) if views else None,
                "is_current": v["id"] == t["current_variant"], "is_winner": v["id"] == t.get("winner"),
                "has_file": bool(v["local_file"])}
-        if t.get("mode") == "clusters":
-            out["cluster_progress"] = self._cluster_progress(t, v)
+        out["cluster_progress"] = self._cluster_progress(t, v)
         if leader and leader["id"] != v["id"] and views and leader["views"]:
             z = z_better(leader, v, t["metric"])
             out["confidence_worse"] = round(min(99.9, 100 * 0.5 * (1 + math.erf((z or 0) / math.sqrt(2)))), 1) if z is not None else None

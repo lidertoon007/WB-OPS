@@ -137,6 +137,17 @@ class ABTestsTests(unittest.TestCase):
         # Extra phrases are report-only and do not affect the configured test total.
         self.assertEqual(d["summary"]["views"], 120)
 
+    def test_cluster_report_is_available_for_views_mode_without_double_counting(self):
+        t = self.ab.create(111, 77, [1], mode="views", views_per_step=1000)
+        d = self.ab.start(t["id"])
+        rows = {row["cluster"]: row for row in d["variants"][0]["cluster_progress"]}
+        self.assertIn("extra phrase", rows)
+        self.assertEqual(rows["extra phrase"]["views"], 37)
+        before = rows["extra phrase"]["views"]
+        d = self.ab.refresh(t["id"])
+        rows = {row["cluster"]: row for row in d["variants"][0]["cluster_progress"]}
+        self.assertEqual(rows["extra phrase"]["views"], before)
+
 
 if __name__ == "__main__":
     unittest.main()
