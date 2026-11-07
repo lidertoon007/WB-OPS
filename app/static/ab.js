@@ -19,7 +19,7 @@ window.WBOPSAB = (() => {
       ? `По показам — смена после ${num(t.views_per_step)} показов на вариант`
       : `По кластерам — ${num(t.views_per_step)} показов на каждый выбранный кластер`;
   const strategyNote = t => t.mode === 'clusters'
-    ? `<small>Выбрано кластеров: ${num((t.clusters || []).length)}</small><small>Дополнительные фразы с показами — только в отчёте</small>`
+    ? `<small title="${esc((t.clusters || []).join(' · '))}">Выбрано: ${esc((t.clusters || []).join(' · '))}</small><small>Дополнительные фразы с показами — только в отчёте</small>`
     : '';
 
   async function render(section) {
