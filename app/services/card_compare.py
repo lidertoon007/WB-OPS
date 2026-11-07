@@ -9,6 +9,7 @@ from typing import Callable
 import httpx
 
 CONTENT = "https://content-api.wildberries.ru"
+RATE_LIMIT_RETRIES = 4
 
 
 def _now() -> str:
@@ -75,7 +76,9 @@ def normalize_card(card: dict) -> dict:
             photos.append({"tm": item, "c246x328": item, "big": item})
         elif isinstance(item, dict):
             photos.append({"tm": item.get("tm") or "", "c246x328": item.get("c246x328") or item.get("c516x688") or item.get("big") or "", "big": item.get("big") or item.get("c516x688") or item.get("c246x328") or item.get("tm") or ""})
-    return {"nm_id": nm_id, "vendor_code": _value(card.get("vendorCode")), "title": _value(card.get("title")),
+    return {"nm_id": nm_id, "vendor_code": _value(card.get("vendorCode")),
+            "supplier_code": _value(card.get("supplierVendorCode") or card.get("supplierArticle") or card.get("supplierCode")),
+            "title": _value(card.get("title")),
             "brand": _value(card.get("brand")), "subject": _value(card.get("subjectName")),
             "description": _value(card.get("description")), "dimensions": dimensions, "characteristics": chars,
             "sizes": sizes, "photos": photos}
@@ -140,17 +143,31 @@ class CardCompare:
                 found = None
                 error = ""
                 for _name, token in available:
-                    try:
-                        response = client.post(CONTENT + "/content/v2/get/cards/list?locale=ru", headers={"Authorization": token}, json={"settings": {"cursor": {"limit": 10}, "filter": {"textSearch": str(nm_id), "withPhoto": -1}}})
-                        if response.status_code >= 400:
-                            error = f"WB ответил {response.status_code}"
-                            continue
-                        data = response.json() or {}
-                        found = next((card for card in data.get("cards") or [] if int(card.get("nmID") or 0) == nm_id), None)
-                        if found:
+                    for attempt in range(RATE_LIMIT_RETRIES):
+                        try:
+                            response = client.post(CONTENT + "/content/v2/get/cards/list?locale=ru", headers={"Authorization": token}, json={"settings": {"cursor": {"limit": 10}, "filter": {"textSearch": str(nm_id), "withPhoto": -1}}})
+                            if response.status_code == 429:
+                                if attempt + 1 >= RATE_LIMIT_RETRIES:
+                                    error = "WB временно ограничил частоту запросов; нажмите «Обновить» ещё раз"
+                                    break
+                                raw_delay = response.headers.get("Retry-After") or response.headers.get("X-Ratelimit-Retry") or "1"
+                                try:
+                                    delay = min(30.0, max(0.5, float(raw_delay)))
+                                except (TypeError, ValueError):
+                                    delay = 1.0
+                                time.sleep(delay)
+                                continue
+                            if response.status_code >= 400:
+                                error = f"WB ответил {response.status_code}"
+                                break
+                            data = response.json() or {}
+                            found = next((card for card in data.get("cards") or [] if int(card.get("nmID") or 0) == nm_id), None)
                             break
-                    except (httpx.HTTPError, ValueError) as exc:
-                        error = type(exc).__name__
+                        except (httpx.HTTPError, ValueError) as exc:
+                            error = type(exc).__name__
+                            break
+                    if found:
+                        break
                 if found:
                     result.append(normalize_card(found))
                 else:

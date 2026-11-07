@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest import mock
 import httpx
 from app.services.card_compare import CardCompare, CardCompareError, normalize_card, parse_nm_ids
+import app.services.card_compare as card_compare_module
 from app.storage import DraftStore
 
 class CardCompareTests(unittest.TestCase):
@@ -19,6 +20,9 @@ class CardCompareTests(unittest.TestCase):
         self.patch.start(); self.addCleanup(self.patch.stop)
         self.service = CardCompare(self.store, lambda:[('WB','token')])
     def _request(self, request):
+        if getattr(self, 'retry_mode', False) and not getattr(self, 'retry_seen', False):
+            self.retry_seen = True
+            return httpx.Response(429, headers={'Retry-After': '0'}, json={})
         body = json.loads(request.content)
         text = str(body.get('settings',{}).get('filter',{}).get('textSearch'))
         cards = [self.cards[int(text)]] if text.isdigit() and int(text) in self.cards else []
@@ -37,6 +41,14 @@ class CardCompareTests(unittest.TestCase):
         self.assertEqual(parse_nm_ids('101 202, 303'), [101, 202, 303])
         with self.assertRaises(ValueError): parse_nm_ids('abc')
         with self.assertRaises(CardCompareError): self.service.detail(999)
+
+    def test_rate_limit_retries_then_keeps_card(self):
+        self.retry_mode = True
+        with mock.patch.object(card_compare_module.time, 'sleep') as pause:
+            result = self.service.create('retry', [101])
+        self.assertEqual(result['cards'][0]['nm_id'], 101)
+        self.assertFalse(result['cards'][0].get('error'))
+        pause.assert_called_once()
 
 if __name__ == '__main__': unittest.main()
 
