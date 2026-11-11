@@ -8,7 +8,7 @@ window.WBOPSReviews = (() => {
   const FILTER_KEYS = ['search', 'from', 'to', 'marketplace', 'cabinet_id', 'order_status', 'answer', 'rating', 'tag', 'sort'];
   const MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
 
-  const st = {f: {sort: 'desc'}, page: 0, size: 20, meta: null, data: null, selected: new Set(), open: new Set(), editing: null, busy: new Set(), auto: null};
+  const st = {f: {sort: 'desc'}, page: 0, size: 50, meta: null, data: null, selected: new Set(), open: new Set(), editing: null, busy: new Set(), auto: null};
   let root = null, searchTimer = null, loadSeq = 0;
   const photos = {};            // WB ID → ссылка на фото (или null — фото нет)
 
@@ -49,7 +49,7 @@ window.WBOPSReviews = (() => {
     const p = new URLSearchParams();
     FILTER_KEYS.forEach(k => { if (st.f[k] && !(k === 'sort' && st.f[k] === 'desc')) p.set(k, st.f[k]); });
     if (st.page) p.set('page', st.page + 1);
-    if (st.size !== 20) p.set('size', st.size);
+    if (st.size !== 50) p.set('size', st.size);
     history.replaceState(history.state, '', '/reviews' + (p.toString() ? '?' + p : ''));
   }
   const query = (extra = {}) => {

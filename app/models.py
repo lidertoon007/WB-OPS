@@ -43,6 +43,7 @@ class InboxItem(BaseModel):
     has_photo: bool = False
     has_video: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    answered_in_wb: bool | None = None
 
 
 class ReplyDraft(BaseModel):

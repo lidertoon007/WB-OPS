@@ -26,7 +26,7 @@ window.WBOPSAnalytics = (() => {
   const KINDS = {review: 'Отзывы', question: 'Вопросы', chat: 'Чаты'};
 
   const state = {tab: 'dashboard', kind: 'review', marketplace: '', cabinet: '', preset: '30', from: '', to: '', grain: 'day',
-                 filters: null, product: null, productData: null, products: null, reportSearch: ''};
+                 filters: null, product: null, productData: null, products: null, reportSearch: '', importedRanges: new Set()};
   let root = null;
 
   async function api(url, options) {
@@ -182,31 +182,89 @@ window.WBOPSAnalytics = (() => {
   const body = () => root.querySelector('[data-an-body]');
   const loading = (filters = '') => { body().innerHTML = filters + '<p class="muted">Загрузка…</p>'; };
   const fail = (e, filters = '') => { body().innerHTML = filters + `<p class="an-error">Не удалось загрузить: ${esc(e.message)}</p>`; };
+  const importWarning = message => `<div class="an-import-warning" role="alert">${esc(message)} <button type="button" data-retry-history>Повторить загрузку истории</button></div>`;
+  const bindImportRetry = reload => body().querySelectorAll('[data-retry-history]').forEach(b => b.onclick = reload);
+
+  async function importAnalyticsHistory() {
+    // Источник импорта — только WB; другие маркетплейсы показывают уже имеющиеся данные.
+    if (state.marketplace && state.marketplace !== 'wildberries') return {warning: ''};
+    const span = Math.round((new Date(state.to) - new Date(state.from)) / 864e5) + 1;
+    if (!Number.isFinite(span) || span < 1) return {warning: 'Некорректный период аналитики.'};
+    const ranges = [
+      {label: 'выбранный период', from: state.from, to: state.to},
+      {label: 'предыдущий период', from: addDays(state.from, -span), to: addDays(state.from, -1)},
+    ];
+    const warnings = [];
+    for (const range of ranges) {
+      const key = `${range.from}:${range.to}:${state.cabinet || '*'}`;
+      if (state.importedRanges.has(key)) continue;
+      const payload = {analytics_only: true, date_from: range.from, date_to: range.to};
+      if (state.cabinet) payload.cabinet_ids = [state.cabinet];
+      try {
+        const result = await api('/api/import/reviews', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+        if (!result || !Number.isFinite(Number(result.imported)) || !Array.isArray(result.results)) {
+          throw new Error('сервер вернул некорректный ответ');
+        }
+        const failed = result.results.filter(item => !item || item.status !== 'ok');
+        if (!failed.length && result.results.length) state.importedRanges.add(key);
+        else {
+          const detail = failed.map(item => `${item && item.cabinet_id || 'кабинет'}: ${item && item.reason || 'неизвестная ошибка'}`).join('; ');
+          warnings.push(`${range.label} (${range.from} — ${range.to}) загружен не полностью${detail ? `: ${detail}` : ': нет результатов по кабинетам'}.`);
+        }
+      } catch (e) {
+        warnings.push(`Не удалось загрузить ${range.label} (${range.from} — ${range.to}): ${e.message || 'неизвестная ошибка'}.`);
+      }
+    }
+    return {warning: warnings.join(' ')};
+  }
 
   // ---------------------------------------------------------------- Дашборд
+  async function dashboardReviewSummary() {
+    let d;
+    try { d = await api(`/api/analytics/tags?${query()}`); }
+    catch (e) { return card('Что хвалят и критикуют в отзывах', `<p class="an-error">Не удалось загрузить сводку: ${esc(e.message || 'неизвестная ошибка')}</p>`); }
+    if (!d || !Array.isArray(d.tags) || !Number.isFinite(Number(d.total))) {
+      return card('Что хвалят и критикуют в отзывах', '<p class="an-error">Не удалось загрузить сводку: некорректный ответ сервера.</p>');
+    }
+    const points = (field, cls) => {
+      const rows = d.tags.filter(t => t && Number(t[field]) > 0)
+        .sort((a, b) => Number(b[field]) - Number(a[field])).slice(0, 5);
+      return rows.length ? `<ul class="an-points ${cls}">${rows.map(t => `<li>${esc(t.title || t.tag)}<span class="an-count">${fmt(Number(t[field]))} упоминаний</span></li>`).join('')}</ul>`
+        : empty('Упоминаний не найдено.');
+    };
+    const content = Number(d.total) === 0 ? empty('Отзывов за выбранный период нет.')
+      : `<p class="muted an-period">По автоматически определённым тегам; один отзыв может содержать несколько аспектов.</p>
+         <div class="an-row">${card('Хвалят', points('pos_total', 'pos'))}${card('Критикуют', points('neg_total', 'neg'))}</div>`;
+    return card('Что хвалят и критикуют в отзывах', content);
+  }
+
   async function renderDashboard() {
     const f = filtersHtml();
     loading(f); bindFilters(body(), renderDashboard);
+    const imported = await importAnalyticsHistory();
     let d;
-    try { d = await api(`/api/analytics/dashboard?${query({kind: state.kind, grain: state.grain})}`); } catch (e) { fail(e, f); bindFilters(body(), renderDashboard); return; }
+    try {
+      d = await api(`/api/analytics/dashboard?${query({kind: state.kind, grain: state.grain})}`);
+    } catch (e) { fail(e, f + (imported.warning ? importWarning(imported.warning) : '')); bindFilters(body(), renderDashboard); bindImportRetry(renderDashboard); return; }
     const k = d.kpi, noun = {review: 'отзывов', question: 'вопросов', chat: 'чатов'}[state.kind];
     const series = Object.entries(d.series).map(([mp, values], i) => ({label: mp, color: MP_COLORS[mp] || CAT[i], values}));
     const mpItems = Object.entries(d.marketplaces).map(([mp, v], i) => ({label: mp, value: v, color: MP_COLORS[mp] || CAT[i]}));
     const exportQ = query({kind: state.kind, grain: state.grain});
-    let html = f + `<div class="an-actions an-noprint">
+    let html = f + (imported.warning ? importWarning(imported.warning) : '') + `<div class="an-actions an-noprint">
         <a class="btn secondary" href="/api/analytics/dashboard?${exportQ}&format=xlsx">⇩ Excel</a>
         <a class="btn secondary" href="/api/analytics/dashboard?${exportQ}&format=csv">⇩ CSV</a>
         <button class="btn secondary" type="button" data-print>PDF / печать</button></div>
       <p class="muted an-period">${KINDS[state.kind]} за ${esc(state.from.split('-').reverse().join('.'))} — ${esc(state.to.split('-').reverse().join('.'))}</p>
       <div class="an-kpis">
         ${kpi(`Новых ${noun}`, fmt(k.new), change(k.change, k.prev))}
-        ${kpi('Ожидают ответа', fmt(k.waiting), '<span class="muted">все неотвеченные сейчас</span>')}
+        ${kpi('Ожидают ответа', k.waiting == null ? '—' : fmt(k.waiting), `<span class="muted">${esc(k.waiting_note || 'Нет актуальных данных')}</span>`)}
         ${kpi('Отвечено за период', fmt(k.answered), k.new ? `<span class="muted">${pct(k.answered / k.new)} от новых</span>` : '')}
         ${kpi('Время ответа (медиана)', minutesText(k.response_minutes), '<span class="muted">от появления до отправки</span>')}
       </div>`;
     if (!k.new) {
       html += empty(state.kind === 'chat' ? 'Чатов за период нет: синхронизация чатов пока не загружала диалоги.' : `За выбранный период ${noun} нет. Выберите другой период или загрузите историю в разделе «Импорт».`);
-      body().innerHTML = html; bindFilters(body(), renderDashboard); bindPrint(); return;
+      html += await dashboardReviewSummary();
+      body().innerHTML = html; bindFilters(body(), renderDashboard); bindImportRetry(renderDashboard); bindPrint(); return;
     }
     html += `<div class="an-row">
         ${card(`Динамика ${noun} по маркетплейсам`, legend(series.map(s => ({...s, value: fmt(Object.values(s.values).reduce((a, b) => a + b, 0))}))) + stacked(d.keys, series, {grain: d.grain}), 'wide')}
@@ -225,8 +283,9 @@ window.WBOPSAnalytics = (() => {
     html += `<div class="an-row">${state.kind !== 'review' ? '' : card('С текстом и без', donut([
         {label: 'С текстом', value: d.text.with_text, color: '#2a78d6'}, {label: 'Без текста', value: d.text.without_text, color: '#c4c2bd'}], noun))}
       ${card('Сравнение периодов', comparePeriods(k, noun))}</div>`;
+    html += await dashboardReviewSummary();
     body().innerHTML = html;
-    bindFilters(body(), renderDashboard); bindPrint();
+    bindFilters(body(), renderDashboard); bindImportRetry(renderDashboard); bindPrint();
   }
   const cabName = id => ((state.filters && state.filters.cabinets) || []).find(c => c.id === id)?.name || id;
   function comparePeriods(k, noun) {
@@ -302,14 +361,18 @@ window.WBOPSAnalytics = (() => {
   async function renderTrends() {
     const f = filtersHtml({kind: false, grain: false});
     loading(f); bindFilters(body(), renderTrends);
+    const imported = await importAnalyticsHistory();
     let d;
-    try { d = await api(`/api/analytics/trends?${query()}`); } catch (e) { fail(e, f); bindFilters(body(), renderTrends); return; }
+    try {
+      d = await api(`/api/analytics/trends?${query()}`);
+    } catch (e) { fail(e, f + (imported.warning ? importWarning(imported.warning) : '')); bindFilters(body(), renderTrends); bindImportRetry(renderTrends); return; }
     const table = (items, polarity) => items.length ? `<div class="an-tw"><table><thead><tr><th>Товар</th><th>Сейчас</th><th>Было</th><th>Рост</th></tr></thead><tbody>${items.map(i =>
       `<tr><td><button type="button" class="an-link" data-open-product="${i.product_id}">${esc(i.name || 'Товар')}</button><div class="muted">WB ${i.product_id}</div></td><td><b>${fmt(i.count)}</b></td><td>${fmt(i.previous)}</td>
        <td><em class="an-trend ${polarity}">▲ ${i.change == null ? 'новое' : pct(i.change)}</em></td></tr>`).join('')}</tbody></table></div>` : empty('Роста нет.');
-    body().innerHTML = f + `<p class="muted an-period">Сравнение с предыдущим периодом такой же длины. Позитив — отзывы 4–5★, негатив — 1–2★.</p>
+    body().innerHTML = f + (imported.warning ? importWarning(imported.warning) : '') + `<p class="muted an-period">Сравнение с предыдущим периодом такой же длины. Позитив — отзывы 4–5★, негатив — 1–2★.</p>
       <div class="an-row">${card('Товары с ростом позитивных отзывов', table(d.growth_positive, 'pos'))}${card('Товары с ростом негатива', table(d.growth_negative, 'neg'))}</div>`;
     bindFilters(body(), renderTrends);
+    bindImportRetry(renderTrends);
     body().querySelectorAll('[data-open-product]').forEach(b => b.onclick = () => { state.product = +b.dataset.openProduct; state.productData = null; openTab('product'); });
   }
 
@@ -496,6 +559,7 @@ window.WBOPSAnalytics = (() => {
 .an-ai h4{margin:0 0 6px;font-size:14px}.an-ai ul{margin:0;padding-left:18px;line-height:1.5;font-size:14px}.an-section{font-size:16px;margin:22px 0 0}
 .an-row-actions{white-space:nowrap}.an-row-actions .btn{height:32px;padding:5px 10px;font-size:12px;margin:2px;text-decoration:none;display:inline-flex;align-items:center}
 .an-empty{padding:18px;border:1px dashed #e5e7eb;border-radius:12px;text-align:center}.an-error{color:#b91c1c}
+.an-import-warning{padding:10px 14px;border:1px solid #e9bc66;border-radius:8px;background:#fff8e8;color:#704d12}
 .an-tip{position:fixed;z-index:1000;display:none;pointer-events:none;background:#111827;color:#fff;font-size:12px;line-height:1.5;padding:8px 10px;border-radius:8px;box-shadow:0 6px 20px #0003;max-width:260px}
 .an-tip i{margin-right:6px;vertical-align:-1px}.an-tip-total{border-top:1px solid #ffffff33;margin-top:4px;padding-top:4px}
 .an-card>p.muted{font-size:13px}

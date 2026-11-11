@@ -16,7 +16,7 @@ from app.services.review_composer import analyze
 TAG_ICONS = {"quality": "🏅", "size": "📏", "length": "📐", "material": "🧵", "color": "🎨", "look": "✨",
              "match": "🔍", "price": "💰", "delivery": "🚚", "smell": "👃"}
 ANSWER_STATUSES = {
-    "unanswered": "Без ответа",       # все неотправленные
+    "unanswered": "Без ответа",       # актуальная очередь WB после синхронизации
     "nodraft": "Нет черновика",
     "draft": "Черновик",
     "approved": "Одобрен",
@@ -82,7 +82,7 @@ class ReviewList:
             c.row_factory = sqlite3.Row
             rows = [dict(r) for r in c.execute(
                 "SELECT i.id, i.cabinet_id, i.text, i.rating, i.product_id, i.created_at, i.order_status, i.author_name, i.marketplace, "
-                "i.product_name, i.has_photo, i.has_video, d.text AS draft_text, COALESCE(d.confirmed,0) AS confirmed, "
+                "i.product_name, i.has_photo, i.has_video, i.wb_unanswered, d.text AS draft_text, COALESCE(d.confirmed,0) AS confirmed, "
                 "COALESCE(d.published,0) AS published, COALESCE(d.moderation_status,'pending') AS moderation_status, "
                 "COALESCE(d.moderation_comment,'') AS moderation_comment, COALESCE(d.user_edited,0) AS user_edited, COALESCE(d.source,'') AS source, "
                 "s.value AS delivery FROM inbox_items i LEFT JOIN reply_drafts d ON d.item_id=i.id "
@@ -101,7 +101,7 @@ class ReviewList:
         return rows
 
     def query(self, *, item_type="review", search="", date_from=None, date_to=None, marketplace=None, cabinet_id=None,
-              order_status=None, answer=None, ratings=None, tags=None, product_id=None, sort="desc", limit=20, offset=0,
+              order_status=None, answer=None, ratings=None, tags=None, product_id=None, sort="desc", limit=50, offset=0,
               with_warnings=None) -> dict:
         rows = self._rows(item_type)
         names = self.product_names()
@@ -143,10 +143,10 @@ class ReviewList:
         counts = {k: 0 for k in ANSWER_STATUSES}
         for r in base:
             counts[r["status"]] += 1
-            if r["status"] != "published":
+            if r["status"] != "published" and r["wb_unanswered"] != 0:
                 counts["unanswered"] += 1
         if answer:
-            base = [r for r in base if (r["status"] != "published" if answer == "unanswered" else r["status"] == answer)]
+            base = [r for r in base if (r["status"] != "published" and r["wb_unanswered"] != 0 if answer == "unanswered" else r["status"] == answer)]
         base.sort(key=lambda r: r["created_at"] or "", reverse=sort != "asc")
         page = base[max(0, offset):max(0, offset) + max(1, min(limit, 200))]
         cabinets = self.cabinet_names()

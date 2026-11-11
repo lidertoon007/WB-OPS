@@ -1,11 +1,14 @@
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import date
 from pathlib import Path
 
 from app.models import InboxItem, ReplyDraft
 from app.services.analytics import Analytics, dashboard_tables, period_keys, report_tables, to_csv
 from app.storage import DraftStore
+from app.services.cabinets import Cabinet
+from app.services.wb_client import WBApiError, WBFeedbackClient
 
 
 class Chats:
@@ -45,6 +48,7 @@ class AnalyticsTests(unittest.TestCase):
         d = self.a.dashboard("review", date(2026, 10, 1), date(2026, 10, 10))
         self.assertEqual(d["kpi"]["new"], 4)
         self.assertEqual(d["kpi"]["answered"], 2)
+        self.assertIsNone(d["kpi"]["waiting"])  # Local statuses are not a current WB count.
         self.assertEqual(d["kpi"]["prev"], 1)                 # 25.09 попадает в прошлые 10 дней
         self.assertEqual(d["ratings"]["5"], 2)
         self.assertEqual(d["text"], {"with_text": 3, "without_text": 1})
@@ -80,6 +84,88 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(t["growth_negative"][0]["product_id"], 111)
         self.assertEqual(period_keys(date(2026, 9, 29), date(2026, 10, 6), "week"), ["2026-09-28", "2026-10-05"])
         self.assertEqual(period_keys(date(2026, 9, 29), date(2026, 10, 6), "month"), ["2026-09", "2026-10"])
+
+    def test_imported_history_is_analytics_only_and_deduplicated_with_inbox(self):
+        historical = [
+            review(1, "2026-10-01", 5, "Дубликат рабочего отзыва"),
+            review(20, "2026-10-06", 4, "Исторический отзыв", cabinet="other"),
+            InboxItem(id="q20", cabinet_id="other", item_type="question", text="Исторический вопрос",
+                      product_id=222, created_at="2026-10-06T10:00:00+00:00", answered_in_wb=False),
+        ]
+        historical[0].answered_in_wb = True
+        historical[1].answered_in_wb = True
+        self.store.save_analytics_history(historical)
+        self.store.save_analytics_history(historical)
+
+        dashboard = self.a.dashboard("review", date(2026, 10, 1), date(2026, 10, 10))
+        self.assertEqual(dashboard["kpi"]["new"], 5)
+        self.assertEqual(dashboard["kpi"]["answered"], 3)
+        self.assertIsNone(dashboard["kpi"]["waiting"])
+        self.assertEqual(self.a.dashboard("review", date(2026, 10, 1), date(2026, 10, 10), cabinet="other")["kpi"]["new"], 1)
+        self.assertEqual(self.a.dashboard("question", date(2026, 10, 1), date(2026, 10, 10), cabinet="other")["kpi"]["new"], 1)
+        self.assertEqual(len(self.a.filtered("review", date(2026, 10, 1), date(2026, 10, 10), marketplace="ozon")), 0)
+        self.assertEqual(self.a.products(date(2026, 10, 1), date(2026, 10, 10))[0]["reviews"], 5)
+        with self.store._connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM inbox_items WHERE id IN ('r20','q20')").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM reply_drafts WHERE item_id IN ('r20','q20')").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM analytics_history").fetchone()[0], 3)
+
+
+class DashboardLiveCountTests(unittest.TestCase):
+    def test_dashboard_uses_live_count_and_hides_partial_or_unsupported_counts(self):
+        import importlib
+
+        main = importlib.import_module("app.main")
+
+        class LocalAnalytics:
+            def dashboard(self, *args, **kwargs):
+                return {"kpi": {"waiting": 327}}
+
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def execute(self, *args):
+                return self
+
+            def fetchall(self):
+                return [("nguyen", "wildberries"), ("other", "wildberries")]
+
+        class Store:
+            def _connect(self):
+                return Connection()
+
+        async def count(self, kind):
+            if self.token == "limited":
+                raise WBApiError("WB API 429: превышен лимит запросов")
+            return {"nguyen-token": 7, "other-token": 3}[self.token]
+
+        cabinets = [Cabinet("nguyen", "Нгуен", "nguyen-token"), Cabinet("other", "Другой", "other-token")]
+
+        def run(**filters):
+            coroutine = main.analytics_dashboard(kind="review", date_from="2026-10-01", date_to="2026-10-10",
+                                                 grain="day", format=None, **filters)
+            try:
+                coroutine.send(None)
+            except StopIteration as result:
+                return result.value["kpi"]
+            finally:
+                coroutine.close()
+            self.fail("Dashboard coroutine unexpectedly suspended")
+
+        with patch.object(main, "analytics", LocalAnalytics()), patch.object(main, "draft_store", Store()), \
+             patch.object(main, "configured_cabinets", return_value=cabinets), \
+             patch.object(WBFeedbackClient, "count_unanswered", count):
+            self.assertEqual(run(cabinet="nguyen", marketplace="wildberries")["waiting"], 7)
+            self.assertEqual(run(marketplace="wildberries")["waiting"], 10)
+            self.assertIsNone(run(cabinet="nguyen", marketplace="ozon")["waiting"])
+            cabinets[1] = Cabinet("other", "Другой", "limited")
+            failed = run(marketplace="wildberries")
+            self.assertIsNone(failed["waiting"])
+            self.assertIn("429", failed["waiting_note"])
 
 
 if __name__ == "__main__":

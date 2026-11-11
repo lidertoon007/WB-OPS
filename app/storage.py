@@ -48,11 +48,18 @@ class DraftStore:
                 "has_video": "INTEGER NOT NULL DEFAULT 0",
                 "review_topics": "TEXT NOT NULL DEFAULT '[]'",
                 "review_sentiment": "TEXT NOT NULL DEFAULT 'neutral'",
+                "wb_unanswered": "INTEGER",
             }
             columns = {row[1] for row in connection.execute("PRAGMA table_info(inbox_items)")}
             for name, definition in inbox_additions.items():
                 if name not in columns:
                     connection.execute(f"ALTER TABLE inbox_items ADD COLUMN {name} {definition}")
+            connection.execute("CREATE TABLE IF NOT EXISTS analytics_history ("
+                               "id TEXT PRIMARY KEY, cabinet_id TEXT NOT NULL, item_type TEXT NOT NULL, "
+                               "text TEXT NOT NULL, rating INTEGER, product_id INTEGER, created_at TEXT NOT NULL, "
+                               "order_status TEXT NOT NULL, author_name TEXT, marketplace TEXT NOT NULL, "
+                               "product_name TEXT, brand TEXT, has_photo INTEGER NOT NULL, has_video INTEGER NOT NULL, "
+                               "review_topics TEXT NOT NULL, review_sentiment TEXT NOT NULL, answered_in_wb INTEGER NOT NULL)")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(reply_drafts)")}
             if "user_edited" not in columns:
                 # Existing drafts are protected until the safe upgrade classifies them.
@@ -200,6 +207,41 @@ class DraftStore:
                 connection.execute("INSERT OR REPLACE INTO inbox_items(id,cabinet_id,item_type,text,rating,product_id,created_at,order_status,author_name,marketplace,product_name,brand,has_photo,has_video,review_topics,review_sentiment) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (item.id, item.cabinet_id, item.item_type.value, item.text, item.rating, item.product_id, item.created_at.isoformat(), item.order_status.value, item.author_name, item.marketplace, item.product_name, item.brand, int(item.has_photo), int(item.has_video), json.dumps(markup.topics if markup else [], ensure_ascii=False), markup.sentiment if markup else "neutral"))
         return len(items)
 
+    def reconcile_wb_unanswered(self, cabinet_id: str, item_types: list[str], item_ids: list[str]) -> None:
+        """Apply a complete successful WB queue snapshot; preserve drafts and history."""
+        with self._connect() as connection:
+            for kind in item_types:
+                connection.execute("UPDATE inbox_items SET wb_unanswered=0 WHERE cabinet_id=? "
+                                   "AND marketplace='wildberries' AND item_type=?", (cabinet_id, kind))
+            connection.executemany("UPDATE inbox_items SET wb_unanswered=1 WHERE id=? AND cabinet_id=? "
+                                   "AND marketplace='wildberries'", ((item_id, cabinet_id) for item_id in item_ids))
+
+    def save_analytics_history(self, items: list[InboxItem]) -> int:
+        """Store imported history without creating workflow drafts or inbox entries."""
+        import json
+        from app.services.review_analysis import analyze_review
+
+        with self._connect() as connection:
+            for item in items:
+                markup = analyze_review(item.text, item.rating) if item.item_type.value == "review" else None
+                connection.execute(
+                    "INSERT INTO analytics_history(id,cabinet_id,item_type,text,rating,product_id,created_at,"
+                    "order_status,author_name,marketplace,product_name,brand,has_photo,has_video,"
+                    "review_topics,review_sentiment,answered_in_wb) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET cabinet_id=excluded.cabinet_id,item_type=excluded.item_type,"
+                    "text=excluded.text,rating=excluded.rating,product_id=excluded.product_id,"
+                    "created_at=excluded.created_at,order_status=excluded.order_status,author_name=excluded.author_name,"
+                    "marketplace=excluded.marketplace,product_name=excluded.product_name,brand=excluded.brand,"
+                    "has_photo=excluded.has_photo,has_video=excluded.has_video,review_topics=excluded.review_topics,"
+                    "review_sentiment=excluded.review_sentiment,answered_in_wb=excluded.answered_in_wb",
+                    (item.id, item.cabinet_id, item.item_type.value, item.text, item.rating, item.product_id,
+                     item.created_at.isoformat(), item.order_status.value, item.author_name, item.marketplace,
+                     item.product_name, item.brand, int(item.has_photo), int(item.has_video),
+                     json.dumps(markup.topics if markup else [], ensure_ascii=False),
+                     markup.sentiment if markup else "neutral", int(bool(item.answered_in_wb))),
+                )
+        return len(items)
+
     def list_inbox(self, item_type: str | None = None, rating: int | None = None, product_id: int | None = None, order_status: str | None = None, search: str | None = None, status: str | None = None, limit: int = 200, offset: int = 0, cabinet_id: str | None = None) -> list[InboxItem]:
         with self._connect() as connection:
             publication_clause = "COALESCE(d.published,0)=1" if status == "published" else "COALESCE(d.published,0)=0"
@@ -214,7 +256,7 @@ class DraftStore:
         import json
         with self._connect() as connection:
             order = "ASC" if sort == "asc" else "DESC"
-            rows = connection.execute(f"SELECT i.id,i.cabinet_id,i.item_type,i.text,i.rating,i.product_id,i.created_at,i.order_status,d.text,d.confirmed,d.published,i.review_topics,i.review_sentiment,d.moderation_status,d.moderation_comment,i.author_name,i.marketplace,i.product_name,i.brand,i.has_photo,i.has_video FROM inbox_items i LEFT JOIN reply_drafts d ON d.item_id=i.id ORDER BY i.created_at {order}").fetchall()
+            rows = connection.execute(f"SELECT i.id,i.cabinet_id,i.item_type,i.text,i.rating,i.product_id,i.created_at,i.order_status,d.text,d.confirmed,d.published,i.review_topics,i.review_sentiment,d.moderation_status,d.moderation_comment,i.author_name,i.marketplace,i.product_name,i.brand,i.has_photo,i.has_video,i.wb_unanswered FROM inbox_items i LEFT JOIN reply_drafts d ON d.item_id=i.id ORDER BY i.created_at {order}").fetchall()
         query = (search or "").strip().lower()
         result = []
         for r in rows:
@@ -235,12 +277,10 @@ class DraftStore:
             delivery_state = self.get_setting(f"reply_delivery:{r[0]}", "")
             current = "published" if r[10] else "error" if delivery_state == "uncertain" else "sending" if delivery_state == "sending" else "ready" if r[9] else "draft" if r[8] is not None else "new"
             # WB's unanswered endpoint is the source of truth for "Новые".
-            # A local draft does not mean the review was answered in WB, so
-            # the "new" filter intentionally includes every non-published
-            # item while the response still exposes its precise workflow
-            # state (draft/ready/sending/error).
-            is_unanswered = current != "published"
-            if status and not (status == "new" and is_unanswered) and current != status:
+            # Drafts do not answer reviews. Exclude records absent from the
+            # last successful snapshot while retaining their workflow state.
+            is_unanswered = current != "published" and r[21] != 0
+            if status and (not is_unanswered if status == "new" else current != status):
                 continue
             result.append({"id": r[0], "cabinet_id": r[1], "item_type": item_type_value, "text": r[3], "rating": r[4], "product_id": r[5], "created_at": r[6], "order_status": order_value, "draft_text": r[8] or "", "confirmed": bool(r[9]), "published": bool(r[10]), "status": current, "error": delivery_state if current == "error" else "", "topics": topics, "sentiment": r[12], "moderation_status": r[13] or "pending", "moderation_comment": r[14] or "", "author_name": r[15], "marketplace": r[16], "product_name": r[17], "brand": r[18], "has_photo": bool(r[19]), "has_video": bool(r[20])})
         return result[max(offset, 0):max(offset, 0) + min(max(limit, 1), 500)]

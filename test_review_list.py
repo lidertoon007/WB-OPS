@@ -49,6 +49,46 @@ class ReviewListTests(unittest.TestCase):
         self.assertEqual([i["id"] for i in d["items"]], ["r4", "r3", "r2", "r1"])
         self.assertEqual([i["id"] for i in self.list.query(sort="asc")["items"]][0], "r1")
 
+    def test_wb_snapshot_excludes_stale_reviews_without_faking_publication(self):
+        before = self.store.get("r2")
+        self.store.reconcile_wb_unanswered("main", ["review"], ["r4"])
+        data = self.list.query(answer="unanswered")
+        self.assertEqual({r["id"] for r in data["items"]}, {"r3", "r4"})
+        self.assertEqual(data["counts"]["unanswered"], 2)
+        self.assertEqual(self.store.get("r2"), before)
+        self.assertEqual(self.list.query()["total"], 4)
+        self.assertEqual(self.list.query()["counts"]["published"], 1)
+        legacy = self.store.list_inbox_overview(status="new")
+        self.assertEqual({r["id"] for r in legacy}, {"r3", "r4"})
+        self.store.reconcile_wb_unanswered("main", ["review"], ["r2", "r4"])
+        self.assertEqual(self.list.query(answer="unanswered")["total"], 3)
+
+    def test_empty_snapshot_is_scoped_to_enabled_kind_and_cabinet(self):
+        self.store.save_inbox([InboxItem(id="q1", cabinet_id="main", item_type="question", text="Вопрос")])
+        self.store.reconcile_wb_unanswered("main", ["review"], [])
+        self.assertEqual(self.list.query(answer="unanswered")["total"], 1)
+        self.assertEqual(self.list.query(item_type="question", answer="unanswered")["total"], 1)
+        self.assertEqual(self.list.query(cabinet_id="other", answer="unanswered")["total"], 1)
+
+    def test_failed_sync_preserves_snapshot_and_successful_empty_sync_reconciles(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+        from app import main
+        from test_wb_client import _run
+        from app.services.wb_client import WBApiError
+        cabinet = SimpleNamespace(id="main", enabled=True, marketplace="wildberries", reviews=True,
+                                  questions=False, token="test")
+        patches = (patch.object(main, "configured_cabinets", return_value=[cabinet]),
+                   patch.object(main, "draft_store", self.store))
+        with patches[0], patches[1], patch.object(main.WBFeedbackClient, "fetch_unanswered", new=AsyncMock(side_effect=WBApiError("429"))):
+            with self.assertRaises(WBApiError):
+                _run(main.perform_sync("main"))
+        self.assertEqual(self.list.query(answer="unanswered")["total"], 3)
+        with patch.object(main, "configured_cabinets", return_value=[cabinet]), patch.object(main, "draft_store", self.store), \
+                patch.object(main.WBFeedbackClient, "fetch_unanswered", new=AsyncMock(return_value=[])):
+            _run(main.perform_sync("main"))
+        self.assertEqual(self.list.query(answer="unanswered")["total"], 1)
+
     def test_filters(self):
         q = self.list.query
         self.assertEqual(q(answer="published")["total"], 1)

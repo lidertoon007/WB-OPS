@@ -437,6 +437,9 @@ async def perform_sync(cabinet_id: str) -> dict[str, object]:
             event = "complaint_ready" if complaint.status == ComplaintStatus.READY_MANUAL else "complaint_not_eligible" if complaint.status == ComplaintStatus.NOT_ELIGIBLE else "complaint_manual_status_preserved"
             draft_store.audit(event, item.id, complaint.reason_code or "no_clear_violation")
     draft_store.save_inbox(items)
+    draft_store.reconcile_wb_unanswered(cabinet.id,
+        [kind for kind, enabled in (("review", cabinet.reviews), ("question", cabinet.questions)) if enabled],
+        [item.id for item in items])
     from datetime import datetime, timezone
     draft_store.set_setting("sync_last_at", datetime.now(timezone.utc).isoformat())
     draft_store.set_setting("sync_last_received", str(len(items)))
@@ -880,7 +883,8 @@ async def import_reviews(request: Request) -> dict[str, object]:
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(400, "Ожидается JSON-объект настроек импорта")
-    cabinet_ids = payload.get("cabinet_ids") or [cabinet.id for cabinet in configured_cabinets() if cabinet.enabled]
+    analytics_only = payload.get("analytics_only") is True
+    cabinet_ids = payload.get("cabinet_ids") or [cabinet.id for cabinet in configured_cabinets() if cabinet.enabled and (not analytics_only or cabinet.marketplace == "wildberries")]
     date_from = payload.get("date_from")
     date_to = payload.get("date_to")
     with_markup = bool(payload.get("with_markup", True))
@@ -892,16 +896,22 @@ async def import_reviews(request: Request) -> dict[str, object]:
         if cabinet is None:
             results.append({"cabinet_id": cabinet_id, "status": "error", "reason": "Кабинет не найден"})
             continue
+        if analytics_only and cabinet.marketplace != "wildberries":
+            results.append({"cabinet_id": cabinet_id, "status": "error", "reason": "Импорт истории поддерживается только для Wildberries"})
+            continue
         try:
             items = await WBFeedbackClient(cabinet.token, settings.feedbacks_api_base_url).fetch_history(date_from, date_to, with_answered=True)
             for item in items:
                 item.cabinet_id = cabinet.id
-            imported += draft_store.save_inbox(items)
-            for item in items:
-                draft_store.save_generated(reply_service.draft(item))
-                if with_markup and item.item_type.value == "review":
-                    markup = analyze_review(item.text, item.rating)
-                    draft_store.audit("review_marked", item.id, f"topics={','.join(markup.topics)};sentiment={markup.sentiment}")
+            if analytics_only:
+                imported += draft_store.save_analytics_history(items)
+            else:
+                imported += draft_store.save_inbox(items)
+                for item in items:
+                    draft_store.save_generated(reply_service.draft(item))
+                    if with_markup and item.item_type.value == "review":
+                        markup = analyze_review(item.text, item.rating)
+                        draft_store.audit("review_marked", item.id, f"topics={','.join(markup.topics)};sentiment={markup.sentiment}")
             results.append({"cabinet_id": cabinet.id, "status": "ok", "count": len(items)})
         except WBApiError as exc:
             results.append({"cabinet_id": cabinet.id, "status": "error", "reason": str(exc)})
@@ -1502,8 +1512,10 @@ def _table_download(tables: dict, fmt: str, name: str) -> Response:
 @app.get("/api/analytics/filters")
 def analytics_filters() -> dict[str, object]:
     with draft_store._connect() as c:
-        cabinets = [r[0] for r in c.execute("SELECT DISTINCT cabinet_id FROM inbox_items WHERE cabinet_id<>'' ORDER BY cabinet_id")]
-        span = c.execute("SELECT MIN(created_at), MAX(created_at) FROM inbox_items").fetchone()
+        cabinets = [r[0] for r in c.execute("SELECT cabinet_id FROM inbox_items WHERE cabinet_id<>'' "
+                                           "UNION SELECT cabinet_id FROM analytics_history WHERE cabinet_id<>'' ORDER BY cabinet_id")]
+        span = c.execute("SELECT MIN(created_at), MAX(created_at) FROM "
+                         "(SELECT created_at FROM inbox_items UNION ALL SELECT created_at FROM analytics_history)").fetchone()
     try:
         names = {c.id: c.name for c in configured_cabinets()}
     except Exception:
@@ -1513,11 +1525,46 @@ def analytics_filters() -> dict[str, object]:
 
 
 @app.get("/api/analytics/dashboard")
-def analytics_dashboard(kind: str = "review", date_from: str | None = Query(None, alias="from"), date_to: str | None = Query(None, alias="to"),
+async def analytics_dashboard(kind: str = "review", date_from: str | None = Query(None, alias="from"), date_to: str | None = Query(None, alias="to"),
                         cabinet: str | None = None, marketplace: str | None = None, grain: str = "day",
                         format: str | None = None):
     start, end = _analytics_period(date_from, date_to)
-    data = analytics.dashboard(_analytics_kind(kind), start, end, cabinet or None, marketplace or None, _grain(grain))
+    kind = _analytics_kind(kind)
+    data = analytics.dashboard(kind, start, end, cabinet or None, marketplace or None, _grain(grain))
+    if kind == "chat":
+        data["kpi"]["waiting_note"] = "По локальным статусам чатов"
+    else:
+        data["kpi"]["waiting"] = None
+        data["kpi"]["waiting_note"] = "Нет актуальных данных WB"
+        configured = configured_cabinets()
+        selected = [c for c in configured if not cabinet or c.id == cabinet]
+        with draft_store._connect() as connection:
+            local_scopes = connection.execute(
+                "SELECT DISTINCT cabinet_id, COALESCE(marketplace,'wildberries') FROM inbox_items WHERE item_type=? "
+                "UNION SELECT DISTINCT cabinet_id, COALESCE(marketplace,'wildberries') FROM analytics_history WHERE item_type=?",
+                (kind, kind)).fetchall()
+        relevant_local = [(cid, mp) for cid, mp in local_scopes if not cabinet or cid == cabinet]
+        has_other_marketplace = (marketplace not in (None, "", "wildberries") or
+                                 (not marketplace and (any(c.marketplace != "wildberries" for c in selected) or
+                                                       any(mp != "wildberries" for _, mp in relevant_local))))
+        wb_cabinets = [c for c in selected if c.marketplace == "wildberries"]
+        known_ids = {c.id for c in wb_cabinets}
+        missing_scope = cabinet and not selected or any(cid not in known_ids for cid, mp in relevant_local
+                                                         if mp == "wildberries" and (not marketplace or marketplace == mp))
+        if not has_other_marketplace and not missing_scope and wb_cabinets:
+            try:
+                counts = []
+                for selected_cabinet in wb_cabinets:
+                    counts.append(await WBFeedbackClient(selected_cabinet.token, settings.feedbacks_api_base_url).count_unanswered(kind))
+            except WBApiError as exc:
+                data["kpi"]["waiting_note"] = f"Нет актуальных данных WB: {exc}"
+            else:
+                data["kpi"]["waiting"] = sum(counts)
+                data["kpi"]["waiting_note"] = "По текущему счётчику WB, за всё время"
+        elif has_other_marketplace:
+            data["kpi"]["waiting_note"] = "Актуальный счётчик доступен только для Wildberries"
+        elif missing_scope:
+            data["kpi"]["waiting_note"] = "Для части кабинетов нет настроенного доступа к WB"
     if format:
         return _table_download(analytics_module.dashboard_tables(data), format, f"analytics_{kind}_{start}_{end}")
     return data
@@ -1624,7 +1671,7 @@ def _review_filters(item_type, search, date_from, date_to, marketplace, cabinet_
 def reviews_list(item_type: str = Query("review", pattern="^(review|question)$"), search: str = "", date_from: str | None = Query(None, alias="from"),
                  date_to: str | None = Query(None, alias="to"), marketplace: str = "", cabinet_id: str = "", order_status: str = "", answer: str = "",
                  rating: str = "", tag: str = "", product_id: int | None = None, sort: str = "desc",
-                 limit: int = Query(20, ge=1, le=200), offset: int = Query(0, ge=0), meta: bool = False) -> dict[str, object]:
+                 limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), meta: bool = False) -> dict[str, object]:
     filters = _review_filters(item_type, search, date_from, date_to, marketplace, cabinet_id, order_status, answer, rating, tag, product_id, sort)
     data = review_list.query(**filters, limit=limit, offset=offset, with_warnings=reply_service.validate)
     if meta:

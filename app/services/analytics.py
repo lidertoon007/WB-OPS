@@ -101,6 +101,12 @@ class Analytics:
                 "SELECT i.*, d.text AS draft_text, COALESCE(d.published,0) AS published, COALESCE(d.confirmed,0) AS confirmed, "
                 "COALESCE(d.user_edited,0) AS user_edited, COALESCE(d.source,'') AS source, d.blocked_reason "
                 "FROM inbox_items i LEFT JOIN reply_drafts d ON d.item_id=i.id WHERE i.item_type=?", (item_type,)).fetchall()
+            history = c.execute(
+                "SELECT h.*, NULL AS draft_text, h.answered_in_wb AS published, 0 AS confirmed, "
+                "0 AS user_edited, '' AS source, NULL AS blocked_reason "
+                "FROM analytics_history h WHERE h.item_type=? "
+                "AND NOT EXISTS (SELECT 1 FROM inbox_items i WHERE i.id=h.id)", (item_type,)).fetchall()
+            items = list(items) + list(history)
             published = dict(c.execute("SELECT item_id, MIN(created_at) FROM audit_log WHERE event='published' GROUP BY item_id").fetchall())
             edited = {r[0] for r in c.execute("SELECT DISTINCT item_id FROM draft_history WHERE action='edited'")}
             generated = dict(c.execute("SELECT item_id, text FROM draft_history WHERE id IN "
@@ -113,7 +119,9 @@ class Analytics:
             row["published"] = bool(row["published"])
             row["marketplace"] = row.get("marketplace") or "wildberries"
             row["has_text"] = bool((row.get("text") or "").strip())
-            if row["published"]:
+            if row["published"] and "answered_in_wb" in row:
+                row["method"] = None
+            elif row["published"]:
                 last = generated.get(row["id"])
                 if last is not None:      # отправлен ли текст в том виде, как его подготовила система
                     changed = " ".join(last.split()) != " ".join(str(row.get("draft_text") or "").split())
@@ -172,8 +180,10 @@ class Analytics:
         span = (date_to - date_from).days + 1
         prev = self.filtered(kind, date_from - timedelta(days=span), date_from - timedelta(days=1), cabinet, marketplace)
         all_rows = self.chat_rows() if kind == "chat" else self.rows("question" if kind == "question" else "review")
+        # WB feedback/question status in local history can become stale after a reply in WB.
+        # The API layer supplies the live count; chats still use their local status.
         waiting = [r for r in all_rows if not r["published"] and (not cabinet or r.get("cabinet_id") == cabinet)
-                   and (not marketplace or r.get("marketplace") == marketplace)]
+                   and (not marketplace or r.get("marketplace") == marketplace)] if kind == "chat" else None
         answered = [r for r in rows if r["published"]]
         minutes = []
         for r in answered:
@@ -210,7 +220,7 @@ class Analytics:
         return {
             "kind": kind, "keys": keys, "grain": grain,
             "kpi": {"new": len(rows), "prev": len(prev), "change": (len(rows) - len(prev)) / len(prev) if prev else None,
-                    "waiting": len(waiting), "answered": len(answered),
+                    "waiting": len(waiting) if waiting is not None else None, "answered": len(answered),
                     "response_minutes": minutes[len(minutes) // 2] if minutes else None},
             "series": {MARKETPLACES.get(k, k): v for k, v in series.items() if sum(v.values()) or k == "wildberries"},
             "ratings_series": ratings,
@@ -305,7 +315,8 @@ class Analytics:
     # ------------------------------------------------------------------ товары
     def product_names(self) -> dict[int, str]:
         with self.store._connect() as c:
-            rows = c.execute("SELECT product_id, product_name FROM inbox_items WHERE product_id IS NOT NULL AND COALESCE(product_name,'')<>''").fetchall()
+            rows = c.execute("SELECT product_id, product_name FROM analytics_history WHERE product_id IS NOT NULL AND COALESCE(product_name,'')<>'' "
+                             "UNION ALL SELECT product_id, product_name FROM inbox_items WHERE product_id IS NOT NULL AND COALESCE(product_name,'')<>''").fetchall()
         return {pid: name for pid, name in rows}
 
     def products(self, date_from, date_to) -> list[dict]:
@@ -460,7 +471,7 @@ def to_xlsx(tables: dict[str, list[list]]) -> bytes:
 def dashboard_tables(d: dict) -> dict[str, list[list]]:
     k = d["kpi"]
     summary = [["Показатель", "Значение"], ["Новых за период", k["new"]], ["За прошлый период", k["prev"]],
-               ["Ожидают ответа", k["waiting"]], ["Отвечено", k["answered"]],
+               ["Ожидают ответа", k["waiting"] if k["waiting"] is not None else "Нет актуальных данных"], ["Отвечено", k["answered"]],
                ["Медианное время ответа, мин", round(k["response_minutes"]) if k["response_minutes"] is not None else ""],
                ["Средняя оценка", round(d["avg_rating"], 2) if d.get("avg_rating") else ""],
                ["С текстом", d["text"]["with_text"]], ["Без текста", d["text"]["without_text"]]]
