@@ -16,20 +16,16 @@ window.WBOPSFinance = (() => {
     const perMp = new Map(), groups = new Map();
     cabs.forEach(c => {
       perMp.set(c.marketplace, (perMp.get(c.marketplace) || 0) + 1);
-      const g = c.marketplace + (c.legal_name ? ' · ' + c.legal_name : '');
+      const g = c.marketplace;
       if (!groups.has(g)) groups.set(g, []);
       groups.get(g).push(c);
     });
     const whole = [...perMp].filter(([, n]) => n > 1).map(([mp]) => opt(mp, `${mp} — все кабинеты`, flt.cabinet)).join('');
-    return `<select data-f-cabinet class="btn secondary" aria-label="Кабинет">${opt('', 'Все кабинеты', flt.cabinet)}
+    return `<select data-f-cabinet class="btn secondary" aria-label="Юрлицо или кабинет">${opt('', 'Все кабинеты', flt.cabinet)}
       ${whole ? `<optgroup label="Маркетплейс целиком">${whole}</optgroup>` : ''}
-      ${[...groups].map(([g, list]) => `<optgroup label="${esc(g)}">${list.map(c => opt(c.key, c.cabinet, flt.cabinet)).join('')}</optgroup>`).join('')}</select>`;
-  }
-
-  function runCabinetSelect(cabs) {
-    const options = cabs.filter(c => c.panel_id || c.cabinet).map(c =>
-      opt(c.panel_id || c.cabinet, c.cabinet, root.dataset.financeCabinet || '')).join('');
-    return options ? `<select data-f-run-cabinet class="btn secondary" aria-label="Кабинет для загрузки"><option value="">Все кабинеты</option>${options}</select>` : '';
+      ${[...groups].map(([g, list]) => `<optgroup label="${esc(g)}">${list.map(c => opt(c.key,
+        c.legal_name && c.legal_name !== c.cabinet ? `${c.legal_name} — ${c.cabinet}` : c.legal_name || c.cabinet,
+        flt.cabinet)).join('')}</optgroup>`).join('')}</select>`;
   }
 
   async function api(url, options) {
@@ -120,6 +116,8 @@ window.WBOPSFinance = (() => {
     const box = root.querySelector('[data-f-report]');
     if (!report) return;
     const s = report.summary, problems = report.control.filter(r => r.problem);
+    // One selector controls the displayed report and the cabinet for the next update.
+    root.dataset.financeCabinet = (report.cabinets || []).find(c => c.key === report.selected)?.panel_id || '';
     const table = flt.grain === 'month' ? s : report.detail?.[flt.grain];
     const fs = report.finance_status || {}, cabs = Object.entries(fs.cabinets || {});
     const quality = report.quality || {};
@@ -135,16 +133,17 @@ window.WBOPSFinance = (() => {
       <div class="f-head"><h3>ОПиУ ${grainLabels[flt.grain].toLowerCase()}</h3><div class="toolbar">
         <select data-f-grain class="btn secondary" aria-label="Детализация ОПиУ">${Object.entries(grainLabels).map(([key, label]) => opt(key, label, flt.grain)).join('')}</select>
         ${cabinetSelect(report.cabinets || [])}
-        ${runCabinetSelect(report.cabinets || [])}
         <label class="r-check"><input type="checkbox" data-f-details ${flt.showDetails ? 'checked' : ''}> ${flt.cabinet ? 'Расшифровка статей' : 'По маркетплейсам'}</label>
         ${periodOptions(table)}</div></div>
       ${renderTable(table)}
       <h3>Контроль</h3>${renderControl(report.control)}
       <div class="f-head"><h3>Товары за период</h3><input data-f-goods-search placeholder="Поиск по артикулу"></div>
       <div data-f-goods>${renderGoods(report.goods)}</div>`;
-    box.querySelector('[data-f-cabinet]').onchange = e => { flt.cabinet = e.target.value; remember(); loadReport(); };
-    const runCab = box.querySelector('[data-f-run-cabinet]');
-    if (runCab) runCab.onchange = e => { root.dataset.financeCabinet = e.target.value; };
+    box.querySelector('[data-f-cabinet]').onchange = e => {
+      flt.cabinet = e.target.value;
+      root.dataset.financeCabinet = (report.cabinets || []).find(c => c.key === flt.cabinet)?.panel_id || '';
+      remember(); loadReport();
+    };
     box.querySelector('[data-f-details]').onchange = e => { flt.showDetails = e.target.checked; remember(); renderReport(); };
     box.querySelector('[data-f-grain]').onchange = e => { flt.grain = e.target.value; remember(); renderReport(); };
     const period = box.querySelector('[data-f-period]');
