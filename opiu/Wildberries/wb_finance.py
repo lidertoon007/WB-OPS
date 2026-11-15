@@ -35,7 +35,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -319,8 +318,9 @@ def load_account(acc, d_from, d_to, cache_dir, from_cache, reload=False):
     cache_dir.mkdir(exist_ok=True)
     # Через временный файл: оборванная запись не испортит кэш, от которого догружается следующий запуск
     tmp = cache_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"rows": rows, "reports": reports, "daily": daily, "daily_ids": daily_ids},
-                              ensure_ascii=False), encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as stream:
+        json.dump({"rows": rows, "reports": reports, "daily": daily, "daily_ids": daily_ids},
+                  stream, ensure_ascii=False)
     tmp.replace(cache_file)
     # Старые выгрузки этого кабинета за тот же период не нужны: новая их полностью заменяет
     for old in cache_dir.glob(f"{safe_name(name)}_{d_from}_*.json"):
@@ -1088,10 +1088,10 @@ def main():
                            lambda text: print(f"[{name}] {text}", flush=True)) if args.dump else {}
         return (*result, goods), None
 
-    # Лимит WB — 1 запрос в минуту на продавца, поэтому кабинеты разных продавцов грузим одновременно
-    with ThreadPoolExecutor(max_workers=max(1, len(accounts))) as pool:
-        loaded = list(pool.map(load, accounts))
-    for acc, (result, error) in zip(accounts, loaded):
+    # Каждый кабинет может содержать сотни мегабайт строк. Обрабатываем их по одному,
+    # чтобы не держать все сырые отчёты в памяти одновременно.
+    for acc in accounts:
+        result, error = load(acc)
         name = acc.get("name") or "Магазин"
         print(f"\n[{name}]")
         if error:
@@ -1117,13 +1117,16 @@ def main():
         if daily:
             print(f"  дни {daily[0]} — {daily[1]} — из ежедневных отчётов WB (неделя ещё не закрыта)")
             checks[name].append(["Из ежедневных отчётов WB (неделя ещё не закрыта)", f"{daily[0]} — {daily[1]}"])
-        tables[name], store_ops[name], store_rows[name] = table, ops, rows
+        tables[name], store_ops[name] = table, ops
+        if not args.no_excel and not args.no_raw:
+            store_rows[name] = rows
         store_sales[name] = sales
         store_by_article[name] = by_article
         store_catalog[name] = catalog
         store_tax_base[name] = tax_base
         store_tax_base_by_article[name] = tax_by_article
         store_reports[name], store_report_net[name] = reports, report_net
+        del result, rows
 
     if not tables:
         sys.exit("\nНе удалось получить данные ни по одному кабинету.")

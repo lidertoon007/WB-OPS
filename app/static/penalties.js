@@ -56,7 +56,7 @@ window.WBOPSPenalties = (() => {
     catch (e) { root.querySelector('[data-body]').innerHTML = `<p class="rv-error">${esc(e.message)}</p>`; return; }
     drawFilters(); drawNotes(); drawBody();
     clearTimeout(st.poll);
-    if (st.data.state?.status === 'running' || st.data.download === 'running') st.poll = setTimeout(waitSync, 5000);
+    if (st.data.state?.status === 'running' || st.data.download === 'running' || st.data.index_pending) st.poll = setTimeout(waitSync, 5000);
   }
   async function waitSync() {
     if (!root?.isConnected) return;
@@ -67,7 +67,7 @@ window.WBOPSPenalties = (() => {
   function drawFilters() {
     const o = st.data.options, f = st.f, [from, to] = period();
     const opt = (v, t, cur) => `<option value="${esc(v)}" ${String(v) === String(cur) ? 'selected' : ''}>${esc(t)}</option>`;
-    const busy = st.data.state?.status === 'running' || st.data.download === 'running';
+    const busy = st.data.state?.status === 'running' || st.data.download === 'running' || st.data.index_pending;
     root.querySelector('[data-filters]').innerHTML = `
       <select data-f="preset" aria-label="Период" class="db-period">${presets().map(([k, t]) => opt(k, t, f.preset)).join('')}</select>
       ${f.preset === 'custom' ? `<label class="db-date">с <input type="date" data-f="from" value="${from}"></label><label class="db-date">по <input type="date" data-f="to" value="${to}"></label>` : ''}
@@ -102,6 +102,7 @@ window.WBOPSPenalties = (() => {
   function drawNotes() {
     const d = st.data, s = d.state || {}, notes = [];
     if (d.download === 'running') notes.push('Скачиваю свежие отчёты реализации WB (через расчёт ОПиУ) — это несколько минут. Страница обновится сама.');
+    else if (d.index_pending) notes.push('Ждём обновления индекса штрафов. Пока показаны данные последнего обновления.');
     if (s.status === 'running') notes.push(esc(s.message || 'Читаю отчёты WB…'));
     if (s.status === 'error') notes.push(esc(s.message));
     if (!d.synced_at && s.status !== 'running' && d.download !== 'running' && s.status !== 'error') notes.push('Отчётов реализации ещё нет. Нажмите «Обновить из WB».');

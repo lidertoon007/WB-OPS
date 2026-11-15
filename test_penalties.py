@@ -1,8 +1,13 @@
+import asyncio
+import importlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from app.services.finance import ReportRunner
 from app.services.penalties import Penalties, classify, clean_reason
 from app.storage import DraftStore
 
@@ -67,6 +72,49 @@ class PenaltiesTests(unittest.TestCase):
         self.assertEqual(feed["items"][1]["fbs"]["hours_to_sc"], 48.0)
         only = self.p.report("2026-09-28", "2026-10-04", {"group": "size"})
         self.assertEqual(only["summary"]["total"], 700.0)
+
+
+    def test_refresh_waits_for_finance_and_retries_after_release(self):
+        from app.config import get_settings
+        from fastapi.testclient import TestClient
+
+        root = Path(self.temp.name)
+        self.addCleanup(get_settings.cache_clear)
+        with mock.patch.dict(os.environ, {"WBOPS_DATABASE_URL": f"sqlite:///{root / 'api.sqlite3'}"}):
+            get_settings.cache_clear()
+            from app import main
+
+            main = importlib.reload(main)
+
+        runner = ReportRunner(root / "finance_status.json")
+        other = ReportRunner(runner.status_path)
+        client = TestClient(main.app)
+        url = "/api/penalties?from=2026-09-28&to=2026-10-04"
+        with mock.patch.object(main, "penalties", self.p), mock.patch.object(main, "finance_runner", runner):
+            with other.try_run_lock():
+                response = client.get(url)
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.json()["index_pending"])
+                self.assertEqual(response.json()["summary"]["total"], 0)
+                self.assertEqual(client.post("/api/penalties/sync").status_code, 409)
+                # Run one iteration of the background task while the other worker owns the lock.
+                with mock.patch.object(main.asyncio, "sleep", side_effect=[None, asyncio.CancelledError()]):
+                    with self.assertRaises(asyncio.CancelledError):
+                        asyncio.run(main.penalties_loop())
+                self.assertTrue(self.p.stale())
+            response = client.get(url)
+            self.assertFalse(response.json()["index_pending"])
+            self.assertEqual(response.json()["summary"]["total"], 1000)
+            self.assertFalse(self.p.stale())
+
+            # The normal "Обновить из WB" path must start finance without holding a lock itself.
+            (root / "opiu_all.py").write_text("print('ok')", encoding="utf-8")
+            with mock.patch.object(main, "finance_project", return_value=root), \
+                 mock.patch.object(main, "sync_opiu_keys", return_value={}):
+                response = client.post("/api/penalties/sync", json={"download": True})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["status"], "downloading")
+                runner.process.wait(timeout=5)
 
 
 if __name__ == "__main__":

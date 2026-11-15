@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import time
 import unittest
 from argparse import Namespace
 from pathlib import Path
@@ -92,6 +93,50 @@ class FinanceTests(unittest.TestCase):
         self.assertEqual(restored.status()["status"], "done")
         self.assertEqual(restored.status()["cabinets"]["К1"]["rows"], 12)
 
+    def test_workers_share_progress_and_reject_a_second_build(self):
+        path = self.dir / "finance_status.json"
+        owner = finance.ReportRunner(path)
+        observer = finance.ReportRunner(path)
+        (self.dir / "opiu_all.py").write_text(
+            "from pathlib import Path\n"
+            "import time\n"
+            "print('[К1] загружено 12 строк', flush=True)\n"
+            "while not Path('finish').exists(): time.sleep(0.01)\n",
+            encoding="utf-8",
+        )
+        owner.start(self.dir, sys.executable, "cache")
+        self.addCleanup(owner.stop)
+        try:
+            for _ in range(200):
+                progress = observer.status()
+                if progress["cabinets"].get("К1"):
+                    break
+                time.sleep(0.01)
+            self.assertEqual(progress["status"], "running")
+            self.assertEqual(progress["cabinets"]["К1"]["rows"], 12)
+            with self.assertRaisesRegex(finance.FinanceError, "уже собирается"):
+                observer.start(self.dir, sys.executable, "cache")
+            observer.stop()
+            self.assertIsNone(owner.process.poll())
+            self.assertEqual(finance.ReportRunner(path).status()["status"], "running")
+        finally:
+            (self.dir / "finish").touch()
+            owner.process.wait(timeout=5)
+        for _ in range(200):
+            if observer.status()["status"] == "done":
+                break
+            time.sleep(0.01)
+        self.assertEqual(observer.status()["status"], "done")
+
+    def test_worker_recovers_an_abandoned_build(self):
+        path = self.dir / "finance_status.json"
+        previous = finance.ReportRunner(path)
+        previous.state.update(status="running", cabinets={"К1": {"status": "loading"}})
+        previous._persist()
+        recovered = finance.ReportRunner(path).status()
+        self.assertEqual((recovered["status"], recovered["code"]), ("interrupted", -15))
+        self.assertEqual(recovered["cabinets"]["К1"]["status"], "interrupted")
+
 
 class SyncAccountsTests(unittest.TestCase):
     """Ключи API для ОПиУ берутся из кабинетов панели."""
@@ -141,14 +186,14 @@ class SyncAccountsTests(unittest.TestCase):
         self.assertFalse((path.parent / "wb_accounts.json.bak").exists())
 
     def test_runner_cache_mode_fills_missing(self):
-        runner = finance.ReportRunner()
+        runner = finance.ReportRunner(self.dir / "finance_status.json")
         (self.dir / "opiu_all.py").write_text("import sys; print(' '.join(sys.argv[1:]))", encoding="utf-8")
         runner.start(self.dir, sys.executable, "cache", note="Ключи API из кабинетов панели: WB — 1")
         runner.process.wait()
         for _ in range(100):
             if runner.status()["status"] != "running":
                 break
-            import time; time.sleep(0.05)
+            time.sleep(0.05)
         self.assertEqual(runner.status()["log"], ["Ключи API из кабинетов панели: WB — 1",
                                                   "--no-unit --from-cache --fill-missing"])
 
@@ -185,7 +230,8 @@ class FillMissingTests(unittest.TestCase):
         opiu_all.run_script = fake_run
 
     def args(self, **kw):
-        return Namespace(**{"from_cache": True, "fill_missing": False, "cache_for": None, "grain": "month", **kw})
+        return Namespace(**{"from_cache": True, "fill_missing": False, "cache_for": None,
+                            "grain": "month", "cabinet": None, **kw})
 
     def test_loads_only_missing_cabinets_from_api(self):
         data, note, errors = self.opiu.run_marketplace(self.mp, self.args(fill_missing=True), str(self.dir))
