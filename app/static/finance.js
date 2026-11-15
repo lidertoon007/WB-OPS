@@ -5,9 +5,10 @@ window.WBOPSFinance = (() => {
   const pct = v => v == null ? '–' : (v * 100).toLocaleString('ru-RU', {minimumFractionDigits: 1, maximumFractionDigits: 1}) + '%';
   const neg = v => v != null && v < 0 ? ' class="f-neg"' : '';
   let root, report = null, polling = null;
-  // Фильтры: кабинет ("" — все, «Ozon» — площадка, «Ozon|Еврозоо» — кабинет), период таблицы, расшифровка
-  const flt = {cabinet: '', lastMonths: 6, showDetails: false};
+  const grainLabels = {day: 'По дням', week: 'По неделям', month: 'По месяцам'};
+  const flt = {cabinet: '', grain: 'month', dayMonth: '', lastMonths: 6, lastWeeks: 6, showDetails: false};
   try { Object.assign(flt, JSON.parse(localStorage.getItem('wbops.finance.f') || '{}')); } catch (e) { /* без хранилища */ }
+  if (!Object.hasOwn(grainLabels, flt.grain)) flt.grain = 'month';
   const remember = () => { try { localStorage.setItem('wbops.finance.f', JSON.stringify(flt)); } catch (e) { /* ignore */ } };
   const opt = (value, label, current) => `<option value="${esc(value)}"${value === current ? ' selected' : ''}>${esc(label)}</option>`;
 
@@ -27,7 +28,7 @@ window.WBOPSFinance = (() => {
 
   function runCabinetSelect(cabs) {
     const options = cabs.filter(c => c.panel_id || c.cabinet).map(c =>
-      opt(c.panel_id || c.cabinet, c.cabinet, '')).join('');
+      opt(c.panel_id || c.cabinet, c.cabinet, root.dataset.financeCabinet || '')).join('');
     return options ? `<select data-f-run-cabinet class="btn secondary" aria-label="Кабинет для загрузки"><option value="">Все кабинеты</option>${options}</select>` : '';
   }
 
@@ -56,17 +57,42 @@ window.WBOPSFinance = (() => {
     </div>`;
   }
 
+  function periodOptions(s) {
+    if (!s) return '';
+    if (flt.grain === 'day') {
+      const months = [...new Set(s.period_keys.map(d => d.slice(0, 7)))].reverse();
+      if (!months.includes(flt.dayMonth)) flt.dayMonth = months[0] || '';
+      const format = new Intl.DateTimeFormat('ru-RU', {month: 'long', year: 'numeric', timeZone: 'UTC'});
+      return `<select data-f-period aria-label="Месяц" class="btn secondary">${months.map(m =>
+        opt(m, format.format(new Date(m + '-01T00:00:00Z')), flt.dayMonth)).join('')}</select>`;
+    }
+    const weekly = flt.grain === 'week';
+    const current = weekly ? flt.lastWeeks : flt.lastMonths;
+    const unit = weekly ? 'нед.' : 'мес.';
+    return `<select data-f-period aria-label="Период" class="btn secondary">${[6, 12, 0].map(n =>
+      opt(n, n ? `Последние ${n} ${unit}` : 'Весь период', current)).join('')}</select>`;
+  }
+
   function renderTable(s) {
-    const n = s.periods.length, from = flt.lastMonths ? Math.max(0, n - flt.lastMonths) : 0;
-    const periods = s.periods.slice(from).reverse(), fc = s.forecast_title;
-    const head = `<tr><th class="f-sticky">Статья</th><th>Итого</th><th>% выр.</th>${fc ? `<th class="f-fc">${esc(fc)}</th>` : ''}${periods.map(p => `<th>${esc(p)}</th>`).join('')}</tr>`;
+    if (!s) return '<p class="muted">В этом отчёте нет детализации. Нажмите «Собрать из кэша», чтобы обновить отчёт.</p>';
+    let columns = s.periods.map((_, i) => i);
+    if (flt.grain === 'day') {
+      columns = columns.filter(i => s.period_keys[i].startsWith(flt.dayMonth));
+    } else {
+      const limit = flt.grain === 'week' ? flt.lastWeeks : flt.lastMonths;
+      if (limit) columns = columns.slice(-limit);
+    }
+    columns.reverse();
+    const fc = s.forecast_title;
+    const totalTitle = columns.length < s.periods.length && flt.grain !== 'month' ? 'Итого за отчёт' : 'Итого';
+    const head = `<tr><th class="f-sticky">Статья</th><th>${totalTitle}</th><th>% выр.</th>${fc ? `<th class="f-fc">${esc(fc)}</th>` : ''}${columns.map(i => `<th title="${esc(s.period_keys?.[i])}">${esc(s.periods[i])}</th>`).join('')}</tr>`;
     const body = s.rows.map(r => {
-      if (r.kind === 'section') return `<tr class="f-section"><td class="f-sticky" colspan="${3 + periods.length + (fc ? 1 : 0)}">${esc(r.label)}</td></tr>`;
+      if (r.kind === 'section') return `<tr class="f-section"><td class="f-sticky" colspan="${3 + columns.length + (fc ? 1 : 0)}">${esc(r.label)}</td></tr>`;
       if (r.kind === 'detail' && !flt.showDetails) return '';
       const isShare = r.kind === 'share', fmt = isShare ? pct : rub;
-      const cells = r.values.slice(from).reverse().map(v => `<td${neg(v)}>${fmt(v)}</td>`).join('');
+      const cells = columns.map(i => `<td${neg(r.values[i])}>${fmt(r.values[i])}</td>`).join('');
       return `<tr class="f-${r.kind}${/^ПРИБЫЛЬ/.test(r.label) ? ' f-profit' : ''}"><td class="f-sticky">${esc(r.label)}</td>
-        <td${neg(r.total)}>${fmt(r.total)}</td><td>${isShare ? '' : pct(r.pct)}</td>${fc ? `<td class="f-fc"${neg(r.forecast)}>${fmt(r.forecast)}</td>` : ''}${cells}</tr>`;
+        <td${neg(r.total)}>${fmt(r.total)}</td><td>${isShare ? '' : pct(r.pct)}</td>${fc ? `<td class="f-fc${r.forecast < 0 ? ' f-neg' : ''}">${fmt(r.forecast)}</td>` : ''}${cells}</tr>`;
     }).join('');
     return `<div class="f-scroll"><table class="f-table">${head}${body}</table></div>`;
   }
@@ -94,6 +120,7 @@ window.WBOPSFinance = (() => {
     const box = root.querySelector('[data-f-report]');
     if (!report) return;
     const s = report.summary, problems = report.control.filter(r => r.problem);
+    const table = flt.grain === 'month' ? s : report.detail?.[flt.grain];
     const fs = report.finance_status || {}, cabs = Object.entries(fs.cabinets || {});
     const quality = report.quality || {};
     const statusTitle = {complete: 'полностью загружен', cache: 'из кэша', api_error: 'ошибка API', skipped: 'пропущен', loading: 'загружается', interrupted: 'прерван'};
@@ -105,12 +132,13 @@ window.WBOPSFinance = (() => {
       ${!quality.reliable ? `<div class="f-alert"><b>Прибыль нельзя считать надёжной.</b> ${esc((quality.reasons || []).slice(0, 3).join('; '))}</div>` : ''}
       ${problems.length ? `<div class="f-alert"><b>На листе «Контроль» есть замечания (${problems.length}):</b><ul>${problems.slice(0, 6).map(p => `<li>${esc(p.marketplace)}${p.cabinet && p.cabinet !== '—' ? ' · ' + esc(p.cabinet) : ''}: ${esc(p.metric)} — ${esc(typeof p.value === 'number' ? rub(p.value) : p.value)} <i>${esc(p.status)}</i></li>`).join('')}</ul></div>` : '<div class="f-ok">Сверки сошлись, замечаний нет.</div>'}
       ${renderKpi(s)}
-      <div class="f-head"><h3>ОПиУ по месяцам</h3><div class="toolbar">
+      <div class="f-head"><h3>ОПиУ ${grainLabels[flt.grain].toLowerCase()}</h3><div class="toolbar">
+        <select data-f-grain class="btn secondary" aria-label="Детализация ОПиУ">${Object.entries(grainLabels).map(([key, label]) => opt(key, label, flt.grain)).join('')}</select>
         ${cabinetSelect(report.cabinets || [])}
         ${runCabinetSelect(report.cabinets || [])}
         <label class="r-check"><input type="checkbox" data-f-details ${flt.showDetails ? 'checked' : ''}> ${flt.cabinet ? 'Расшифровка статей' : 'По маркетплейсам'}</label>
-        <select data-f-months class="btn secondary"><option value="6"${flt.lastMonths === 6 ? ' selected' : ''}>Последние 6 мес.</option><option value="12"${flt.lastMonths === 12 ? ' selected' : ''}>Последние 12 мес.</option><option value="0"${!flt.lastMonths ? ' selected' : ''}>Весь период</option></select></div></div>
-      ${renderTable(s)}
+        ${periodOptions(table)}</div></div>
+      ${renderTable(table)}
       <h3>Контроль</h3>${renderControl(report.control)}
       <div class="f-head"><h3>Товары за период</h3><input data-f-goods-search placeholder="Поиск по артикулу"></div>
       <div data-f-goods>${renderGoods(report.goods)}</div>`;
@@ -118,7 +146,15 @@ window.WBOPSFinance = (() => {
     const runCab = box.querySelector('[data-f-run-cabinet]');
     if (runCab) runCab.onchange = e => { root.dataset.financeCabinet = e.target.value; };
     box.querySelector('[data-f-details]').onchange = e => { flt.showDetails = e.target.checked; remember(); renderReport(); };
-    box.querySelector('[data-f-months]').onchange = e => { flt.lastMonths = Number(e.target.value); remember(); renderReport(); };
+    box.querySelector('[data-f-grain]').onchange = e => { flt.grain = e.target.value; remember(); renderReport(); };
+    const period = box.querySelector('[data-f-period]');
+    if (period) period.onchange = e => {
+      if (flt.grain === 'day') flt.dayMonth = e.target.value;
+      else if (flt.grain === 'week') flt.lastWeeks = Number(e.target.value);
+      else flt.lastMonths = Number(e.target.value);
+      remember();
+      renderReport();
+    };
     box.querySelector('[data-f-goods-search]').oninput = e => { box.querySelector('[data-f-goods]').innerHTML = renderGoods(report.goods, e.target.value.trim()); };
   }
 
@@ -220,7 +256,7 @@ window.WBOPSFinance = (() => {
 .f-total td{font-weight:700;background:#fffbeb}.f-total .f-sticky{background:#fffbeb}.f-profit td{background:#ecfdf5;font-weight:700}.f-profit .f-sticky{background:#ecfdf5}.f-detail td{color:#6b7280;font-size:12px}.f-detail .f-sticky{padding-left:26px}.f-share td{color:#4b5563}.f-fc{background:#fdf4ff}
 .f-control td:nth-child(3){text-align:left;white-space:normal}.f-control td{text-align:left}.f-problem td{background:#fff7ed;color:#9a3412}
 .f-alert{padding:12px 14px;border-radius:10px;background:#fff7ed;color:#9a3412;margin:10px 0}.f-alert ul{margin:6px 0 0 18px;padding:0}.f-ok{padding:10px 14px;border-radius:10px;background:#ecfdf5;color:#065f46;margin:10px 0}
-.f-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.f-head h3{margin:12px 0 4px}.f-head input{padding:8px 10px;border:1px solid #ddd6fe;border-radius:10px}
+.f-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.f-head .toolbar{flex-wrap:wrap}.f-head h3{margin:12px 0 4px}.f-head input{padding:8px 10px;border:1px solid #ddd6fe;border-radius:10px}
 .f-run{padding:12px;border:1px solid #ddd6fe;border-radius:10px;background:#faf5ff;margin:10px 0}.f-run pre{max-height:220px;overflow:auto;font-size:12px;white-space:pre-wrap;margin:8px 0 0}.f-settings{margin:8px 0}.f-settings summary{cursor:pointer;color:#6d28d9}.r-form input:not([type]){padding:9px;border:1px solid #ddd6fe;border-radius:10px}`;
   document.head.appendChild(style);
   return {render};

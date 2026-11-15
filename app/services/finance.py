@@ -22,6 +22,7 @@ from typing import BinaryIO
 SUMMARY_SHEET = "Свод"
 CONTROL_SHEET = "Контроль"
 GOODS_SHEET = "Товары"
+DETAIL_GRAINS = ("day", "week")
 MARKETPLACE_NAMES = {"Wildberries", "Ozon", "Яндекс Маркет"}
 TOTAL_PREFIXES = ("ИТОГО", "ВАЛОВАЯ", "ПРИБЫЛЬ", "Выручка за вычетом", "Итого расходы")
 KPI_LABELS = {
@@ -240,7 +241,7 @@ def _load_workbook(path: Path):
         raise FinanceError(f"Не удалось открыть {path.name}: {type(exc).__name__}") from exc
 
 
-def parse_summary(ws, articles: set | None = None) -> dict:
+def parse_summary(ws, articles: set | None = None, detail: bool = False) -> dict:
     """Лист ОПиУ: «Свод» (расшифровка статей — по маркетплейсам) или лист площадки/кабинета.
 
     articles — статьи «Свода»: на листе площадки расшифровка — исходные строки отчёта маркетплейса,
@@ -306,8 +307,12 @@ def parse_summary(ws, articles: set | None = None) -> dict:
     revenue = (kpi.get("revenue") or {}).get("total")
     profit = (kpi.get("profit") or {}).get("total")
     kpi["margin"] = {"total": profit / revenue if revenue and profit is not None else None}
-    return {"title": title, "subtitle": subtitle, "periods": periods,
-            "forecast_title": forecast["title"] if forecast else None, "rows": out, "kpi": kpi}
+    summary = {"title": title, "subtitle": subtitle, "periods": periods,
+               "forecast_title": forecast["title"] if forecast else None, "rows": out, "kpi": kpi}
+    if detail:
+        key_row = rows[header_index - 1] if header_index else ()
+        summary["period_keys"] = [_text(key_row[col]) if col < len(key_row) else "" for col, _ in period_cols]
+    return summary
 
 
 def parse_control(ws) -> list[dict]:
@@ -345,7 +350,7 @@ def parse_goods(ws, limit: int | None = None) -> dict:
     return {"header": header, "rows": items}
 
 
-def parse_views(wb, articles: set) -> tuple[dict, list[dict]]:
+def parse_views(wb, articles: set, grain: str = "") -> tuple[dict, list[dict]]:
     """Листы ОПиУ площадок и кабинетов → ({ключ: свод}, [кабинеты отчёта]).
 
     Ключ «Ozon» — площадка целиком, «Ozon|Еврозоо» — кабинет. У площадки с одним кабинетом лист один
@@ -353,9 +358,14 @@ def parse_views(wb, articles: set) -> tuple[dict, list[dict]]:
     кабинетов.
     """
     views, cabinets = {}, []
-    for name in wb.sheetnames:
-        if name in (SUMMARY_SHEET, CONTROL_SHEET, GOODS_SHEET):
-            continue
+    if grain:
+        prefix = f"_{grain}_"
+        names = [name for name in wb.sheetnames if name.startswith(prefix) and name != prefix + SUMMARY_SHEET]
+    else:
+        reserved = (SUMMARY_SHEET, CONTROL_SHEET, GOODS_SHEET)
+        prefixes = tuple(f"_{g}_" for g in DETAIL_GRAINS)
+        names = [name for name in wb.sheetnames if name not in reserved and not name.startswith(prefixes)]
+    for name in names:
         ws = wb[name]
         first = next(iter(ws.iter_rows(max_row=1, values_only=True)), ())
         m = SHEET_TITLE.match(_text(first[0]) if first else "")
@@ -363,7 +373,7 @@ def parse_views(wb, articles: set) -> tuple[dict, list[dict]]:
             continue
         mp, cab = m.group(1), m.group(2)
         try:
-            view = parse_summary(ws, articles)
+            view = parse_summary(ws, articles, detail=bool(grain))
         except FinanceError:
             continue
         if cab:
@@ -422,7 +432,8 @@ def report_view(data: dict, key: str = "") -> dict:
                "reasons": reasons[:20]}
     if key not in views:
         key = ""
-    out = {k: v for k, v in data.items() if k != "views"}
+    out = {k: v for k, v in data.items() if k not in ("views", "detail")}
+    out["detail"] = {g: summary for g, views in data.get("detail", {}).items() if (summary := views.get(key))}
     goods = data["goods"]
     if not key:
         out["goods"] = {**goods, "rows": goods["rows"][:GOODS_LIMIT], "scope": "Все маркетплейсы"}
@@ -453,8 +464,17 @@ def read_report(path: Path) -> dict:
         if SUMMARY_SHEET not in wb.sheetnames:
             raise FinanceError(f"В файле {path.name} нет листа «{SUMMARY_SHEET}»")
         summary = parse_summary(wb[SUMMARY_SHEET])
-        views, cabinets = parse_views(wb, {r["label"] for r in summary["rows"] if r["kind"] not in ("detail", "section")})
+        views, cabinets = parse_views(wb, pnl_articles(summary))
+        detail = {}
+        for grain in DETAIL_GRAINS:
+            name = f"_{grain}_{SUMMARY_SHEET}"
+            if name not in wb.sheetnames:
+                continue
+            variant = parse_summary(wb[name], detail=True)
+            variant_views, _ = parse_views(wb, pnl_articles(variant), grain)
+            detail[grain] = {"": variant, **variant_views}
         data = {"summary": summary, "views": views, "cabinets": cabinets,
+                "detail": detail,
                 "control": parse_control(wb[CONTROL_SHEET]) if CONTROL_SHEET in wb.sheetnames else [],
                 "goods": parse_goods(wb[GOODS_SHEET]) if GOODS_SHEET in wb.sheetnames else {"header": [], "rows": []},
                 "file": path.name, "updated_at": datetime.fromtimestamp(stamp).isoformat(timespec="minutes")}
@@ -463,6 +483,10 @@ def read_report(path: Path) -> dict:
     _cache.clear()
     _cache[str(path)] = (stamp, data)
     return data
+
+
+def pnl_articles(summary):
+    return {r["label"] for r in summary["rows"] if r["kind"] not in ("detail", "section")}
 
 
 class ReportRunner:

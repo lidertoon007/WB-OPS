@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from argparse import Namespace
+from datetime import date
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -76,6 +77,44 @@ class FinanceTests(unittest.TestCase):
         self.assertEqual([r["problem"] for r in data["control"]], [False, True])
         self.assertEqual(data["goods"]["header"], ["Артикул", "Маркетплейс", "Штук", "Выручка"])
         self.assertEqual(data["goods"]["rows"], [["A", "Все маркетплейсы", 2, 1000]])
+        self.assertEqual(finance.report_view(data)["detail"], {})
+
+    def test_report_detail_uses_source_dates_and_cabinet_scope(self):
+        from opiu import opiu_all
+
+        months = ["2026-09", "2026-10"]
+        days = ["2026-09-30", "2026-10-01", "2026-10-02", "2026-10-03"]
+        source = {"marketplace": "Wildberries", "months": days, "cabinets": {
+            "К1": {"rows": [["Выручка", "Продано", {days[0]: 100, days[1]: 300}]],
+                   "sales": [[days[0], "A", 1, 100], [days[1], "A", 2, 300]],
+                   "tax_base": {days[0]: 90, days[1]: 270}},
+            "К2": {"rows": [["Выручка", "Продано", {days[2]: 200}]], "tax_base": {days[2]: 150}},
+        }}
+        entities, _ = opiu_all.build([source])
+        book = Workbook()
+        book.active.title = "Свод"
+        opiu_all.write_pnl(book.active, {opiu_all.REV_SALES: {"Продано": dict(zip(months, (100, 500)))}},
+                           months, "ОПиУ маркетплейсов — свод")
+        for cabinet in source["cabinets"]:
+            opiu_all.write_pnl(book.create_sheet(cabinet), {}, months, f"ОПиУ Wildberries — {cabinet}")
+        opiu_all.write_report_detail(book, {name.lower() for name in book.sheetnames}, months, entities, [source],
+                                     {"A": [("", 1, 10), ("2026-10-01", 1, 20)]}, {},
+                                     {("Wildberries", None): 10}, {}, {}, None, date(2026, 11, 1))
+        path = self.dir / "detailed.xlsx"
+        opiu_all.save_workbook(book, path)
+
+        data = finance.read_report(path)
+        all_cabinets = finance.report_view(data)
+        self.assertEqual(all_cabinets["summary"]["kpi"]["revenue"]["total"], 600)
+        self.assertEqual(all_cabinets["detail"]["day"]["period_keys"], days[:3])
+        self.assertEqual(all_cabinets["detail"]["week"]["period_keys"], ["2026-09-28"])
+        self.assertEqual(all_cabinets["detail"]["week"]["kpi"]["revenue"]["total"], 600)
+        for grain in ("day", "week"):
+            variant = finance.report_view(data, "Wildberries|К1")["detail"][grain]
+            self.assertEqual(variant["kpi"]["revenue"]["total"], 400)
+            self.assertEqual(variant["kpi"]["cogs"]["total"], -50)
+            self.assertEqual(variant["kpi"]["tax"]["total"], -36)
+            self.assertEqual(variant["kpi"]["margin"]["total"], (400 - 50 - 36) / 400)
 
     def test_report_quality_marks_missing_cost_and_api_warning(self):
         data = finance.read_report(self.dir / "opiu_all_2026-09_2026-10.xlsx")
