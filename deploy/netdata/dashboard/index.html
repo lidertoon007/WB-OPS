@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Состояние сервера · WB OPS</title>
+<style>
+:root{font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;color:#e5ecf7;background:#0a1020;font-synthesis:none}*{box-sizing:border-box}body{margin:0}main{max-width:1440px;margin:auto;padding:32px 28px 24px}header,.toolbar,.heading,.legend{display:flex;align-items:center;gap:14px;flex-wrap:wrap}header{justify-content:space-between;margin-bottom:26px}h1{font-size:27px;letter-spacing:-.7px;margin:4px 0 8px}h2{font-size:15px;margin:0}.eyebrow{font-size:11px;letter-spacing:2px;color:#6da8ff;font-weight:700}.muted,.sub,.axis{color:#8f9db6}.sub{font-size:12px;line-height:1.6;min-height:20px;margin-top:9px}.node{font-size:13px;color:#a8b8ce}a{color:#a3c5ff;text-decoration:none}a:hover{text-decoration:underline}button,select{font:inherit;font-size:13px;color:#e5ecf7;background:#19263e;border:1px solid #334563;border-radius:8px;padding:9px 12px}button{cursor:pointer;background:#2465d8;border-color:#3679ef}button:disabled{opacity:.55;cursor:wait}select:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid #85b7ff;outline-offset:3px}label{font-size:12px;color:#a8b8ce}.status{font-size:12px;line-height:1.7;padding:11px 15px;background:#111c30;border:1px solid #26364e;border-radius:9px;margin-bottom:20px}.status.error{color:#ffcb84;border-color:#825b29}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px}.card,.plot,.health{background:linear-gradient(125deg,#131e32,#10192a);border:1px solid #26354e;border-radius:13px;padding:20px}.card .value{font-size:29px;font-weight:650;letter-spacing:-.8px;margin-top:13px;overflow-wrap:anywhere}.card .value.small{font-size:23px}.bar{height:4px;background:#26344b;border-radius:6px;margin-top:14px;overflow:hidden}.bar span{display:block;height:100%;background:#6da8ff;width:0;transition:width .4s}.plots{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:22px}.heading{justify-content:space-between;margin-bottom:6px}.legend{font-size:11px;gap:12px;margin-top:10px}.legend span:before{content:"";display:inline-block;width:7px;height:7px;background:var(--line);border-radius:50%;margin-right:5px}.chart{width:100%;height:180px;display:block;margin-top:14px}.axis{font-size:10px;fill:#8f9db6}.plot .empty{font-size:13px;color:#9aaac1;min-height:180px;display:flex;align-items:center;justify-content:center}.health{margin-top:20px}.health ul{padding-left:20px;font-size:13px;line-height:1.7}.health .warning{color:#ffc66e}.health .critical{color:#ff8790}footer{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;font-size:11px;color:#8190a8;margin-top:22px}.source{font-size:11px;color:#8f9db6;overflow-wrap:anywhere}#health-summary{margin-top:12px;font-size:14px}noscript{display:block;color:#ffc66e;padding:24px} @media(max-width:950px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:600px){main{padding:22px 14px}.plots{grid-template-columns:1fr}.card,.plot,.health{padding:16px}.card .value{font-size:24px}.card .value.small{font-size:20px}header{align-items:flex-start}.toolbar{gap:9px}h1{font-size:24px}}
+</style>
+</head>
+<body>
+<main>
+<header><div><div class="eyebrow">WB OPS / МОНИТОРИНГ</div><h1>Состояние сервера</h1><div class="node">Узел: <strong id="node">определяем…</strong></div></div><div class="toolbar"><label>Период <select id="period"><option value="900">15 минут</option><option value="3600">1 час</option><option value="21600">6 часов</option></select></label><button id="refresh" type="button">Обновить</button><a href="/" target="_blank" rel="noopener">Открыть Netdata ↗</a></div></header>
+<div id="status" class="status" role="status" aria-live="polite">Загрузка показателей…</div>
+<section class="cards" aria-label="Ключевые показатели">
+<article class="card"><h2>CPU</h2><div id="cpu-value" class="value">—</div><div class="sub" id="cpu-sub">Загрузка процессора</div><div class="bar"><span id="cpu-bar"></span></div></article>
+<article class="card"><h2>Оперативная память</h2><div id="ram-value" class="value">—</div><div class="sub" id="ram-sub">Занято / всего</div><div class="bar"><span id="ram-bar"></span></div></article>
+<article class="card"><h2>Load average</h2><div id="load-value" class="value small">—</div><div class="sub" id="load-sub">1 / 5 / 15 минут</div></article>
+<article class="card"><h2>Диск · место</h2><div id="space-value" class="value">—</div><div class="sub" id="space-sub">Занято / всего</div><div class="bar"><span id="space-bar"></span></div></article>
+<article class="card"><h2>Диск · I/O</h2><div id="io-value" class="value small">—</div><div class="sub" id="io-sub">Чтение / запись</div></article>
+<article class="card"><h2>Сеть</h2><div id="net-value" class="value small">—</div><div class="sub" id="net-sub">↓ Входящий / ↑ исходящий</div></article>
+<article class="card"><h2>Время работы</h2><div id="uptime-value" class="value small">—</div><div class="sub" id="uptime-sub">С последней загрузки</div></article>
+<article class="card"><h2>Health alerts</h2><div id="alerts-value" class="value small">—</div><div class="sub" id="alerts-sub">Критические / предупреждения</div></article>
+</section>
+<section class="plots" aria-label="Графики показателей">
+<article class="plot"><div class="heading"><h2>CPU · загрузка</h2><span class="source" id="cpu-source"></span></div><div id="cpu-chart"></div><div class="legend"><span style="--line:#6da8ff">Загрузка, %</span></div></article>
+<article class="plot"><div class="heading"><h2>RAM · занято</h2><span class="source" id="ram-source"></span></div><div id="ram-chart"></div><div class="legend"><span style="--line:#aa8cff">Использование, %</span></div></article>
+<article class="plot"><div class="heading"><h2>Сеть · трафик</h2><label>Интерфейс <select id="network" aria-label="Сетевой интерфейс"></select></label></div><div id="net-chart"></div><div class="legend"><span style="--line:#45d7bc">Входящий</span><span style="--line:#6da8ff">Исходящий</span></div><div class="source" id="net-source"></div></article>
+<article class="plot"><div class="heading"><h2>Диск · скорость I/O</h2><label>Устройство <select id="disk" aria-label="Диск для I/O"></select></label></div><div id="io-chart"></div><div class="legend"><span style="--line:#ffc66e">Чтение</span><span style="--line:#aa8cff">Запись</span></div><div class="source" id="io-source"></div></article>
+</section>
+<section class="health" aria-label="Состояние проверок"><div class="heading"><h2>Состояние проверок Netdata</h2><label>Раздел диска <select id="filesystem" aria-label="Раздел диска"></select></label></div><div id="health-summary">Загрузка…</div><ul id="health-list"></ul></section>
+<footer><span>Автообновление каждые 10 секунд · значения усредняются по точкам графика</span><span>Локальный Netdata API · без внешних ресурсов</span></footer>
+<noscript>Для отображения показателей включите JavaScript в браузере.</noscript>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const fmt = (n, digits = 1) => Number.isFinite(n) ? n.toLocaleString('ru-RU', {maximumFractionDigits: digits}) : '—';
+const state = {catalog: null, discoveredAt: 0, busy: false, pending: false};
+const colors = ['#6da8ff', '#aa8cff', '#45d7bc', '#ffc66e'];
+function text(id, value) { $(id).textContent = value; }
+async function api(path, params = {}) {
+  const url = new URL('/api/v1/' + path, location.origin);
+  Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+  const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(url, {signal: controller.signal, cache: 'no-store', credentials: 'same-origin'});
+    if (!response.ok) throw new Error(response.status === 401 ? 'Требуется вход в Netdata' : `API: HTTP ${response.status}`);
+    return await response.json();
+  } finally { clearTimeout(timeout); }
+}
+function candidates(context, fallback) {
+  const charts = Object.values(state.catalog.charts);
+  const found = charts.filter(c => c.context === context);
+  return found.length ? found : charts.filter(c => c.id === fallback);
+}
+function options(id, charts, preferred) {
+  const select = $(id), previous = select.value;
+  select.replaceChildren();
+  charts.forEach(chart => {
+    const option = document.createElement('option'); option.value = chart.id;
+    option.textContent = chart.context.startsWith('system.') ? 'Суммарно' : (chart.name || chart.id);
+    select.append(option);
+  });
+  if (!charts.length) { const option = document.createElement('option'); option.textContent = 'Нет данных'; option.value = ''; select.append(option); }
+  select.value = charts.some(c => c.id === previous) ? previous : (preferred?.id || charts[0]?.id || '');
+  select.disabled = !charts.length;
+}
+async function discover() {
+  const catalog = await api('charts');
+  if (!catalog.charts || typeof catalog.charts !== 'object') throw new Error('Нет каталога метрик Netdata');
+  Object.entries(catalog.charts).forEach(([id, chart]) => { chart.id = chart.id || id; });
+  state.catalog = catalog; state.discoveredAt = Date.now();
+  text('node', catalog.hostname || 'Имя узла недоступно');
+  const net = [...candidates('system.net', 'system.net'), ...candidates('net.net', '')];
+  const disks = [...candidates('system.io', 'system.io'), ...candidates('disk.io', '')];
+  const spaces = candidates('disk.space', 'disk_space./');
+  options('network', net); options('disk', disks);
+  options('filesystem', spaces, spaces.find(c => c.id === 'disk_space./' || c.chart_labels?.mount_point === '/'));
+}
+function chosen(context, fallback) { return candidates(context, fallback)[0]?.id || ''; }
+function latest(data) {
+  const row = data.data.find(row => row.slice(1).some(Number.isFinite));
+  if (!row) throw new Error('Нет свежих точек');
+  return Object.fromEntries(data.labels.slice(1).map((key, i) => [key, row[i + 1]]));
+}
+function sum(values) { const valid = values.filter(Number.isFinite); return valid.length ? valid.reduce((a, b) => a + b, 0) : null; }
+function cpuValue(values) { return sum(Object.entries(values).filter(([key]) => key.toLowerCase() !== 'idle').map(([, value]) => value)); }
+function percent(used, total) { return Number.isFinite(used) && total > 0 ? 100 * used / total : null; }
+function ramValue(values) { return percent(values.used, sum(Object.values(values))); }
+function dimension(values, names) { for (const name of names) if (Number.isFinite(values[name])) return Math.abs(values[name]); return null; }
+function bytes(value, unit) {
+  const factors = {bytes:1, KiB:1024, MiB:1024**2, GiB:1024**3, TiB:1024**4, KB:1000, MB:1000**2, GB:1000**3};
+  if (!Number.isFinite(value)) return '—';
+  if (!factors[unit]) return `${fmt(value)} ${unit}`;
+  let n = value * factors[unit], i = 0; const units = ['Б','КиБ','МиБ','ГиБ','ТиБ'];
+  while (Math.abs(n) >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${fmt(n)} ${units[i]}`;
+}
+function rate(value, unit) {
+  if (!Number.isFinite(value)) return '—';
+  if (unit.endsWith('/s') && ['bytes','KiB','MiB','GiB','KB','MB','GB'].includes(unit.slice(0,-2))) return bytes(value, unit.slice(0,-2)) + '/с';
+  if (/kilobits\/s/i.test(unit)) return value >= 1000 ? `${fmt(value / 1000)} Мбит/с` : `${fmt(value)} Кбит/с`;
+  return `${fmt(value)} ${unit}`;
+}
+function bar(id, n) { $(id + '-bar').style.width = `${Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0}%`; }
+function svgNode(tag, attrs = {}, content) {
+  const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, value));
+  if (content !== undefined) node.textContent = content;
+  return node;
+}
+function draw(id, data, series, unit, fixedMax) {
+  const host = $(id + '-chart'); host.replaceChildren();
+  const rows = [...data.data].sort((a, b) => a[0] - b[0]);
+  const lines = series.map(s => ({...s, values: rows.map(row => s.get(Object.fromEntries(data.labels.slice(1).map((name,i) => [name,row[i+1]]))))}));
+  const available = lines.flatMap(s => s.values).filter(Number.isFinite);
+  if (!available.length) { emptyPlot(id, 'Пока нет точек для графика'); return; }
+  const max = fixedMax || Math.max(1, ...available) * 1.1, width = 600, height = 180, left = 52, right = 12, top = 12, bottom = 28;
+  const svg = svgNode('svg', {viewBox:`0 0 ${width} ${height}`, class:'chart', role:'img', 'aria-label':`${id}: ${unit}, период ${$('period').selectedOptions[0].textContent}`});
+  const from = Math.floor(Date.now()/1000) - Number($('period').value), to = Math.floor(Date.now()/1000);
+  const x = timestamp => left + (timestamp - from) / (to - from) * (width-left-right);
+  const y = n => top + (1 - Math.max(0, Math.min(n, max)) / max) * (height-top-bottom);
+  for (let i=0;i<3;i++) {
+    const value = max * i / 2;
+    svg.append(svgNode('line', {x1:left,y1:y(value),x2:width-right,y2:y(value),stroke:'#26354b','stroke-width':1}));
+    svg.append(svgNode('text', {x:left-8,y:y(value)+4,'text-anchor':'end',class:'axis'}, fmt(value,1)));
+  }
+  lines.forEach(line => {
+    let points = [];
+    const flush = () => { if (points.length) svg.append(svgNode('polyline',{points:points.join(' '),fill:'none',stroke:line.color,'stroke-width':2,'stroke-linejoin':'round'})); points=[]; };
+    line.values.forEach((n,i) => { if (Number.isFinite(n) && rows[i][0] >= from && rows[i][0] <= to) points.push(`${x(rows[i][0])},${y(n)}`); else flush(); }); flush();
+  });
+  const time = n => new Date(n*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+  svg.append(svgNode('text',{x:left,y:height-5,class:'axis'},time(from)), svgNode('text',{x:width-right,y:height-5,class:'axis','text-anchor':'end'},time(to)), svgNode('text',{x:width-right,y:11,class:'axis','text-anchor':'end'},unit));
+  host.append(svg);
+}
+function emptyPlot(id, message) { const node = document.createElement('div'); node.className='empty'; node.textContent=message; $(id+'-chart').replaceChildren(node); }
+function unavailable(key, message) {
+  text(key+'-value', '—'); text(key+'-sub', message);
+  if (['cpu','ram','space'].includes(key)) bar(key, null);
+  if (['cpu','ram','net','io'].includes(key)) { emptyPlot(key, message); text(key+'-source',''); }
+}
+function render(key, data, chart) {
+  const values = latest(data), unit = chart.units || '';
+  if (key==='cpu') { const n=cpuValue(values); if (!Number.isFinite(n)) throw new Error('Нет загрузки CPU'); text('cpu-value',fmt(n)+' %'); text('cpu-sub','Все ядра · включая iowait и steal'); bar('cpu',n); draw('cpu',data,[{get:cpuValue,color:colors[0]}],'%',100); }
+  if (key==='ram') { const used=values.used,total=sum(Object.values(values)),n=ramValue(values); if (!Number.isFinite(n)) throw new Error('Нет объёма RAM'); text('ram-value',fmt(n)+' %'); text('ram-sub',`${bytes(used,unit)} / ${bytes(total,unit)} · без cache и buffers`); bar('ram',n); draw('ram',data,[{get:ramValue,color:colors[1]}],'%',100); }
+  if (key==='space') { const total=sum(Object.values(values)),n=percent(values.used,total); if (!Number.isFinite(n)) throw new Error('Нет объёма диска'); text('space-value',fmt(n)+' %'); text('space-sub',`${bytes(values.used,unit)} / ${bytes(total,unit)} · ${chart.name || chart.id}`); bar('space',n); }
+  if (key==='load') { if (![values.load1,values.load5,values.load15].every(Number.isFinite)) throw new Error('Нет load average'); text('load-value',[values.load1,values.load5,values.load15].map(n=>fmt(n,2)).join(' / ')); text('load-sub','1 / 5 / 15 минут · очередь задач'); }
+  if (key==='uptime') { const n=dimension(values,['uptime']); if (!Number.isFinite(n)) throw new Error('Нет uptime'); text('uptime-value',`${Math.floor(n/86400)} д ${Math.floor(n%86400/3600)} ч ${Math.floor(n%3600/60)} мин`); text('uptime-sub','С последней загрузки'); }
+  if (key==='net' || key==='io') {
+    const names=key==='net' ? [['received','InOctets','in'],['sent','OutOctets','out']] : [['reads','in','read'],['writes','out','write']];
+    const first=v=>dimension(v,names[0]),second=v=>dimension(v,names[1]);
+    if (![first(values),second(values)].every(Number.isFinite)) throw new Error('Нет измерений чтения/передачи');
+    text(key+'-value',`${rate(first(values),unit)} / ${rate(second(values),unit)}`);
+    text(key+'-sub',key==='net' ? '↓ Входящий / ↑ исходящий' : 'Чтение / запись');
+    draw(key,data,[{get:first,color:key==='net'?colors[2]:colors[3]},{get:second,color:key==='net'?colors[0]:colors[1]}],unit);
+  }
+  if (['cpu','ram','net','io'].includes(key)) text(key+'-source',chart.name || chart.id);
+}
+async function health() {
+  const data=await api('alarms',{all:''});
+  if (!data.alarms || typeof data.alarms!=='object') throw new Error('Нет состояния проверок');
+  const alarms=Object.values(data.alarms).filter(a=>a.active!==false && !a.disabled), critical=alarms.filter(a=>a.status==='CRITICAL'), warning=alarms.filter(a=>a.status==='WARNING');
+  const waiting=alarms.filter(a=>['UNINITIALIZED','UNDEFINED'].includes(a.status)).length;
+  text('alerts-value',`${critical.length} / ${warning.length}`); text('alerts-sub','Критические / предупреждения');
+  text('health-summary',`${critical.length ? 'Требуется внимание' : warning.length ? 'Есть предупреждения' : 'Активных тревог нет'} · проверок: ${alarms.length}${waiting ? ` · ожидают данных: ${waiting}` : ''}`);
+  $('health-list').replaceChildren();
+  [...critical,...warning].slice(0,12).forEach(alarm=>{const li=document.createElement('li');li.className=alarm.status.toLowerCase();li.textContent=`${alarm.status==='CRITICAL'?'Критично':'Предупреждение'}: ${alarm.summary || alarm.name} · ${alarm.chart} · ${alarm.value_string || '—'}`;$('health-list').append(li);});
+  if (critical.length+warning.length>12) { const li=document.createElement('li');li.textContent='Остальные тревоги доступны в Netdata.';$('health-list').append(li); }
+}
+async function refresh() {
+  if (state.busy) {state.pending=true;return;}
+  state.busy=true; $('refresh').disabled=true; text('refresh','Обновляем…');
+  const errors=[];
+  try {
+    if (!state.catalog || Date.now()-state.discoveredAt>300000) await discover();
+    const targets={cpu:chosen('system.cpu','system.cpu'),ram:chosen('system.ram','system.ram'),load:chosen('system.load','system.load'),uptime:chosen('system.uptime','system.uptime'),space:$('filesystem').value,net:$('network').value,io:$('disk').value};
+    await Promise.all(Object.entries(targets).map(async ([key,id])=>{
+      try {
+        if (!id) throw new Error('Метрика не найдена на узле');
+        const data=await api('data',{chart:id,after:-Number($('period').value),before:0,points:90,group:'average',format:'json'});
+        if (!Array.isArray(data.data)||!Array.isArray(data.labels)) throw new Error('Некорректные данные API');
+        render(key,data,state.catalog.charts[id]);
+      } catch(error) { const message=error.name==='AbortError'?'API не ответил за 12 секунд':error.message;unavailable(key,message);errors.push(`${key}: ${message}`); }
+    }));
+    try { await health(); } catch(error) {unavailable('alerts','Проверки недоступны');text('health-summary','Не удалось получить состояние проверок');$('health-list').replaceChildren();errors.push(error.message);}
+    const now=new Date().toLocaleTimeString('ru-RU');
+    text('status',errors.length ? `Обновлено ${now} · часть метрик недоступна: ${errors.join('; ')}. Повтор через 10 секунд.` : `Обновлено ${now} · соединение с узлом установлено · период ${$('period').selectedOptions[0].textContent}`);
+    $('status').className='status'+(errors.length?' error':'');
+  } catch(error) {
+    text('status',`Нет связи с Netdata: ${error.name==='AbortError'?'время ожидания истекло':error.message}. Повтор через 10 секунд.`);$('status').className='status error';
+    ['cpu','ram','load','uptime','space','net','io','alerts'].forEach(key=>unavailable(key,'Данные временно недоступны'));text('health-summary','Состояние проверок недоступно');$('health-list').replaceChildren();
+  } finally {
+    state.busy=false;$('refresh').disabled=false;text('refresh','Обновить');
+    if(state.pending){state.pending=false;refresh();}
+  }
+}
+['period','network','disk','filesystem'].forEach(id=>$(id).addEventListener('change',refresh));
+$('refresh').addEventListener('click',refresh);
+refresh();setInterval(()=>{if(!state.busy)refresh();},10000);
+</script>
+</body>
+</html>

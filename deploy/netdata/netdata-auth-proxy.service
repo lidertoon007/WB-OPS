@@ -1,0 +1,19 @@
+[Unit]
+Description=Local Basic Auth proxy for Netdata
+Requires=netdata.service
+After=network-online.target netdata.service
+
+[Service]
+Type=forking
+PIDFile=/run/netdata-auth-proxy.pid
+ExecStartPre=/usr/sbin/nginx -t -q -p /etc/netdata-auth-proxy/ -c nginx.conf
+ExecStart=/usr/sbin/nginx -p /etc/netdata-auth-proxy/ -c nginx.conf
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -QUIT $MAINPID
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
