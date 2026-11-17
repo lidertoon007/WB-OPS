@@ -97,7 +97,7 @@ def analyze_question(item: InboxItem) -> QuestionFacts:
     if w:
         size = w.group(1)
     if size:
-        if int(size) >= 42 and int(size) % 2 == 0 and int(size) <= 66:
+        if not w and int(size) >= 42 and int(size) % 2 == 0 and int(size) <= 66:
             f.ru_size = size
             m = re.search(rf"(2[6-9]|3\d|4[0-2])\s*\(\s*{size}\s*\)|{size}\s*\(\s*(2[6-9]|3\d|4[0-2])\s*\)", t)
             f.size = (m.group(1) or m.group(2)) if m else None
@@ -108,6 +108,8 @@ def analyze_question(item: InboxItem) -> QuestionFacts:
     for key, pattern in INTENTS:
         if re.search(pattern, t):
             f.intents.append(key)
+    if re.search(r"замер|ширин\w* (?:по поясу|пояса|талии|бедер|бедра|бедре|колена)|обхват\w* (?:пояса|бедер)", t):
+        f.intents.append("garment_dimensions")
     if (f.waist or f.hips or f.height or f.weight) and not set(f.intents) & {"size_pick", "length", "bottom", "what_height"}:
         f.intents.append("size_pick")
     if f.length_l and not f.intents:
@@ -292,6 +294,40 @@ class QuestionComposer:
         size = f" у {f.size} размера" if f.size else ""
         return [f"Точное значение ({label}{size}) уточним по замерам этой модели — напишите, пожалуйста, нам в чат продавца или посмотрите таблицу замеров в карточке."]
 
+    def _garment_measurements(self, f, m) -> list[str]:
+        row = size_row(m, f.size or f.ru_size)
+        if not row or not row.get("garment_waist"):
+            return []
+        fields = (
+            ("waist_width", "пояс в разложенном виде", r"пояс|талии"),
+            ("garment_waist", "расчётный обхват пояса", r"обхват.*(?:пояс|талии)"),
+            ("hips_width", "полуобхват бёдер", r"бедер"),
+            ("thigh_width", "ширина одной штанины в бедре", r"бедра|бедре"),
+            ("knee_width", "ширина колена", r"колен"),
+            ("bottom", "ширина низа", r"низ"),
+            ("front_rise", "передняя посадка", r"посадк"),
+            ("back_rise", "задняя посадка", r"посадк"),
+        )
+        measurements = [f"{label} — {_cm(row[key])}" for key, label, pattern in fields
+                        if row.get(key) and (re.search(pattern, f.text) or "замер" in f.text)]
+        if re.search(r"обхват\w* бедер", f.text) and (hips := parse_range(row.get("hips_width"))):
+            measurements.append(f"расчётный обхват бёдер — {_cm(round(hips[0] * 2, 5))}")
+        if not measurements:
+            return []
+        return [f"Замеры изделия для размера {row['size']}: {', '.join(measurements)}."]
+
+    def _length_measurements(self, f, m, key, label) -> list[str]:
+        rows = m.get("sizes", [])
+        row = size_row(m, f.size or f.ru_size) if f.size or f.ru_size else (rows[0] if key == "inseam" and rows else None)
+        if not row or not row.get(f"{key}_l32"):
+            return []
+        lengths = [f"{length} — {_cm(row[field])}" for length in ("L32", "L33")
+                   if (field := f"{key}_{length.lower()}") in row and row[field] and (not f.length_l or length == f.length_l)]
+        if not lengths:
+            return []
+        size = f" у {row['size']} размера" if f.size or f.ru_size else ""
+        return [f"{label.capitalize()}{size}: {', '.join(lengths)}."]
+
     def _fact(self, m, key, fallback) -> list[str]:
         value = str(m.get(key) or "").strip()
         return [value.rstrip(".") + "."] if value else [fallback]
@@ -300,7 +336,7 @@ class QuestionComposer:
         f = analyze_question(item)
         m = self._model(item, f)
         body: list[str] = []
-        priority = ["complaint", "refund", "return", "size_pick", "length", "what_height", "bottom", "waist_for_size", "ru_map",
+        priority = ["complaint", "refund", "return", "size_pick", "length", "what_height", "bottom", "waist_for_size", "garment_dimensions", "ru_map",
                     "composition", "stretch", "density", "season", "shrink", "rise", "fastener", "country", "availability",
                     "find_mark", "price", "units"]
         intents = sorted(f.intents, key=lambda i: priority.index(i) if i in priority else 99) or ["general"]
@@ -352,13 +388,18 @@ class QuestionComposer:
             elif intent == "fastener":
                 body += self._fact(m, "fastener", "Тип застёжки видно на фото в карточке; уточним по этой модели, если нужно.")
             elif intent == "rise":
-                body += self._fact(m, "rise", "") if m.get("rise") else self._fact(m, "fit", "Посадку модели уточним — напишите, какой размер вас интересует, и подскажем высоту посадки.")
+                body += self._garment_measurements(f, m) or self._fact(m, "rise" if m.get("rise") else "fit", "Посадку модели уточним — напишите, какой размер вас интересует, и подскажем высоту посадки.")
             elif intent == "bottom":
                 body += self._measure(f, m, "bottom", "ширина низа")
             elif intent == "length":
+                key, label = ("outseam", "длина по внешнему шву") if re.search(r"внешн|наружн", f.text) else ("inseam", "длина по внутреннему шву")
+                lengths = self._length_measurements(f, m, key, label)
+                if lengths:
+                    body += lengths
+                    done.add("size_pick")
+                    continue
                 if f.length_l:
                     body.append(wl_text(f))
-                key, label = ("outseam", "длина по внешнему шву") if re.search(r"внешн|наружн", f.text) else ("inseam", "длина по внутреннему шву")
                 if f.height and m.get("sizes") and not (f.size or f.ru_size):
                     body += self._size_pick(f, m, item)
                 elif f.height and not m.get("sizes"):
@@ -385,7 +426,9 @@ class QuestionComposer:
                         continue
                 body += self._fact(m, "height_note", "Ростовка зависит от длины по внутреннему шву в таблице замеров. Напишите ваш рост и размер — подскажем, подойдёт ли по длине.")
             elif intent == "waist_for_size":
-                body += self._measure(f, m, "waist", "обхват талии")
+                body += self._garment_measurements(f, m) or self._measure(f, m, "waist", "обхват талии")
+            elif intent == "garment_dimensions":
+                body += self._garment_measurements(f, m)
             elif intent == "size_pick":
                 body += self._size_pick(f, m, item)
             elif intent == "general":

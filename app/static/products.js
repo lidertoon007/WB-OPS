@@ -120,7 +120,8 @@ window.WBOPSProducts = (() => {
       <div class="pr-prod"><div class="pr-photo">${i.photo ? `<img loading="lazy" src="${esc(i.photo)}" alt="" onerror="this.remove()">` : ''}<span aria-hidden="true">👖</span></div>
         <div class="pr-pinfo"><b>${esc(i.article)}</b>${i.name ? `<span class="pr-name">${esc(i.name)}</span>` : ''}
           <span class="muted pr-meta">${[i.brand, i.category, i.nm_ids.length ? `WB ${i.nm_ids.slice(0, 3).join(', ')}${i.nm_ids.length > 3 ? '…' : ''}` : ''].filter(Boolean).map(esc).join(' · ')}
-          ${wb ? `<a href="${wb}" target="_blank" rel="noopener" aria-label="Открыть на Wildberries">↗</a>` : ''}</span></div></div>
+          ${wb ? `<a href="${wb}" target="_blank" rel="noopener" aria-label="Открыть на Wildberries">↗</a>` : ''}
+          ${i.model_key ? `<a href="/products?model=${encodeURIComponent(i.model_key)}">Характеристики</a>` : ''}</span></div></div>
       <div class="r"><b>${i.sold ? i.sold.toLocaleString('ru-RU') : '—'}</b>${i.revenue ? `<span class="muted pr-sub">${rub(i.revenue)}</span>` : ''}</div>
       <div class="r">${i.stock != null ? Math.round(i.stock).toLocaleString('ru-RU') : '—'}</div>
       <div class="r">${i.price ? rub(i.price) : '—'}</div>

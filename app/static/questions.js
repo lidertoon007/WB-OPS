@@ -117,5 +117,6 @@
 @media(max-width:800px){.m-layout{grid-template-columns:1fr}}`;
   document.head.appendChild(style);
 
-  loadQMode(); loadModels();
+  const selectedModel = location.pathname === '/products' ? new URLSearchParams(location.search).get('model') : null;
+  loadQMode(); loadModels(selectedModel);
 })();

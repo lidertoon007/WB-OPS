@@ -1,8 +1,10 @@
 import json
 import sys
 import tempfile
+import time
 import unittest
 from argparse import Namespace
+from datetime import date
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -75,6 +77,44 @@ class FinanceTests(unittest.TestCase):
         self.assertEqual([r["problem"] for r in data["control"]], [False, True])
         self.assertEqual(data["goods"]["header"], ["Артикул", "Маркетплейс", "Штук", "Выручка"])
         self.assertEqual(data["goods"]["rows"], [["A", "Все маркетплейсы", 2, 1000]])
+        self.assertEqual(finance.report_view(data)["detail"], {})
+
+    def test_report_detail_uses_source_dates_and_cabinet_scope(self):
+        from opiu import opiu_all
+
+        months = ["2026-09", "2026-10"]
+        days = ["2026-09-30", "2026-10-01", "2026-10-02", "2026-10-03"]
+        source = {"marketplace": "Wildberries", "months": days, "cabinets": {
+            "К1": {"rows": [["Выручка", "Продано", {days[0]: 100, days[1]: 300}]],
+                   "sales": [[days[0], "A", 1, 100], [days[1], "A", 2, 300]],
+                   "tax_base": {days[0]: 90, days[1]: 270}},
+            "К2": {"rows": [["Выручка", "Продано", {days[2]: 200}]], "tax_base": {days[2]: 150}},
+        }}
+        entities, _ = opiu_all.build([source])
+        book = Workbook()
+        book.active.title = "Свод"
+        opiu_all.write_pnl(book.active, {opiu_all.REV_SALES: {"Продано": dict(zip(months, (100, 500)))}},
+                           months, "ОПиУ маркетплейсов — свод")
+        for cabinet in source["cabinets"]:
+            opiu_all.write_pnl(book.create_sheet(cabinet), {}, months, f"ОПиУ Wildberries — {cabinet}")
+        opiu_all.write_report_detail(book, {name.lower() for name in book.sheetnames}, months, entities, [source],
+                                     {"A": [("", 1, 10), ("2026-10-01", 1, 20)]}, {},
+                                     {("Wildberries", None): 10}, {}, {}, None, date(2026, 11, 1))
+        path = self.dir / "detailed.xlsx"
+        opiu_all.save_workbook(book, path)
+
+        data = finance.read_report(path)
+        all_cabinets = finance.report_view(data)
+        self.assertEqual(all_cabinets["summary"]["kpi"]["revenue"]["total"], 600)
+        self.assertEqual(all_cabinets["detail"]["day"]["period_keys"], days[:3])
+        self.assertEqual(all_cabinets["detail"]["week"]["period_keys"], ["2026-09-28"])
+        self.assertEqual(all_cabinets["detail"]["week"]["kpi"]["revenue"]["total"], 600)
+        for grain in ("day", "week"):
+            variant = finance.report_view(data, "Wildberries|К1")["detail"][grain]
+            self.assertEqual(variant["kpi"]["revenue"]["total"], 400)
+            self.assertEqual(variant["kpi"]["cogs"]["total"], -50)
+            self.assertEqual(variant["kpi"]["tax"]["total"], -36)
+            self.assertEqual(variant["kpi"]["margin"]["total"], (400 - 50 - 36) / 400)
 
     def test_report_quality_marks_missing_cost_and_api_warning(self):
         data = finance.read_report(self.dir / "opiu_all_2026-09_2026-10.xlsx")
@@ -91,6 +131,50 @@ class FinanceTests(unittest.TestCase):
         restored = finance.ReportRunner(path)
         self.assertEqual(restored.status()["status"], "done")
         self.assertEqual(restored.status()["cabinets"]["К1"]["rows"], 12)
+
+    def test_workers_share_progress_and_reject_a_second_build(self):
+        path = self.dir / "finance_status.json"
+        owner = finance.ReportRunner(path)
+        observer = finance.ReportRunner(path)
+        (self.dir / "opiu_all.py").write_text(
+            "from pathlib import Path\n"
+            "import time\n"
+            "print('[К1] загружено 12 строк', flush=True)\n"
+            "while not Path('finish').exists(): time.sleep(0.01)\n",
+            encoding="utf-8",
+        )
+        owner.start(self.dir, sys.executable, "cache")
+        self.addCleanup(owner.stop)
+        try:
+            for _ in range(200):
+                progress = observer.status()
+                if progress["cabinets"].get("К1"):
+                    break
+                time.sleep(0.01)
+            self.assertEqual(progress["status"], "running")
+            self.assertEqual(progress["cabinets"]["К1"]["rows"], 12)
+            with self.assertRaisesRegex(finance.FinanceError, "уже собирается"):
+                observer.start(self.dir, sys.executable, "cache")
+            observer.stop()
+            self.assertIsNone(owner.process.poll())
+            self.assertEqual(finance.ReportRunner(path).status()["status"], "running")
+        finally:
+            (self.dir / "finish").touch()
+            owner.process.wait(timeout=5)
+        for _ in range(200):
+            if observer.status()["status"] == "done":
+                break
+            time.sleep(0.01)
+        self.assertEqual(observer.status()["status"], "done")
+
+    def test_worker_recovers_an_abandoned_build(self):
+        path = self.dir / "finance_status.json"
+        previous = finance.ReportRunner(path)
+        previous.state.update(status="running", cabinets={"К1": {"status": "loading"}})
+        previous._persist()
+        recovered = finance.ReportRunner(path).status()
+        self.assertEqual((recovered["status"], recovered["code"]), ("interrupted", -15))
+        self.assertEqual(recovered["cabinets"]["К1"]["status"], "interrupted")
 
 
 class SyncAccountsTests(unittest.TestCase):
@@ -141,14 +225,14 @@ class SyncAccountsTests(unittest.TestCase):
         self.assertFalse((path.parent / "wb_accounts.json.bak").exists())
 
     def test_runner_cache_mode_fills_missing(self):
-        runner = finance.ReportRunner()
+        runner = finance.ReportRunner(self.dir / "finance_status.json")
         (self.dir / "opiu_all.py").write_text("import sys; print(' '.join(sys.argv[1:]))", encoding="utf-8")
         runner.start(self.dir, sys.executable, "cache", note="Ключи API из кабинетов панели: WB — 1")
         runner.process.wait()
         for _ in range(100):
             if runner.status()["status"] != "running":
                 break
-            import time; time.sleep(0.05)
+            time.sleep(0.05)
         self.assertEqual(runner.status()["log"], ["Ключи API из кабинетов панели: WB — 1",
                                                   "--no-unit --from-cache --fill-missing"])
 
@@ -185,7 +269,8 @@ class FillMissingTests(unittest.TestCase):
         opiu_all.run_script = fake_run
 
     def args(self, **kw):
-        return Namespace(**{"from_cache": True, "fill_missing": False, "cache_for": None, "grain": "month", **kw})
+        return Namespace(**{"from_cache": True, "fill_missing": False, "cache_for": None,
+                            "grain": "month", "cabinet": None, **kw})
 
     def test_loads_only_missing_cabinets_from_api(self):
         data, note, errors = self.opiu.run_marketplace(self.mp, self.args(fill_missing=True), str(self.dir))

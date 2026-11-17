@@ -617,6 +617,8 @@ class Nomenclature:
         except (OSError, ValueError):
             links = {}
         names = self.product_names()
+        models_by_article = {}
+        models_by_nm = {}
         for nm, vendor in links.items():
             key = art_key(vendor)
             if key in rows:
@@ -624,11 +626,15 @@ class Nomenclature:
         if self.models is not None:
             for model_key, model in self.models.all().items():
                 key = art_key(model_key)
+                models_by_article[key] = model_key
+                models_by_nm.update({int(n): model_key for n in model.get("nm_ids", [])})
                 if key in rows:
                     rows[key]["nm_ids"] |= {int(n) for n in model.get("nm_ids", [])}
         today = date.today().isoformat()
         out = []
         for key, item in rows.items():
+            linked_models = {models_by_nm[nm] for nm in item["nm_ids"] if nm in models_by_nm}
+            model_key = models_by_article.get(key) or (next(iter(linked_models)) if len(linked_models) == 1 else "")
             if not item["name"]:
                 item["name"] = next((names.get(nm) for nm in item["nm_ids"] if names.get(nm)), "")
             current = self.current_price(item["prices"], today)
@@ -639,6 +645,7 @@ class Nomenclature:
             out.append({
                 "key": key, "article": item["article"], "name": item["name"], "brand": item["brand"], "category": item["category"],
                 "nm_ids": sorted(item["nm_ids"]), "marketplaces": sorted(item["marketplaces"]), "photo": item["photo"], "sizes": item["sizes"],
+                "model_key": model_key,
                 "cost": cost, "prep": prep, "multiplier": num(current.get("кратность")) if current else None,
                 "effective_from": current.get("действует_с", "") if current else "",
                 "history": [{"from": r.get("действует_с", ""), "cost": num(r.get(COST_COL)), "prep": num(r.get(PREP_COL)),

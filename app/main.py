@@ -3322,13 +3322,24 @@ def _penalties_cache_dir():
 penalties = Penalties(draft_store, _penalties_cache_dir, configured_cabinets)
 
 
+def sync_penalties_cache() -> bool:
+    # The finance subprocess and penalty index both load large WB cache files.
+    # Use the same lock across workers to avoid running them together.
+    run_lock = finance_runner.try_run_lock()
+    if run_lock is None:
+        return False
+    with run_lock:
+        if penalties.stale() and penalties._sources():
+            penalties.sync()
+    return True
+
+
 async def penalties_loop() -> None:
     """Переиндексировать штрафы, когда расчёт ОПиУ скачал свежие отчёты реализации."""
     await asyncio.sleep(120)
     while True:
         try:
-            if penalties.stale() and penalties._sources():
-                await asyncio.to_thread(penalties.sync)
+            await asyncio.to_thread(sync_penalties_cache)
         except Exception as exc:
             draft_store.audit("penalties_sync_error", details=str(exc)[:300])
         await asyncio.sleep(10 * 60)
@@ -3349,10 +3360,12 @@ def _pen_args(date_from: str, date_to: str, cabinet: str, q: str, brand: str, ca
 async def penalties_report(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"), cabinet: str = "", q: str = "",
                            brand: str = "", category: str = "", group: str = "", reason: str = "", warehouse: str = "", prev_from: str = "", prev_to: str = "") -> dict[str, object]:
     a, b, f = _pen_args(date_from, date_to, cabinet, q, brand, category, group, reason, warehouse)
-    if penalties.state["status"] != "running" and penalties.stale() and penalties._sources():
-        await asyncio.to_thread(penalties.sync)
+    index_pending = False
+    if penalties.state["status"] != "running":
+        index_pending = not await asyncio.to_thread(sync_penalties_cache)
     data = await asyncio.to_thread(penalties.report, a, b, f, (prev_from, prev_to) if prev_from and prev_to else None)
     data["download"] = finance_runner.status()["status"]
+    data["index_pending"] = index_pending
     return data
 
 
@@ -3390,8 +3403,19 @@ async def penalties_sync(request: Request) -> dict[str, object]:
             raise HTTPException(409, str(exc)) from exc
         draft_store.audit("finance_update_started", details="full (penalties)")
         return {"status": "downloading"}
-    if penalties.state["status"] != "running":
-        threading.Thread(target=penalties.sync, kwargs={"force": True}, daemon=True).start()
+    run_lock = finance_runner.try_run_lock()
+    if run_lock is None:
+        raise HTTPException(409, "Отчёт уже собирается или обновляется индекс штрафов. Дождитесь окончания.")
+
+    def force_sync():
+        with run_lock:
+            penalties.sync(force=True)
+
+    try:
+        threading.Thread(target=force_sync, daemon=True).start()
+    except RuntimeError:
+        run_lock.close()
+        raise
     return {"status": "running"}
 
 

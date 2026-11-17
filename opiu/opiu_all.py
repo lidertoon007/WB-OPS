@@ -1069,7 +1069,7 @@ def day_slice(data, first_day):
 
 
 def load_daily_dumps(args, first_day):
-    """Дневные выгрузки МП из кэша для прогноза в отчёте по месяцам. Кэш только что обновлён основным
+    """Дневные выгрузки МП из кэша для детализации и прогноза. Кэш только что обновлён основным
     запуском, поэтому к API повторно не обращаемся; вывод скриптов не показываем — он уже был выше."""
     only = {s.strip().lower() for s in args.only.split(",")} if args.only else None
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
@@ -1086,7 +1086,7 @@ def load_daily_dumps(args, first_day):
             try:
                 data = json.loads(dump.read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                print(f"  {mp['name']}: дневные данные для прогноза не получены — прогноз без этого маркетплейса")
+                print(f"  {mp['name']}: дневные данные из кэша не получены")
                 continue
             if data.get("cabinets"):
                 dumps.append(day_slice(data, first_day))
@@ -1295,7 +1295,8 @@ F_FORECAST = PatternFill("solid", fgColor="E4DFEC")
 
 
 class Sheet:
-    def __init__(self, ws, months, title, subtitle="", forecast=None):
+    def __init__(self, ws, months, title, subtitle="", forecast=None, grain=None):
+        grain = grain or GRAIN
         self.ws, self.months, self.row = ws, months, 1
         self.last = COL_MONTH0 + len(months) - 1
         self.fc_col = self.last + 1 if forecast else None   # колонка прогноза — сразу за последним периодом
@@ -1310,7 +1311,7 @@ class Sheet:
             ws.column_dimensions[get_column_letter(self.fc_col)].width = 14
         self.row = 4
         headers = {1: "Статья", COL_TOTAL: "Итого", COL_PCT: "% выручки"}
-        headers.update({COL_MONTH0 + i: period_title(m, GRAIN) for i, m in enumerate(months)})
+        headers.update({COL_MONTH0 + i: period_title(m, grain) for i, m in enumerate(months)})
         for c, v in headers.items():
             cell = ws.cell(self.row, c, v)
             cell.font = WHITE_BOLD
@@ -1320,7 +1321,7 @@ class Sheet:
         ws.column_dimensions["A"].width = 58
         ws.column_dimensions[get_column_letter(COL_TOTAL)].width = 15
         ws.column_dimensions[get_column_letter(COL_PCT)].width = 10
-        width = {"month": 13, "week": 12, "day": 11, "unitweek": 12}[GRAIN]
+        width = {"month": 13, "week": 12, "day": 11, "unitweek": 12}[grain]
         for c in range(COL_MONTH0, self.last + 1):
             ws.column_dimensions[get_column_letter(c)].width = width
         self.row += 1
@@ -1380,10 +1381,10 @@ def sum_vals(list_of_vals, months):
 
 
 def write_pnl(ws, table, months, title, subtitle="", info=None, detail_order=None, cogs=None, prep=None, tax=None,
-              forecast=None, retro=None):
+              forecast=None, retro=None, grain=None):
     """ОПиУ в единых статьях. table: {статья: {строка: {месяц: сумма}}}.
     forecast — прогноз на конец последнего периода (period_forecast): отдельная колонка справа."""
-    sh = Sheet(ws, months, title, subtitle, forecast)
+    sh = Sheet(ws, months, title, subtitle, forecast, grain)
     fc = (forecast or {}).get("values") or {}
     fc_rev = fc.get("revenue")
 
@@ -1479,6 +1480,108 @@ def write_pnl(ws, table, months, title, subtitle="", info=None, detail_order=Non
         for label, vals in info.items():
             sh.line(label, vals, indent=2, pct=False)
     return net
+
+
+def marketplace_tables(entities):
+    by_mp = defaultdict(list)
+    for entity in entities:
+        by_mp[entity["mp"]].append(entity)
+    tables, info = {}, {}
+    for mp, members in by_mp.items():
+        if len(members) == 1:
+            tables[mp], info[mp] = members[0]["table"], members[0]["info"]
+            continue
+        table = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+        notes = defaultdict(lambda: defaultdict(float))
+        for entity in members:
+            cabinet = entity["cabinet"]
+            for article, rows in entity["table"].items():
+                for label, values in rows.items():
+                    for key, value in values.items():
+                        table[article][f"{cabinet}: {label}"][key] += value
+            for label, values in entity["info"].items():
+                for key, value in values.items():
+                    notes[f"{cabinet}: {label}"][key] += value
+        tables[mp], info[mp] = table, notes
+    return by_mp, tables, info
+
+
+def write_report_detail(wb, used, month_keys, entities, day_dumps, costs, preps, rates, retro, catalog,
+                        fc_series, today):
+    """Скрытые листы для панели используют те же статьи и исходные даты начислений."""
+    daily, _ = build(day_dumps)
+    monthly_cabinets = {(e["mp"], e["cabinet"]) for e in entities}
+    daily = [e for e in daily if (e["mp"], e["cabinet"]) in monthly_cabinets]
+    if {(e["mp"], e["cabinet"]) for e in daily} != monthly_cabinets:
+        print("  Детализация ОПиУ недоступна: дневные данные получены не по всем кабинетам")
+        return
+    report_months = set(month_keys)
+    active_days = {day for e in daily for rows in e["table"].values() for values in rows.values()
+                   for day, value in values.items() if value and day[:7] in report_months}
+    days = sorted({day for dump in day_dumps for day in dump["months"] if day[:7] in report_months})
+    if active_days:
+        days = [day for day in days if day <= max(active_days)]
+    if not days:
+        return
+    day_set = set(days)
+    cogs, prep = apply_costs(daily, costs, preps, day_set)[:2]
+    tax, _ = apply_tax(daily, rates, day_set)
+    bonus = apply_retro(daily, costs, retro, catalog, day_set)
+    for grain in ("day", "week"):
+        key_for_day = {day: day if grain == "day" else week_key(day) for day in days}
+        periods = sorted(set(key_for_day.values()))
+
+        def fold(values):
+            out = defaultdict(float)
+            for day, value in values.items():
+                if day in key_for_day:
+                    out[key_for_day[day]] += value
+            return dict(out)
+
+        selected = [{**e,
+                     "table": {article: {label: values for label, entries in rows.items() if (values := fold(entries))}
+                               for article, rows in e["table"].items()},
+                     "info": {label: values for label, entries in e["info"].items() if (values := fold(entries))}}
+                    for e in daily]
+        by_mp, tables, info = marketplace_tables(selected)
+        period = period_range(periods, grain)
+        if grain == "week":
+            period += ". Недели пн–вс, начисления в границах сводного отчёта"
+        forecast_start = date.fromisoformat(periods[-1]) if grain == "week" and periods[-1] == week_key(today.isoformat()) else None
+
+        def write(title, table, members, notes=None, order=None, sheet_name=None):
+            keys = [(e["mp"], e["cabinet"]) for e in members]
+
+            def amounts(source):
+                return fold(merge_period_values(source, keys)) or None
+
+            forecast = (period_forecast(fc_series, keys, forecast_start, forecast_start + timedelta(days=6),
+                                        FORECAST_WINDOW["week"]) if forecast_start and fc_series else None)
+            ws = wb.create_sheet(safe_name(f"_{grain}_{sheet_name or title}", used))
+            ws.sheet_state = "hidden"
+            write_pnl(ws, table, periods, title, period, info=notes, detail_order=order, cogs=amounts(cogs),
+                      prep=amounts(prep), tax=amounts(tax), retro=amounts(bonus), forecast=forecast, grain=grain)
+            for col, key in enumerate(periods, COL_MONTH0):
+                ws.cell(3, col, key)
+
+        names = list(tables)
+        summary = merge_tables([tables[mp] for mp in names], detail_key=lambda i: names[i])
+        write("ОПиУ маркетплейсов — свод", summary, selected,
+              order=lambda rows: [mp for mp in names if mp in rows], sheet_name="Свод")
+        for mp, members in by_mp.items():
+            title = f"{mp} — {members[0]['cabinet']}" if len(members) == 1 else mp
+            write(f"ОПиУ {title}", tables[mp], members, info[mp])
+            if len(members) > 1:
+                for e in members:
+                    write(f"ОПиУ {mp} — {e['cabinet']}", e["table"], [e], e["info"])
+
+
+def merge_period_values(source, pairs):
+    result = defaultdict(float)
+    for key in pairs:
+        for period, value in source.get(key, {}).items():
+            result[period] += value
+    return dict(result)
 
 
 def write_comparison(ws, per_mp, months, cogs_by_mp=None, prep_by_mp=None, tax_by_mp=None, retro_by_mp=None):
@@ -2401,13 +2504,16 @@ def build_unit_workbook(rows, entities, expected, months, period, catalog, costs
 
 
 def save_workbook(wb, out):
-    """Сохраняет книгу; если файл открыт в Excel — под другим именем. Возвращает итоговый путь."""
-    try:
-        wb.save(out)
-    except PermissionError:
-        out = out.with_name(f"{out.stem}_{datetime.now():%Y%m%d_%H%M}{out.suffix}")
-        print(f"\nФайл открыт в Excel — сохраняю под другим именем.")
-        wb.save(out)
+    """Готовая книга заменяет предыдущую только после записи всех листов."""
+    with tempfile.TemporaryDirectory(dir=out.parent) as tmp:
+        draft = Path(tmp) / out.name
+        wb.save(draft)
+        try:
+            draft.replace(out)
+        except PermissionError:
+            out = out.with_name(f"{out.stem}_{datetime.now():%Y%m%d_%H%M}{out.suffix}")
+            print("\nФайл открыт в Excel — сохраняю под другим именем.")
+            draft.replace(out)
     return out
 
 
@@ -2574,11 +2680,12 @@ def main():
     fc_series, fc_args = None, None
     today = date.today()
     if args.grain in ("month", "week") and not args.only_unit:
+        if args.grain == "month":
+            step("Дневные и недельные данные маркетплейсов из кэша")
+            day_dumps = load_daily_dumps(args, min(fc_first_day, months[0] + "-01"))
         if args.grain == "month" and months[-1] == f"{today:%Y-%m}":
             start = today.replace(day=1)
             end = (start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-            step("Прогноз на конец месяца: дневные данные маркетплейсов из кэша")
-            day_dumps = load_daily_dumps(args, fc_first_day)
             fc_args = (start, end, FORECAST_WINDOW["month"])
         elif args.grain == "week" and months[-1] == week_key(today.isoformat()):
             start = date.fromisoformat(months[-1])
@@ -2607,52 +2714,19 @@ def main():
         print("Ставка налога не задана (tax_percent в конфиге маркетплейса) — статья «Налог с выручки» пустая")
 
     # Таблицы по маркетплейсам (строки — исходные, с префиксом кабинета, если кабинетов несколько)
-    by_mp = defaultdict(list)
-    for e in entities:
-        by_mp[e["mp"]].append(e)
-    per_mp, per_mp_info = {}, {}
-    for mp, ents in by_mp.items():
-        if len(ents) == 1:
-            per_mp[mp] = ents[0]["table"]
-        else:
-            per_mp[mp] = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
-            for e in ents:
-                for a, rows in e["table"].items():
-                    for label, vals in rows.items():
-                        for m, v in vals.items():
-                            per_mp[mp][a][f"{e['cabinet']}: {label}"][m] += v
-        info = defaultdict(lambda: defaultdict(float))
-        for e in ents:
-            for label, vals in e["info"].items():
-                for m, v in vals.items():
-                    info[label if len(ents) == 1 else f"{e['cabinet']}: {label}"][m] += v
-        per_mp_info[mp] = info
+    by_mp, per_mp, per_mp_info = marketplace_tables(entities)
 
     mp_names = list(per_mp)
     summary = merge_tables([per_mp[n] for n in mp_names], detail_key=lambda i: mp_names[i])
 
-    def cogs_for(pairs):
-        out = defaultdict(float)
-        for key in pairs:
-            for mon, value in cogs_map.get(key, {}).items():
-                out[mon] += value
-        return dict(out) if out else None
-
-    def sum_by(source, pairs):
-        out = defaultdict(float)
-        for key in pairs:
-            for mon, value in source.get(key, {}).items():
-                out[mon] += value
-        return dict(out)
-
-    cogs_by_mp = {mp: sum_by(cogs_map, [(mp, e["cabinet"]) for e in ents]) for mp, ents in by_mp.items()}
-    prep_by_mp = {mp: sum_by(prep_map, [(mp, e["cabinet"]) for e in ents]) for mp, ents in by_mp.items()}
-    tax_by_mp = {mp: sum_by(tax_map, [(mp, e["cabinet"]) for e in ents]) for mp, ents in by_mp.items()}
-    retro_by_mp = {mp: sum_by(retro_map, [(mp, e["cabinet"]) for e in ents]) for mp, ents in by_mp.items()}
-    retro_all = sum_by(retro_map, list(retro_map)) or None
-    cogs_all = cogs_for(list(cogs_map))
-    prep_all = sum_by(prep_map, list(prep_map)) or None
-    tax_all = sum_by(tax_map, list(tax_map)) or None
+    cogs_by_mp = {mp: merge_period_values(cogs_map, [(mp, e["cabinet"]) for e in ents]) for mp, ents in by_mp.items()}
+    prep_by_mp = {mp: merge_period_values(prep_map, [(mp, e["cabinet"]) for e in ents]) for mp, ents in by_mp.items()}
+    tax_by_mp = {mp: merge_period_values(tax_map, [(mp, e["cabinet"]) for e in ents]) for mp, ents in by_mp.items()}
+    retro_by_mp = {mp: merge_period_values(retro_map, [(mp, e["cabinet"]) for e in ents]) for mp, ents in by_mp.items()}
+    retro_all = merge_period_values(retro_map, retro_map) or None
+    cogs_all = merge_period_values(cogs_map, cogs_map) or None
+    prep_all = merge_period_values(prep_map, prep_map) or None
+    tax_all = merge_period_values(tax_map, tax_map) or None
     # Маркетплейсы, где себестоимость покрыта не полностью: валовая прибыль по ним завышена
     uncovered = []
     for mp, ents in by_mp.items():
@@ -2716,6 +2790,10 @@ def main():
     problems = write_control(wb.create_sheet(safe_name("Контроль", used)), entities, notes, months, unified_net,
                              covered, missing_costs, bool(costs), tax_used, prep_map, missing_prep, order_totals,
                              cogs_map, script_errors)
+    if args.grain == "month" and not args.only_unit and day_dumps:
+        step("Детализация ОПиУ по дням и неделям")
+        write_report_detail(wb, used, months, entities, day_dumps, costs, preps, rates, retro, catalog,
+                            fc_series, today)
 
     # Один файл пропусков: артикул попадает туда, если у него нет себестоимости или подготовки.
     # Уже известные цены подставлены, чтобы было видно, какую колонку осталось заполнить.

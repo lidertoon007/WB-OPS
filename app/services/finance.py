@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -16,10 +17,12 @@ import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from typing import BinaryIO
 
 SUMMARY_SHEET = "Свод"
 CONTROL_SHEET = "Контроль"
 GOODS_SHEET = "Товары"
+DETAIL_GRAINS = ("day", "week")
 MARKETPLACE_NAMES = {"Wildberries", "Ozon", "Яндекс Маркет"}
 TOTAL_PREFIXES = ("ИТОГО", "ВАЛОВАЯ", "ПРИБЫЛЬ", "Выручка за вычетом", "Итого расходы")
 KPI_LABELS = {
@@ -238,7 +241,7 @@ def _load_workbook(path: Path):
         raise FinanceError(f"Не удалось открыть {path.name}: {type(exc).__name__}") from exc
 
 
-def parse_summary(ws, articles: set | None = None) -> dict:
+def parse_summary(ws, articles: set | None = None, detail: bool = False) -> dict:
     """Лист ОПиУ: «Свод» (расшифровка статей — по маркетплейсам) или лист площадки/кабинета.
 
     articles — статьи «Свода»: на листе площадки расшифровка — исходные строки отчёта маркетплейса,
@@ -304,8 +307,12 @@ def parse_summary(ws, articles: set | None = None) -> dict:
     revenue = (kpi.get("revenue") or {}).get("total")
     profit = (kpi.get("profit") or {}).get("total")
     kpi["margin"] = {"total": profit / revenue if revenue and profit is not None else None}
-    return {"title": title, "subtitle": subtitle, "periods": periods,
-            "forecast_title": forecast["title"] if forecast else None, "rows": out, "kpi": kpi}
+    summary = {"title": title, "subtitle": subtitle, "periods": periods,
+               "forecast_title": forecast["title"] if forecast else None, "rows": out, "kpi": kpi}
+    if detail:
+        key_row = rows[header_index - 1] if header_index else ()
+        summary["period_keys"] = [_text(key_row[col]) if col < len(key_row) else "" for col, _ in period_cols]
+    return summary
 
 
 def parse_control(ws) -> list[dict]:
@@ -343,7 +350,7 @@ def parse_goods(ws, limit: int | None = None) -> dict:
     return {"header": header, "rows": items}
 
 
-def parse_views(wb, articles: set) -> tuple[dict, list[dict]]:
+def parse_views(wb, articles: set, grain: str = "") -> tuple[dict, list[dict]]:
     """Листы ОПиУ площадок и кабинетов → ({ключ: свод}, [кабинеты отчёта]).
 
     Ключ «Ozon» — площадка целиком, «Ozon|Еврозоо» — кабинет. У площадки с одним кабинетом лист один
@@ -351,9 +358,14 @@ def parse_views(wb, articles: set) -> tuple[dict, list[dict]]:
     кабинетов.
     """
     views, cabinets = {}, []
-    for name in wb.sheetnames:
-        if name in (SUMMARY_SHEET, CONTROL_SHEET, GOODS_SHEET):
-            continue
+    if grain:
+        prefix = f"_{grain}_"
+        names = [name for name in wb.sheetnames if name.startswith(prefix) and name != prefix + SUMMARY_SHEET]
+    else:
+        reserved = (SUMMARY_SHEET, CONTROL_SHEET, GOODS_SHEET)
+        prefixes = tuple(f"_{g}_" for g in DETAIL_GRAINS)
+        names = [name for name in wb.sheetnames if name not in reserved and not name.startswith(prefixes)]
+    for name in names:
         ws = wb[name]
         first = next(iter(ws.iter_rows(max_row=1, values_only=True)), ())
         m = SHEET_TITLE.match(_text(first[0]) if first else "")
@@ -361,7 +373,7 @@ def parse_views(wb, articles: set) -> tuple[dict, list[dict]]:
             continue
         mp, cab = m.group(1), m.group(2)
         try:
-            view = parse_summary(ws, articles)
+            view = parse_summary(ws, articles, detail=bool(grain))
         except FinanceError:
             continue
         if cab:
@@ -420,7 +432,8 @@ def report_view(data: dict, key: str = "") -> dict:
                "reasons": reasons[:20]}
     if key not in views:
         key = ""
-    out = {k: v for k, v in data.items() if k != "views"}
+    out = {k: v for k, v in data.items() if k not in ("views", "detail")}
+    out["detail"] = {g: summary for g, views in data.get("detail", {}).items() if (summary := views.get(key))}
     goods = data["goods"]
     if not key:
         out["goods"] = {**goods, "rows": goods["rows"][:GOODS_LIMIT], "scope": "Все маркетплейсы"}
@@ -451,8 +464,17 @@ def read_report(path: Path) -> dict:
         if SUMMARY_SHEET not in wb.sheetnames:
             raise FinanceError(f"В файле {path.name} нет листа «{SUMMARY_SHEET}»")
         summary = parse_summary(wb[SUMMARY_SHEET])
-        views, cabinets = parse_views(wb, {r["label"] for r in summary["rows"] if r["kind"] not in ("detail", "section")})
+        views, cabinets = parse_views(wb, pnl_articles(summary))
+        detail = {}
+        for grain in DETAIL_GRAINS:
+            name = f"_{grain}_{SUMMARY_SHEET}"
+            if name not in wb.sheetnames:
+                continue
+            variant = parse_summary(wb[name], detail=True)
+            variant_views, _ = parse_views(wb, pnl_articles(variant), grain)
+            detail[grain] = {"": variant, **variant_views}
         data = {"summary": summary, "views": views, "cabinets": cabinets,
+                "detail": detail,
                 "control": parse_control(wb[CONTROL_SHEET]) if CONTROL_SHEET in wb.sheetnames else [],
                 "goods": parse_goods(wb[GOODS_SHEET]) if GOODS_SHEET in wb.sheetnames else {"header": [], "rows": []},
                 "file": path.name, "updated_at": datetime.fromtimestamp(stamp).isoformat(timespec="minutes")}
@@ -463,34 +485,59 @@ def read_report(path: Path) -> dict:
     return data
 
 
+def pnl_articles(summary):
+    return {r["label"] for r in summary["rows"] if r["kind"] not in ("detail", "section")}
+
+
 class ReportRunner:
     """Пересборка ОПиУ в фоне: один запуск за раз, вывод скрипта сохраняется для панели."""
 
     def __init__(self, status_path: Path | None = None):
         self.lock = threading.Lock()
         self.process: subprocess.Popen | None = None
+        self.run_lock: BinaryIO | None = None
         self.stop_requested = False
         self.log: deque[str] = deque(maxlen=400)
         self.status_path = Path(status_path or "data/finance_status.json")
         self.state = {"status": "idle", "mode": None, "marketplace": None, "cabinet": None, "started_at": None,
                       "finished_at": None, "code": None, "cabinets": {}, "warnings": []}
-        self._load_state()
 
-    def _load_state(self):
+    def try_run_lock(self) -> BinaryIO | None:
+        """Reserve access to the finance cache across workers until the file is closed."""
+        self.status_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.status_path.with_suffix(".lock").open("a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return None
+            raise
+        return handle
+
+    def _load_state(self, *, recover: bool = False):
         try:
             saved = json.loads(self.status_path.read_text(encoding="utf-8"))
             if isinstance(saved, dict):
                 self.state.update({k: saved[k] for k in self.state if k in saved})
+                self.log.clear()
                 self.log.extend(str(x) for x in saved.get("log", [])[-400:])
                 interrupted = self.state.get("status") == "running" or (
                     self.state.get("status") == "error" and self.state.get("code") == -15
                 )
-                if interrupted:
+                if interrupted and recover:
                     for item in self.state.setdefault("cabinets", {}).values():
                         if item.get("status") == "loading":
                             item.update(status="interrupted", message="Сборка прервана")
                     self.state.update(status="interrupted", finished_at=time.time(), code=-15)
-                    self._persist()
                 elif self.state.get("status") == "done":
                     selected = self.state.get("cabinet")
                     for name, item in self.state.setdefault("cabinets", {}).items():
@@ -500,6 +547,7 @@ class ReportRunner:
                             item.update(status="complete", message="Загрузка завершена")
                         else:
                             item.update(status="cache", message="Сохранено из кэша")
+                if interrupted and recover:
                     self._persist()
         except (OSError, ValueError, TypeError):
             pass
@@ -547,12 +595,22 @@ class ReportRunner:
 
     def status(self) -> dict:
         with self.lock:
+            if self.run_lock is None:
+                self._load_state()
+                if self.state["status"] == "running" or (
+                    self.state["status"] == "error" and self.state["code"] == -15
+                ):
+                    run_lock = self.try_run_lock()
+                    if run_lock is not None:
+                        with run_lock:
+                            # Reload under the lock in case the owner finished meanwhile.
+                            self._load_state(recover=True)
             return {**self.state, "log": list(self.log)[-60:]}
 
     def start(self, project: Path, python: str, mode: str, note: str = "", marketplace: str | None = None,
               cabinet: str | None = None) -> dict:
         with self.lock:
-            if self.state["status"] == "running":
+            if self.run_lock is not None:
                 raise FinanceError("Отчёт уже собирается. Дождитесь окончания.")
             cmd = [python or sys.executable, "opiu_all.py", "--no-unit"]
             if mode == "cache":
@@ -566,11 +624,21 @@ class ReportRunner:
                 cmd += ["--cabinet", cabinet]
             env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
             try:
+                run_lock = self.try_run_lock()
+            except OSError as exc:
+                raise FinanceError(f"Не удалось заблокировать запуск ОПиУ: {exc}") from exc
+            if run_lock is None:
+                raise FinanceError("Отчёт уже собирается или обновляется индекс штрафов. Дождитесь окончания.")
+            # On Unix the child retains the lock if the serving worker exits unexpectedly.
+            process_options = {} if os.name == "nt" else {"pass_fds": (run_lock.fileno(),)}
+            try:
                 self.process = subprocess.Popen(cmd, cwd=project, env=env, stdout=subprocess.PIPE,
                                                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                                                errors="replace")
+                                                errors="replace", **process_options)
             except OSError as exc:
+                run_lock.close()
                 raise FinanceError(f"Не удалось запустить Python ({cmd[0]}): {exc}") from exc
+            self.run_lock = run_lock
             self.log.clear()
             self.stop_requested = False
             if note:
@@ -584,7 +652,20 @@ class ReportRunner:
 
     def _pump(self):
         process = self.process
-        for line in process.stdout:
+        try:
+            with process.stdout as output:
+                self._read_output(output)
+        finally:
+            code = process.wait()
+            with self.lock:
+                try:
+                    self._finish(code)
+                finally:
+                    self.run_lock.close()
+                    self.run_lock = None
+
+    def _read_output(self, output):
+        for line in output:
             line = line.rstrip()
             if line:
                 with self.lock:
@@ -596,30 +677,30 @@ class ReportRunner:
                         if item["status"] in ("api_error", "skipped"):
                             self.state.setdefault("warnings", []).append(line)
                     self._persist()
-        code = process.wait()
-        with self.lock:
-            interrupted = self.stop_requested or code == -15
-            if interrupted:
-                # A terminated worker must not leave its last cabinet marked as loading.
-                for item in self.state.setdefault("cabinets", {}).values():
-                    if item.get("status") == "loading":
-                        item.update(status="interrupted", message="Сборка прервана")
-            else:
-                # A script can finish without an explicit terminal line for every
-                # cabinet.  Cache baseline entries are complete as cache; the
-                # selected scoped cabinet gets the actual run result.
-                selected = self.state.get("cabinet")
-                for name, item in self.state.setdefault("cabinets", {}).items():
-                    if item.get("status") != "loading":
-                        continue
-                    if selected and name == selected:
-                        item.update(status="complete" if code == 0 else "api_error",
-                                    message="Загрузка завершена" if code == 0 else "Ошибка API")
-                    else:
-                        item.update(status="cache", message="Сохранено из кэша")
-            self.state.update(status="interrupted" if interrupted else ("done" if code == 0 else "error"),
-                              code=code, finished_at=time.time())
-            self._persist()
+
+    def _finish(self, code):
+        interrupted = self.stop_requested or code == -15
+        if interrupted:
+            # A terminated worker must not leave its last cabinet marked as loading.
+            for item in self.state.setdefault("cabinets", {}).values():
+                if item.get("status") == "loading":
+                    item.update(status="interrupted", message="Сборка прервана")
+        else:
+            # A script can finish without an explicit terminal line for every
+            # cabinet. Cache baseline entries are complete as cache; the
+            # selected scoped cabinet gets the actual run result.
+            selected = self.state.get("cabinet")
+            for name, item in self.state.setdefault("cabinets", {}).items():
+                if item.get("status") != "loading":
+                    continue
+                if selected and name == selected:
+                    item.update(status="complete" if code == 0 else "api_error",
+                                message="Загрузка завершена" if code == 0 else "Ошибка API")
+                else:
+                    item.update(status="cache", message="Сохранено из кэша")
+        self.state.update(status="interrupted" if interrupted else ("done" if code == 0 else "error"),
+                          code=code, finished_at=time.time())
+        self._persist()
 
     def stop(self):
         with self.lock:
