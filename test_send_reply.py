@@ -1,9 +1,10 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi import HTTPException
@@ -127,14 +128,77 @@ class WBTransportTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.services.wb_client.httpx.AsyncClient", factory):
             await WBFeedbackClient("fake", "https://example.test").publish(item, "Ответ клиента")
 
-    async def test_review_and_question_paths(self):
-        for kind, verb, path in (("review", "POST", "/api/v1/feedbacks/answer"), ("question", "PATCH", "/api/v1/questions")):
+    async def test_review_path(self):
+        def handler(request):
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(request.url.path, "/api/v1/feedbacks/answer")
+            self.assertEqual(json.loads(request.content), {"id": "test", "text": "Ответ клиента"})
+            return httpx.Response(204)
+        await self.run_case("review", handler)
+
+    async def test_question_payload_and_readback(self):
+        calls = []
+        def handler(request):
+            calls.append(request.method)
+            if request.method == "PATCH":
+                self.assertEqual(request.url.path, "/api/v1/questions")
+                self.assertEqual(json.loads(request.content), {"id": "test", "answer": {"text": "Ответ клиента"}, "state": "wbRu"})
+                return httpx.Response(200, json={"error": False, "data": None})
+            self.assertEqual(request.url.path, "/api/v1/question")
+            self.assertEqual(request.url.params["id"], "test")
+            return httpx.Response(200, json={"error": False, "data": {"id": "test", "state": "wbRu", "answer": {"text": "Ответ клиента"}}})
+        with patch("app.services.wb_client.asyncio.sleep", new=AsyncMock()):
+            await self.run_case("question", handler)
+        self.assertEqual(calls, ["PATCH", "GET"])
+
+    async def test_question_http_success_without_stored_answer_is_uncertain(self):
+        cases = [
+            {"id": "test", "state": "suppliersPortalSynch", "answer": None},
+            {"id": "test", "state": "wbRu", "answer": {"text": "Другой ответ"}},
+            {"id": "other", "state": "wbRu", "answer": {"text": "Ответ клиента"}},
+        ]
+        for data in cases:
+            methods = []
             def handler(request):
-                self.assertEqual(request.method, verb)
-                self.assertEqual(request.url.path, path)
-                self.assertIn("Ответ клиента".encode(), request.content)
-                return httpx.Response(204)
-            await self.run_case(kind, handler)
+                methods.append(request.method)
+                return httpx.Response(200, json={"error": False, "data": None if request.method == "PATCH" else data})
+            with self.subTest(data=data), patch("app.services.wb_client.asyncio.sleep", new=AsyncMock()):
+                with self.assertRaises(WBDeliveryUncertain):
+                    await self.run_case("question", handler)
+            self.assertEqual(methods.count("PATCH"), 1)
+
+    async def test_question_readback_failure_is_uncertain(self):
+        for response in (httpx.Response(429), httpx.Response(200, text="invalid"), httpx.Response(200, json={"error": True})):
+            def handler(request):
+                return httpx.Response(200, json={"error": False}) if request.method == "PATCH" else response
+            with self.subTest(status=response.status_code), patch("app.services.wb_client.asyncio.sleep", new=AsyncMock()):
+                with self.assertRaises(WBDeliveryUncertain):
+                    await self.run_case("question", handler)
+
+    async def test_unconfirmed_question_is_not_marked_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = DraftStore("sqlite:///" + str(Path(directory) / "delivery.sqlite3"))
+            store.save_inbox([InboxItem(id="test", cabinet_id="main", item_type="question", text="Вопрос")])
+            store.save(ReplyDraft(item_id="test", text="Ответ клиента", mode="draft"))
+            publisher = ReplyPublisher(store, SimpleNamespace(dry_run=False, cabinets_json="", feedbacks_api_base_url="https://example.test"),
+                                       lambda _: [SimpleNamespace(id="main", token="fake")])
+            real_client = httpx.AsyncClient
+            methods = []
+            def handler(request):
+                methods.append(request.method)
+                return httpx.Response(200, json={"error": False, "data": None if request.method == "PATCH" else {"id": "test", "state": "suppliersPortalSynch", "answer": None}})
+            def factory(**kwargs):
+                return real_client(transport=httpx.MockTransport(handler), **kwargs)
+            with patch("app.services.wb_client.httpx.AsyncClient", factory), patch("app.services.wb_client.asyncio.sleep", new=AsyncMock()):
+                with self.assertRaises(HTTPException) as error:
+                    await publisher.send("test", "Ответ клиента")
+                self.assertEqual(error.exception.status_code, 502)
+                self.assertFalse(store.get("test").published)
+                self.assertEqual(store.get_setting("reply_delivery:test", ""), "uncertain")
+                with self.assertRaises(HTTPException) as retry:
+                    await publisher.send("test", "Ответ клиента")
+                self.assertEqual(retry.exception.status_code, 409)
+            self.assertEqual(methods.count("PATCH"), 1)
 
     async def test_api_error_in_200_is_not_success(self):
         with self.assertRaises(WBApiError):

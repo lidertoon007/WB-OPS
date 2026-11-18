@@ -35,7 +35,7 @@
     settings:        {path: '/settings',        title: 'Настройки ответов', sub: 'Автоответы на отзывы и правила', show: ['autoRepliesPanel']},
     ai:              {path: '/ai',              title: 'Настройки ИИ', sub: 'Подключение ИИ, подпись, тон и длина ответов', show: ['aiConnectionPanel', 'aiSettingsPanel']},
     import:          {path: '/import',          title: 'Импорт отзывов', sub: 'Загрузка истории отзывов из WB', show: ['importPanel']},
-    questions:       {path: '/questions',       title: 'Все вопросы', sub: 'Ответы на вопросы покупателей', show: ['cabinet', 'syncToolbar', 'questionRepliesPanel', 'questionsPanel']},
+    questions:       {path: '/questions',       title: 'Все вопросы', sub: 'Ответы на вопросы покупателей', show: ['questionRepliesPanel', 'questionsPage', 'questionsPanel']},
     chats:           {path: '/chats',           title: 'Управление чатами', sub: 'Диалоги с покупателями', show: ['chats']},
     messengers:      {path: '/messengers',      title: 'Агенты в мессенджерах', sub: 'Ответы покупателям в мессенджерах', show: ['messengers']},
     profile:         {path: '/profile',         title: 'Учётная запись', sub: 'Владелец, режим работы, резервные копии и API', show: ['profile']},
@@ -148,6 +148,27 @@
     if (window.WBOPSReviews) window.WBOPSReviews.render(s);
     else s.innerHTML = '<p class="muted">Не загрузился модуль reviews.js.</p>';
   };
+  const questionsPage = () => {
+    const s = section('questionsPage', '');
+    const legacy = document.getElementById('questionsPanel');
+    // Keep question settings and templates; the shared list replaces the old table and filters.
+    if (legacy) {
+      const run = legacy.querySelector('[data-question-run]');
+      if (run) {
+        legacy.insertBefore(run, legacy.querySelector('h3'));
+        const generate = run.onclick;
+        run.onclick = async () => {
+          await generate();
+          if (window.WBOPSQuestions) await window.WBOPSQuestions.reload();
+        };
+      }
+      [...legacy.children].forEach(el => {
+        if (el.matches('.question-head, .toolbar, .table-wrap, hr')) el.style.display = 'none';
+      });
+    }
+    if (window.WBOPSQuestions) window.WBOPSQuestions.render(s);
+    else s.innerHTML = '<p class="muted">Не загрузился модуль reviews.js.</p>';
+  };
   const complaintsPage = () => {
     const s = section('complaintsPage', '');
     if (window.WBOPSComplaints) window.WBOPSComplaints.render(s);
@@ -234,7 +255,7 @@
     if (window.WBOPSCardCompare) window.WBOPSCardCompare.render(s);
     else s.innerHTML = '<p class="muted">Не загрузился модуль сравнения карточек.</p>';
   };
-  const rendered = {home: homePage, abc: abcPage, ab: abPage, 'card-comparisons': cardComparisonsPage, planfact: planfactPage, ads: adsPage, penalties: penaltiesPage, 'fbs-analytics': fbsPage, stocks: stocksPage, repricer: repricerPage, transfer: transferPage, rnp: rnpPage, dashboard: dashboardPage, 'dashboard-ozon': ozonDashboardPage, nomenclature: nomenclaturePage, complaints: complaintsPage, reviews: reviewsPage, cabinets: settingsPage('cabinets', 'cabinets'), notifications: settingsPage('notificationsSettings', 'notifications'), team: settingsPage('team', 'team'), analytics: renderAnalytics, import: renderImport, profile: renderProfile, messengers: renderMessengers, finances: renderFinances};
+  const rendered = {home: homePage, abc: abcPage, ab: abPage, 'card-comparisons': cardComparisonsPage, planfact: planfactPage, ads: adsPage, penalties: penaltiesPage, 'fbs-analytics': fbsPage, stocks: stocksPage, repricer: repricerPage, transfer: transferPage, rnp: rnpPage, dashboard: dashboardPage, 'dashboard-ozon': ozonDashboardPage, nomenclature: nomenclaturePage, complaints: complaintsPage, reviews: reviewsPage, questions: questionsPage, cabinets: settingsPage('cabinets', 'cabinets'), notifications: settingsPage('notificationsSettings', 'notifications'), team: settingsPage('team', 'team'), analytics: renderAnalytics, import: renderImport, profile: renderProfile, messengers: renderMessengers, finances: renderFinances};
   const done = new Set();
   let applying = false;
   function apply() {

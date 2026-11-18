@@ -35,6 +35,23 @@ class ReviewListTests(unittest.TestCase):
             c.execute("UPDATE reply_drafts SET moderation_status='rework' WHERE item_id='r3'")
         self.list = ReviewList(self.store, cabinet_names=lambda: {"main": "ИП Тест"}, vendor_path=str(Path(self.temp.name) / "none.json"))
 
+    def test_question_filters_and_tags_do_not_include_reviews(self):
+        self.store.save_inbox([
+            InboxItem(id="q1", cabinet_id="main", item_type="question", text="Маломерят, размер маленький?",
+                      product_id=111, author_name="Anna", order_status="buyout", created_at="2026-10-02T09:00:00+00:00"),
+            InboxItem(id="q2", cabinet_id="other", item_type="question", text="When available?",
+                      product_id=222, order_status="notSpecified", created_at="2026-10-03T09:00:00+00:00"),
+        ])
+        self.store.save_generated(ReplyDraft(item_id="q1", text="Answer", mode="draft", source="individual"))
+        data = self.list.query(item_type="question", search="Anna", date_from="2026-10-02", date_to="2026-10-02",
+                               marketplace="wildberries", cabinet_id="main", order_status="buyout", answer="draft",
+                               tags=["size:negative"])
+        self.assertEqual([i["id"] for i in data["items"]], ["q1"])
+        self.assertIn("size", [t["tag"] for t in data["items"][0]["tags"]])
+        self.assertEqual(self.list.query(item_type="question", tags=["size:positive"])["total"], 0)
+        self.assertEqual(self.list.query(item_type="question", answer="nodraft")["items"][0]["id"], "q2")
+        self.assertEqual(self.list.query()["total"], 4)
+
     def test_statuses_counts_and_methods(self):
         d = self.list.query()
         self.assertEqual(d["total"], 4)
