@@ -3,6 +3,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from argparse import Namespace
 from datetime import date
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 from openpyxl import Workbook
 
 from app.services import finance
+from app.services import finance_worker
 from app.services.cabinets import Cabinet
 
 
@@ -122,6 +124,48 @@ class FinanceTests(unittest.TestCase):
         self.assertFalse(view["quality"]["reliable"])
         self.assertTrue(any("Себестоимость" in reason for reason in view["quality"]["reasons"]))
 
+    def test_goods_streams_and_bounds_each_marketplace_preview(self):
+        class Goods:
+            def iter_rows(self, **_):
+                yield ("Артикул", "Маркетплейс", "Штук")
+                for mp in ("Все маркетплейсы", "Wildberries", "Ozon", "Яндекс Маркет"):
+                    for i in range(500):
+                        yield (f"{mp}-{i}", mp, 1)
+
+        goods = finance.parse_goods(Goods(), finance.GOODS_LIMIT, by_marketplace=True)
+        self.assertEqual(len(goods["rows"]), finance.GOODS_LIMIT * 4)
+        for mp in finance.MARKETPLACE_NAMES:
+            self.assertEqual(sum(row[1] == mp for row in goods["rows"]), finance.GOODS_LIMIT)
+
+    def test_goods_limit_stops_consuming_the_sheet(self):
+        class Goods:
+            def iter_rows(self, **_):
+                yield ("Артикул", "Штук")
+                for i in range(200):
+                    yield (str(i), 1)
+                raise AssertionError("The preview must not read the rest of the sheet")
+
+        self.assertEqual(len(finance.parse_goods(Goods(), 200)["rows"]), 200)
+
+    def test_report_preview_keeps_later_marketplace_rows_with_bounded_memory(self):
+        path = self.dir / "opiu_all_large.xlsx"
+        make_report(path)
+        from openpyxl import load_workbook
+        book = load_workbook(path)
+        goods = book["Товары"]
+        goods.delete_rows(3, goods.max_row)
+        for mp in ("Все маркетплейсы", "Wildberries", "Ozon", "Яндекс Маркет"):
+            for i in range(250):
+                goods.append([f"{mp}-{i}", mp, 1, 10])
+        book.save(path)
+        book.close()
+        data = finance.read_report(path)
+        self.assertEqual(len(data["goods"]["rows"]), finance.GOODS_LIMIT * 4)
+        data["views"]["Ozon"] = data["summary"]
+        rows = finance.report_view(data, "Ozon")["goods"]["rows"]
+        self.assertEqual(len(rows), finance.GOODS_LIMIT)
+        self.assertTrue(all(row[1] == "Ozon" for row in rows))
+
     def test_runner_persists_and_restores_status(self):
         path = self.dir / "finance_status.json"
         runner = finance.ReportRunner(path)
@@ -140,7 +184,7 @@ class FinanceTests(unittest.TestCase):
             "from pathlib import Path\n"
             "import time\n"
             "print('[К1] загружено 12 строк', flush=True)\n"
-            "while not Path('finish').exists(): time.sleep(0.01)\n",
+            f"while not Path({str(self.dir / 'finish')!r}).exists(): time.sleep(0.01)\n",
             encoding="utf-8",
         )
         owner.start(self.dir, sys.executable, "cache")
@@ -175,6 +219,135 @@ class FinanceTests(unittest.TestCase):
         recovered = finance.ReportRunner(path).status()
         self.assertEqual((recovered["status"], recovered["code"]), ("interrupted", -15))
         self.assertEqual(recovered["cabinets"]["К1"]["status"], "interrupted")
+
+    def wait_runner(self, runner):
+        for _ in range(200):
+            state = runner.status()
+            if state["status"] != "running":
+                return state
+            time.sleep(0.05)
+        self.fail("finance process did not finish")
+
+    def test_low_memory_refuses_start_and_preserves_data(self):
+        report = finance.latest_report(self.dir)
+        before = report.read_bytes()
+        runner = finance.ReportRunner(self.dir / "status.json")
+        with patch.object(finance_worker, "available_memory_mb", return_value=300):
+            with self.assertRaisesRegex(finance.FinanceError, "мало свободной памяти"):
+                runner.start(self.dir, sys.executable, "full")
+        self.assertIsNone(runner.process)
+        self.assertEqual(report.read_bytes(), before)
+        handle = runner.try_run_lock()
+        self.assertIsNotNone(handle)
+        handle.close()
+
+    def test_low_disk_refuses_start(self):
+        runner = finance.ReportRunner(self.dir / "status.json")
+        with patch.object(finance_worker.shutil, "disk_usage", return_value=Namespace(free=1)):
+            with self.assertRaisesRegex(finance.FinanceError, "недостаточно места"):
+                runner.start(self.dir, sys.executable, "full")
+
+    def test_failed_staged_update_keeps_previous_cache_and_report(self):
+        cache = self.dir / "Wildberries" / "cache"
+        cache.mkdir(parents=True)
+        original = cache / "data.json"
+        original.write_text('{"old": 1}', encoding="utf-8")
+        report = finance.latest_report(self.dir)
+        before = report.read_bytes()
+        (self.dir / "opiu_all.py").write_text(
+            "from pathlib import Path\n"
+            "Path('Wildberries/cache/data.json').write_text('broken')\n"
+            f"Path({report.name!r}).write_text('broken')\n"
+            "raise SystemExit(1)\n", encoding="utf-8")
+        runner = finance.ReportRunner(self.dir / "status.json")
+        runner.start(self.dir, sys.executable, "full")
+        state = self.wait_runner(runner)
+        self.assertEqual(state["status"], "error")
+        self.assertIn("Предыдущие данные сохранены", state["message"])
+        self.assertEqual(original.read_text(), '{"old": 1}')
+        self.assertEqual(report.read_bytes(), before)
+
+    def test_successful_update_publishes_cache_and_report_only(self):
+        (self.dir / "opiu_all.py").write_text(
+            "from pathlib import Path\n"
+            "Path('Ozon/cache').mkdir(parents=True)\n"
+            "Path('Ozon/cache/new.json').write_text('{}')\n"
+            "Path('opiu_all_new.xlsx').write_bytes(b'new report')\n"
+            "Path('settings.json').write_text('must not be published')\n", encoding="utf-8")
+        runner = finance.ReportRunner(self.dir / "status.json")
+        runner.start(self.dir, sys.executable, "full")
+        self.assertEqual(self.wait_runner(runner)["status"], "done")
+        self.assertEqual((self.dir / "Ozon/cache/new.json").read_text(), "{}")
+        self.assertEqual((self.dir / "opiu_all_new.xlsx").read_bytes(), b"new report")
+        self.assertFalse((self.dir / "settings.json").exists())
+
+    def test_timeout_terminates_job_and_keeps_previous_cache(self):
+        (self.dir / "opiu_all.py").write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+        runner = finance.ReportRunner(self.dir / "status.json")
+        with patch.dict("os.environ", {"WBOPS_FINANCE_TIMEOUT_SECONDS": "1"}):
+            runner.start(self.dir, sys.executable, "full")
+        state = self.wait_runner(runner)
+        self.assertEqual(state["status"], "error")
+        self.assertIn("лимит времени", state["message"])
+        self.assertIsNotNone(runner.process.poll())
+
+    def test_marketplace_memory_error_cannot_publish_partial_success(self):
+        (self.dir / "opiu_all.py").write_text(
+            "from pathlib import Path\n"
+            "print('MemoryError in marketplace process', flush=True)\n"
+            "Path('opiu_all_partial.xlsx').write_bytes(b'partial')\n", encoding="utf-8")
+        runner = finance.ReportRunner(self.dir / "status.json")
+        runner.start(self.dir, sys.executable, "full")
+        state = self.wait_runner(runner)
+        self.assertEqual(state["status"], "error")
+        self.assertFalse((self.dir / "opiu_all_partial.xlsx").exists())
+
+    def test_publication_failure_rolls_back_previous_artifacts(self):
+        stage = self.dir / "staged"
+        stage.mkdir()
+        target = self.dir / "opiu_all_old.xlsx"
+        target.write_bytes(b"old")
+        (stage / target.name).write_bytes(b"new")
+        (stage / "opiu_all_second.xlsx").write_bytes(b"second")
+        original_replace = finance_worker.os.replace
+
+        def failing_replace(source, destination):
+            if Path(destination).name == "opiu_all_second.xlsx":
+                raise OSError("simulated disk error")
+            return original_replace(source, destination)
+
+        with patch.object(finance_worker.os, "replace", side_effect=failing_replace):
+            with self.assertRaisesRegex(OSError, "simulated disk error"):
+                finance_worker.publish(stage, self.dir)
+        self.assertEqual(target.read_bytes(), b"old")
+        self.assertFalse((self.dir / "opiu_all_second.xlsx").exists())
+        self.assertFalse(list(self.dir.glob("*.wbops-new")))
+
+    def test_linux_limits_and_idle_io_priority(self):
+        fake_resource = Namespace(RLIMIT_AS=1, RLIMIT_CPU=2, setrlimit=unittest.mock.Mock())
+        with patch.object(finance_worker.os, "name", "posix"), \
+                patch.object(finance_worker.os, "nice", create=True) as nice, \
+                patch.object(finance_worker.shutil, "which", return_value="/usr/bin/ionice"), \
+                patch.object(finance_worker.subprocess, "run") as run, \
+                patch.dict(sys.modules, {"resource": fake_resource}):
+            limits = finance_worker.Limits()
+            finance_worker.lower_priority(limits)
+            finance_worker.apply_limits(512, 600)
+        nice.assert_called_once_with(10)
+        self.assertEqual(run.call_args.args[0][:3], ["/usr/bin/ionice", "-c", "3"])
+        self.assertEqual(fake_resource.setrlimit.call_args_list, [
+            unittest.mock.call(1, (512 * finance_worker.MIB,) * 2),
+            unittest.mock.call(2, (600, 601))])
+
+    def test_linux_stop_also_kills_remaining_grandchildren(self):
+        process = Namespace(pid=123, wait=unittest.mock.Mock(return_value=0))
+        with patch.object(finance_worker.os, "name", "posix"), \
+                patch.object(finance_worker.os, "killpg", create=True) as kill, \
+                patch.object(finance_worker.signal, "SIGKILL", 9, create=True):
+            finance_worker.stop_tree(process)
+        self.assertEqual(kill.call_args_list, [
+            unittest.mock.call(123, finance_worker.signal.SIGTERM),
+            unittest.mock.call(123, 9)])
 
 
 class SyncAccountsTests(unittest.TestCase):

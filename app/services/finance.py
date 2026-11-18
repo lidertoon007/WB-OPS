@@ -19,6 +19,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 
+from app.services import finance_worker
+
 SUMMARY_SHEET = "Свод"
 CONTROL_SHEET = "Контроль"
 GOODS_SHEET = "Товары"
@@ -331,21 +333,39 @@ def parse_control(ws) -> list[dict]:
     return out
 
 
-def parse_goods(ws, limit: int | None = None) -> dict:
-    rows = list(ws.iter_rows(values_only=True))
-    header_index = next((i for i, r in enumerate(rows[:10]) if r and any(_text(v) == "Артикул" for v in r)), None)
-    if header_index is None:
+def parse_goods(ws, limit: int | None = None, *, by_marketplace: bool = False) -> dict:
+    # read_only workbooks stream rows: never materialize the full goods sheet.
+    rows = iter(ws.iter_rows(values_only=True))
+    header = None
+    for _ in range(10):
+        row = next(rows, None)
+        if row is None:
+            break
+        if any(_text(v) == "Артикул" for v in row):
+            header = [_text(v) for v in row]
+            break
+    if header is None:
         return {"header": [], "rows": []}
-    header = [_text(v) for v in rows[header_index]]
     while header and not header[-1]:
         header.pop()
     width = len(header)
     items = []
-    for r in rows[header_index + 1:]:
+    counts = {}
+    mp_col = header.index("Маркетплейс") if "Маркетплейс" in header else None
+    for r in rows:
         if not r or all(v is None for v in r[:width]):
             continue
+        if limit and by_marketplace and mp_col is not None:
+            mp = _text(r[mp_col]) if mp_col < len(r) else ""
+            # Preserve the first 200 overall and the first 200 per filter scope.
+            # Unknown marketplace labels cannot grow the in-memory cache.
+            if len(items) >= limit and (mp not in MARKETPLACE_NAMES or counts.get(mp, 0) >= limit):
+                continue
+            counts[mp] = counts.get(mp, 0) + 1
         items.append([v if isinstance(v, (int, float, str)) or v is None else str(v) for v in r[:width]])
-        if limit and len(items) >= limit:
+        if limit and len(items) >= limit and (not by_marketplace or mp_col is None):
+            break
+        if limit and by_marketplace and all(counts.get(mp, 0) >= limit for mp in MARKETPLACE_NAMES):
             break
     return {"header": header, "rows": items}
 
@@ -476,7 +496,8 @@ def read_report(path: Path) -> dict:
         data = {"summary": summary, "views": views, "cabinets": cabinets,
                 "detail": detail,
                 "control": parse_control(wb[CONTROL_SHEET]) if CONTROL_SHEET in wb.sheetnames else [],
-                "goods": parse_goods(wb[GOODS_SHEET]) if GOODS_SHEET in wb.sheetnames else {"header": [], "rows": []},
+                "goods": parse_goods(wb[GOODS_SHEET], GOODS_LIMIT, by_marketplace=True)
+                         if GOODS_SHEET in wb.sheetnames else {"header": [], "rows": []},
                 "file": path.name, "updated_at": datetime.fromtimestamp(stamp).isoformat(timespec="minutes")}
     finally:
         wb.close()
@@ -500,7 +521,7 @@ class ReportRunner:
         self.log: deque[str] = deque(maxlen=400)
         self.status_path = Path(status_path or "data/finance_status.json")
         self.state = {"status": "idle", "mode": None, "marketplace": None, "cabinet": None, "started_at": None,
-                      "finished_at": None, "code": None, "cabinets": {}, "warnings": []}
+                      "finished_at": None, "code": None, "cabinets": {}, "warnings": [], "message": ""}
 
     def try_run_lock(self) -> BinaryIO | None:
         """Reserve access to the finance cache across workers until the file is closed."""
@@ -612,7 +633,7 @@ class ReportRunner:
         with self.lock:
             if self.run_lock is not None:
                 raise FinanceError("Отчёт уже собирается. Дождитесь окончания.")
-            cmd = [python or sys.executable, "opiu_all.py", "--no-unit"]
+            cmd = [python or sys.executable, str(Path(finance_worker.__file__).resolve()), "opiu_all.py", "--no-unit"]
             if mode == "cache":
                 cmd += ["--from-cache", "--fill-missing"]   # чего нет в кэше — загрузить из API
             elif mode == "reload":
@@ -629,8 +650,14 @@ class ReportRunner:
                 raise FinanceError(f"Не удалось заблокировать запуск ОПиУ: {exc}") from exc
             if run_lock is None:
                 raise FinanceError("Отчёт уже собирается или обновляется индекс штрафов. Дождитесь окончания.")
+            try:
+                finance_worker.check_resources(project, finance_worker.Limits.configured())
+            except (OSError, ValueError) as exc:
+                run_lock.close()
+                raise FinanceError(str(exc)) from exc
             # On Unix the child retains the lock if the serving worker exits unexpectedly.
-            process_options = {} if os.name == "nt" else {"pass_fds": (run_lock.fileno(),)}
+            process_options = ({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt"
+                               else {"pass_fds": (run_lock.fileno(),), "start_new_session": True})
             try:
                 self.process = subprocess.Popen(cmd, cwd=project, env=env, stdout=subprocess.PIPE,
                                                 stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -645,7 +672,7 @@ class ReportRunner:
                 self.log.append(note)
             self.state = {"status": "running", "mode": mode, "marketplace": marketplace, "cabinet": cabinet,
                           "started_at": time.time(), "finished_at": None, "code": None,
-                          "cabinets": {}, "warnings": []}
+                          "cabinets": {}, "warnings": [], "message": ""}
             self._persist()
         threading.Thread(target=self._pump, daemon=True).start()
         return self.status()
@@ -670,6 +697,8 @@ class ReportRunner:
             if line:
                 with self.lock:
                     self.log.append(line)
+                    if line.startswith(finance_worker.ERROR_PREFIX):
+                        self.state["message"] = line[len(finance_worker.ERROR_PREFIX):]
                     parsed = self._cabinet_line(line)
                     if parsed:
                         name, item = parsed
@@ -679,8 +708,12 @@ class ReportRunner:
                     self._persist()
 
     def _finish(self, code):
-        interrupted = self.stop_requested or code == -15
-        if interrupted:
+        interrupted = self.stop_requested or code in (-15, 130)
+        if code and self.state.get("message"):
+            for item in self.state.setdefault("cabinets", {}).values():
+                if item.get("status") in ("loading", "complete"):
+                    item.update(status="interrupted", message=self.state["message"])
+        elif interrupted:
             # A terminated worker must not leave its last cabinet marked as loading.
             for item in self.state.setdefault("cabinets", {}).values():
                 if item.get("status") == "loading":

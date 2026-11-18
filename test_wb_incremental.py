@@ -1,8 +1,10 @@
 """Догрузка отчётов реализации WB к кэшу (opiu/Wildberries/wb_finance.py: closed_weeks, load_account)."""
 import io
+import gzip
 import json
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from contextlib import redirect_stdout
 from datetime import date
@@ -47,6 +49,79 @@ class ClosedWeeksTests(unittest.TestCase):
 
     def test_nothing_to_continue(self):
         self.assertIsNone(w.closed_weeks({"rows": [row(1, 1, "2026-10-13")], "reports": []}, date(2026, 10, 27)))
+
+
+class StreamingCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "cache.json"
+
+    def test_roundtrip_unicode_and_chunk_boundaries(self):
+        rows = [dict(row(1, 1, "2026-10-13"), text='Кавычки " / \\ / \n 😀' * 8000),
+                row(2, 2, "2026-10-20")]
+        w.write_cache(self.path, rows, [WEEK1, WEEK2], None, [])
+        data = w.read_cache(self.path)
+        self.assertEqual(list(data["rows"]), rows)
+        self.assertEqual(list(data["rows"]), rows)  # aggregation/cache/CSV each iterate independently
+        self.assertEqual(data["reports"], [WEEK1, WEEK2])
+        self.assertIsNone(data["daily"])
+
+    def test_rejects_truncated_or_trailing_cache(self):
+        for text in ('{"rows":[{"rrdId":1}', '{"rows":[]} unexpected'):
+            self.path.write_text(text, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                w.read_cache(self.path)
+
+    def test_large_cache_peak_memory_is_bounded(self):
+        # 40 MiB of raw rows must not become a full Unicode string/list of dicts.
+        count = 20000
+        w.write_cache(self.path, (dict(row(i, 1, "2026-10-13"), payload="я" * 1000)
+                                 for i in range(count)), [WEEK1], None, [])
+        self.assertGreater(self.path.stat().st_size, 40_000_000)
+        tracemalloc.start()
+        try:
+            data = w.read_cache(self.path)
+            selected, reports = w.closed_weeks(data, date(2026, 10, 27))
+            self.assertEqual(len(selected), count)
+            self.assertEqual(sum(1 for _ in selected), count)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 4 * 1024 * 1024, f"streaming cache peak={peak} bytes")
+        self.assertEqual(reports, [WEEK1])
+
+    def test_api_dedup_preserves_last_value_and_original_order(self):
+        class Client:
+            log = staticmethod(lambda _: None)
+            def post(self, _):
+                return [row(1, 1, "2026-10-13"), row(2, 1, "2026-10-14"),
+                        row(1, 1, "2026-10-15")]
+        result = w.fetch_rows(Client(), D_FROM, date(2026, 10, 27))
+        self.assertEqual([(r["rrdId"], r["rrDate"]) for r in result],
+                         [(1, "2026-10-15"), (2, "2026-10-14")])
+
+    def test_http_finance_pages_stream_both_plain_and_gzip(self):
+        expected = [dict(row(i, 1, "2026-10-13"), text="Кавычки \\\" 😀" * 100)
+                    for i in range(300)]
+        raw = json.dumps(expected, ensure_ascii=False).encode("utf-8")
+        class Response(io.BytesIO):
+            status = 200
+        for compressed in (False, True):
+            response = Response(gzip.compress(raw) if compressed else raw)
+            response.headers = {"Content-Encoding": "gzip" if compressed else ""}
+            with mock.patch.object(w.urllib.request, "urlopen", return_value=response):
+                actual = w.WBClient("fake").post({})
+            self.assertIsInstance(actual, w.DiskRows)
+            self.assertEqual(list(actual), expected)
+
+    def test_disk_rows_temp_database_is_removed_when_released(self):
+        rows = w.DiskRows([row(1, 1, "2026-10-13")])
+        folder = Path(rows._temp.name)
+        self.assertTrue(folder.exists())
+        self.assertEqual(len(list(rows)), 1)
+        del rows
+        self.assertFalse(folder.exists())
 
 
 class LoadAccountTests(unittest.TestCase):
@@ -104,6 +179,13 @@ class LoadAccountTests(unittest.TestCase):
     def test_reload_fetches_whole_period(self):
         self.load(date(2026, 10, 28), reload=True)
         self.assertIn(("rows", "weekly", D_FROM, date(2026, 10, 28)), self.calls)
+
+    def test_from_cache_uses_disk_rows_and_preserves_daily(self):
+        rows, reports, daily = w.load_account(ACC, D_FROM, date(2026, 10, 27), self.cache, True)
+        self.assertIsInstance(rows, w.DiskRows)
+        self.assertEqual(list(rows), CACHE["rows"])
+        self.assertEqual(reports, CACHE["reports"])
+        self.assertEqual(daily, CACHE["daily"])
 
 
 if __name__ == "__main__":

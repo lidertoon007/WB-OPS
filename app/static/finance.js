@@ -181,7 +181,7 @@ window.WBOPSFinance = (() => {
       : st.status === 'done' ? 'Отчёт собран.'
       : st.status === 'interrupted' ? `Сборка прервана${st.code != null ? ` (код ${st.code})` : ''}.`
       : `Сборка завершилась с ошибкой (код ${st.code}).`;
-    out.innerHTML = `<b>${esc(title.replace('маркетплейсов', 'маркетплейса' + scope))}</b><pre>${esc((st.log || []).slice(-15).join('\n'))}</pre>`;
+    out.innerHTML = `<b>${esc(st.message || title.replace('маркетплейсов', 'маркетплейса' + scope))}</b><pre>${esc((st.log || []).slice(-15).join('\n'))}</pre>`;
   }
 
   async function poll() {

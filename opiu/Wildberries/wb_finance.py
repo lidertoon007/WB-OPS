@@ -27,9 +27,12 @@ import argparse
 import csv
 import gzip
 import http.client
+import io
 import json
 import re
+import sqlite3
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -152,6 +155,19 @@ class WBClient:
                 with urllib.request.urlopen(req, timeout=600) as resp:
                     if resp.status == 204:
                         return []
+                    if url == API_URL:
+                        # Decode/decompress finance pages incrementally too: reducing
+                        # the WB page limit would multiply its one-minute API pauses.
+                        body_stream = (gzip.GzipFile(fileobj=resp) if
+                                       resp.headers.get("Content-Encoding", "").lower() == "gzip" else resp)
+                        with io.TextIOWrapper(body_stream, encoding="utf-8") as text_stream:
+                            reader = _JsonStream(text_stream)
+                            rows = DiskRows()
+                            if reader.char():
+                                read_row_array(reader, rows)
+                            if reader.char():
+                                raise ValueError("Invalid trailing WB response JSON")
+                            return rows
                     raw = resp.read()
                     if resp.headers.get("Content-Encoding", "").lower() == "gzip":
                         raw = gzip.decompress(raw)
@@ -179,8 +195,136 @@ class WBClient:
                 raise RuntimeError(f"Нет соединения с API Wildberries: {e}") from None
 
 
+class DiskRows:
+    """Repeatable report rows without retaining hundreds of MB of Python dicts."""
+    def __init__(self, rows=()):
+        self._temp = tempfile.TemporaryDirectory(prefix="wb-finance-rows-")
+        self._db = sqlite3.connect(str(Path(self._temp.name) / "rows.sqlite"))
+        self._db.execute("PRAGMA cache_size=-1024")
+        self._db.execute("PRAGMA journal_mode=OFF")
+        self._db.execute("PRAGMA synchronous=OFF")
+        self._db.execute("CREATE TABLE rows (seq INTEGER PRIMARY KEY, key TEXT UNIQUE, payload TEXT NOT NULL)")
+        self.extend(rows)
+
+    def append(self, row, *, deduplicate=False):
+        key = json.dumps(row.get("rrdId")) if deduplicate else None
+        self._db.execute("INSERT INTO rows(key,payload) VALUES (?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+                         (key, json.dumps(row, ensure_ascii=False)))
+
+    def extend(self, rows):
+        for row in rows:
+            self.append(row)
+
+    def __len__(self):
+        return self._db.execute("SELECT COUNT(*) FROM rows").fetchone()[0]
+
+    def __iter__(self):
+        for (payload,) in self._db.execute("SELECT payload FROM rows ORDER BY seq"):
+            yield json.loads(payload)
+
+    def __del__(self):
+        if hasattr(self, "_db"):
+            self._db.close()
+        if hasattr(self, "_temp"):
+            self._temp.cleanup()
+
+
+class _JsonStream:
+    """Incremental JSON values; the buffer is one row plus a 64 KiB chunk."""
+    def __init__(self, stream):
+        self.stream, self.buffer, self.pos, self.eof = stream, "", 0, False
+        self.decoder = json.JSONDecoder()
+
+    def fill(self):
+        self.buffer = self.buffer[self.pos:] + self.stream.read(65536)
+        self.pos = 0
+        if not self.buffer:
+            self.eof = True
+
+    def char(self):
+        while True:
+            while self.pos < len(self.buffer) and self.buffer[self.pos].isspace():
+                self.pos += 1
+            if self.pos < len(self.buffer):
+                return self.buffer[self.pos]
+            if self.eof:
+                return ""
+            self.fill()
+
+    def expect(self, char):
+        if self.char() != char:
+            raise ValueError(f"Invalid WB cache JSON: expected {char!r}")
+        self.pos += 1
+
+    def value(self):
+        self.char()
+        while True:
+            try:
+                value, end = self.decoder.raw_decode(self.buffer, self.pos)
+                self.pos = end
+                return value
+            except json.JSONDecodeError:
+                tail = self.buffer[self.pos:]
+                chunk = self.stream.read(65536)
+                if not chunk:
+                    raise ValueError("Invalid or truncated WB cache JSON") from None
+                self.buffer, self.pos = tail + chunk, 0
+
+
+def read_cache(path):
+    """Read the existing cache format while spilling its large rows array to disk."""
+    data, rows = {}, DiskRows()
+    with path.open(encoding="utf-8") as stream:
+        reader = _JsonStream(stream)
+        reader.expect("{")
+        first = True
+        while reader.char() != "}":
+            if not first:
+                reader.expect(",")
+            first = False
+            key = reader.value()
+            reader.expect(":")
+            if key == "rows":
+                read_row_array(reader, rows)
+            else:
+                data[key] = reader.value()
+        reader.expect("}")
+        if reader.char():
+            raise ValueError("Invalid trailing WB cache JSON")
+    data["rows"] = rows
+    return data
+
+
+def read_row_array(reader, rows):
+    reader.expect("[")
+    first = True
+    while reader.char() != "]":
+        if not first:
+            reader.expect(",")
+        first = False
+        rows.append(reader.value())
+    reader.expect("]")
+
+
+def write_cache(path, rows, reports, daily, daily_ids):
+    with path.open("w", encoding="utf-8") as stream:
+        stream.write('{"rows":[')
+        for i, row in enumerate(rows):
+            if i:
+                stream.write(",")
+            json.dump(row, stream, ensure_ascii=False)
+        stream.write('],"reports":')
+        json.dump(reports, stream, ensure_ascii=False)
+        stream.write(',"daily":')
+        json.dump(daily, stream, ensure_ascii=False)
+        stream.write(',"daily_ids":')
+        json.dump(daily_ids, stream, ensure_ascii=False)
+        stream.write("}")
+
+
 def fetch_rows(client, date_from, date_to, period="weekly"):
-    rows, rrd_id, page = {}, 0, 0
+    rows, rrd_id, page = DiskRows(), 0, 0
     while True:
         page += 1
         batch = client.post({
@@ -189,14 +333,16 @@ def fetch_rows(client, date_from, date_to, period="weekly"):
         })
         if not batch:
             break
+        last_row = None
         for r in batch:
-            rows[r.get("rrdId")] = r
+            rows.append(r, deduplicate=True)
+            last_row = r
         client.log(f"  часть {page}: {len(batch)} строк (всего {len(rows)})")
-        new_id = batch[-1].get("rrdId") or 0
+        new_id = last_row.get("rrdId") or 0
         if len(batch) < PAGE_LIMIT or new_id == rrd_id:
             break
         rrd_id = new_id
-    return list(rows.values())
+    return rows
 
 
 def fetch_reports(client, date_from, date_to, period="weekly"):
@@ -227,7 +373,7 @@ def closed_weeks(data, d_to):
     if not weekly:
         return None
     ids = {r.get("reportId") for r in weekly}
-    return [r for r in data.get("rows") or [] if r.get("reportId") in ids], weekly
+    return DiskRows(r for r in data.get("rows") or [] if r.get("reportId") in ids), weekly
 
 
 def load_account(acc, d_from, d_to, cache_dir, from_cache, reload=False):
@@ -247,7 +393,7 @@ def load_account(acc, d_from, d_to, cache_dir, from_cache, reload=False):
             if not candidates:
                 raise RuntimeError(f"нет кэша {cache_file.name} — запустите без --from-cache")
             cache_file = candidates[-1]
-        data = json.loads(cache_file.read_text(encoding="utf-8"))
+        data = read_cache(cache_file)
         rows, reports = data["rows"], data.get("reports") or []
         log(f"из кэша {cache_file.name}: {len(rows)} строк, {len(reports)} отчётов")
         return rows, reports, data.get("daily")
@@ -257,7 +403,7 @@ def load_account(acc, d_from, d_to, cache_dir, from_cache, reload=False):
     if candidates and not reload:
         prev = cache_file if cache_file.exists() else candidates[-1]
         try:
-            base = closed_weeks(json.loads(prev.read_text(encoding="utf-8")), d_to)
+            base = closed_weeks(read_cache(prev), d_to)
         except (OSError, ValueError, KeyError) as e:
             log(f"кэш {prev.name} не прочитан ({e}), загружаю всё заново")
     if base:
@@ -270,14 +416,15 @@ def load_account(acc, d_from, d_to, cache_dir, from_cache, reload=False):
         if week_from + timedelta(days=7) <= d_to:
             known = {r.get("reportId") for r in reports}
             log(f"догрузка еженедельных отчётов {week_from} — {d_to}...")
-            new_rows = [r for r in fetch_rows(client, week_from, d_to) if r.get("reportId") not in known]
+            new_rows = DiskRows(r for r in fetch_rows(client, week_from, d_to) if r.get("reportId") not in known)
             try:
                 new_reports = [r for r in fetch_reports(client, week_from, d_to) if r.get("reportId") not in known]
             except RuntimeError as e:
                 log(f"  список отчётов не получен, сверки новых недель не будет: {e}")
                 new_reports = []
             log(f"  новых отчётов: {len(new_reports)}, строк: {len(new_rows)}")
-            rows, reports = rows + new_rows, reports + new_reports
+            rows.extend(new_rows)
+            reports.extend(new_reports)
     else:
         log("загрузка еженедельных отчётов реализации...")
         rows = fetch_rows(client, d_from, d_to)
@@ -290,9 +437,10 @@ def load_account(acc, d_from, d_to, cache_dir, from_cache, reload=False):
 
     # Еженедельный отчёт WB формирует в понедельник за прошлую неделю. Дни после него есть
     # только в ежедневных отчётах — берём их, чтобы видеть данные по вчерашний день.
-    ends = [str(r.get("dateTo") or "")[:10] for r in reports] or [str(r.get("rrDate") or "")[:10] for r in rows]
-    ends = [e for e in ends if e]
-    weekly_end = date.fromisoformat(max(ends)) if ends else d_from - timedelta(days=1)
+    last_end = max((str(r.get("dateTo") or "")[:10] for r in reports), default="")
+    if not last_end:
+        last_end = max((str(r.get("rrDate") or "")[:10] for r in rows), default="")
+    weekly_end = date.fromisoformat(last_end) if last_end else d_from - timedelta(days=1)
     daily, daily_ids = None, []
     if weekly_end < d_to:
         day_from = weekly_end + timedelta(days=1)
@@ -302,10 +450,10 @@ def load_account(acc, d_from, d_to, cache_dir, from_cache, reload=False):
             day_reports = fetch_reports(client, day_from, d_to, period="daily")
             ids = {r.get("reportId") for r in day_reports}
             weekly_ids = {r.get("reportId") for r in rows}
-            day_rows = [r for r in day_rows if (not ids or r.get("reportId") in ids)
-                        and r.get("reportId") not in weekly_ids]
-            rows = rows + day_rows
-            reports = reports + day_reports
+            day_rows = DiskRows(r for r in day_rows if (not ids or r.get("reportId") in ids)
+                               and r.get("reportId") not in weekly_ids)
+            rows.extend(day_rows)
+            reports.extend(day_reports)
             daily_ids = [r.get("reportId") for r in day_reports]
             days = sorted(str(r.get("rrDate") or "")[:10] for r in day_rows if r.get("rrDate"))
             if days:
@@ -318,9 +466,7 @@ def load_account(acc, d_from, d_to, cache_dir, from_cache, reload=False):
     cache_dir.mkdir(exist_ok=True)
     # Через временный файл: оборванная запись не испортит кэш, от которого догружается следующий запуск
     tmp = cache_file.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as stream:
-        json.dump({"rows": rows, "reports": reports, "daily": daily, "daily_ids": daily_ids},
-                  stream, ensure_ascii=False)
+    write_cache(tmp, rows, reports, daily, daily_ids)
     tmp.replace(cache_file)
     # Старые выгрузки этого кабинета за тот же период не нужны: новая их полностью заменяет
     for old in cache_dir.glob(f"{safe_name(name)}_{d_from}_*.json"):
