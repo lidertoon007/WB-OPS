@@ -124,7 +124,7 @@ class IndividualSafetyTests(StatusTests):
 
     def test_question_unchanged(self):
         item = InboxItem(id="q", cabinet_id="main", item_type="question", text="Есть размер 50?")
-        self.assertIn("Сообщить о поступлении", self.service.draft(item).text)
+        self.assertIn("следите за наличием", self.service.draft(item).text)
 
     # Тексты благодарности в индивидуальном режиме другие — проверяем смысл, а не формулировку
     def test_positive_refusal_screenshot(self):

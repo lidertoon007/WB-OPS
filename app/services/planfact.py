@@ -53,11 +53,11 @@ def status(key, plan, forecast) -> str | None:
     if direction == "up":
         if plan <= 0:
             return "good" if forecast >= plan else "bad"
-        p = forecast / plan * 100
+        p = round(forecast / plan * 100, 4)
         return "good" if p >= 100 else "warn" if p >= 90 else "bad"
     if plan <= 0:
         return "good" if forecast <= 0 else "bad"
-    p = forecast / plan * 100
+    p = round(forecast / plan * 100, 4)
     return "good" if p <= 100 else "warn" if p <= 110 else "bad"
 
 
