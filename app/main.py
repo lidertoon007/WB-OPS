@@ -46,6 +46,7 @@ from app.services.chats import ChatStore
 from app.services.knowledge_groups import KnowledgeGroupStore
 from app.services.wb_client import WBApiError, WBFeedbackClient
 from app.services import finance
+from app.services import unit_economics
 from app.services import keycheck
 from app.services import analytics as analytics_module
 from app.services.analytics import Analytics
@@ -70,7 +71,7 @@ from app.storage import DraftStore
 settings = get_settings()
 STATIC_DIR = Path(__file__).parent / "static"
 DASHBOARD_FILE = STATIC_DIR / "dashboard.html"
-DASHBOARD_PAGES = ("workspace", "abc", "products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "notifications", "team", "complaints", "nomenclature", "dashboard", "dashboard-ozon", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads", "planfact", "ab", "card-comparisons")
+DASHBOARD_PAGES = ("workspace", "abc", "products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "unit-economics", "notifications", "team", "complaints", "nomenclature", "dashboard", "dashboard-ozon", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads", "planfact", "ab", "card-comparisons")
 DASHBOARD_PATHS = {"/", *(f"/{page}" for page in DASHBOARD_PAGES)}
 app = FastAPI(
     title=settings.app_name,
@@ -353,7 +354,7 @@ def process_auto_question(item: InboxItem) -> dict[str, object]:
 LOCAL_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
 # Только владельцу (на компьютере с WB OPS): команда, токены, ключи, финансы, резервные копии
 OWNER_ONLY = ("/api/team", "/api/admin", "/api/notifications", "/api/finance", "/api/home", "/api/abc", "/api/nomenclature", "/api/dashboard", "/api/rnp", "/api/transfer", "/api/repricer", "/api/penalties", "/api/ads", "/api/planfact", "/api/ab", "/api/card-comparisons", "/api/settings/modules/telegram", "/docs", "/openapi.json",
-              "/api/complaint-browser")
+              "/api/complaint-browser", "/api/unit-economics")
 OWNER_ONLY_WRITE = ("/api/cabinets", "/api/ai/settings", "/api/account", "/api/settings/auto-sync")
 MEMBER_OPEN = ("/api/team/me", "/api/team/logout")
 
@@ -361,7 +362,7 @@ MEMBER_OPEN = ("/api/team/me", "/api/team/logout")
 def is_owner_only(path: str, method: str) -> bool:
     if path.startswith(MEMBER_OPEN):
         return False
-    if path.startswith(OWNER_ONLY) or path in ("/finances", "/nomenclature", "/dashboard", "/dashboard-ozon", "/abc", "/rnp", "/transfer", "/repricer", "/penalties", "/ads", "/planfact", "/ab", "/card-comparisons"):
+    if path.startswith(OWNER_ONLY) or path in ("/finances", "/unit-economics", "/nomenclature", "/dashboard", "/dashboard-ozon", "/abc", "/rnp", "/transfer", "/repricer", "/penalties", "/ads", "/planfact", "/ab", "/card-comparisons"):
         return True
     return method not in ("GET", "HEAD") and path.startswith(OWNER_ONLY_WRITE)
 
@@ -404,7 +405,7 @@ async def inject_knowledge_workspace(request: Request, call_next):
     body = b"".join([chunk async for chunk in response.body_iterator])
     html = body.decode("utf-8")
     if request.url.path in DASHBOARD_PATHS:
-        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "fbs_ozon.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "card_compare.js", "home.js", "abc.js", "router.js", "knowledge.js"))
+        scripts = "".join(f"<script>{(STATIC_DIR / name).read_text(encoding='utf-8')}</script>" for name in ("finance.js", "unit_economics.js", "replies.js", "questions.js", "analytics.js", "settings.js", "reviews.js", "complaints.js", "products.js", "dashboard.js", "rnp.js", "transfer.js", "repricer.js", "stocks.js", "fbs.js", "fbs_ozon.js", "penalties.js", "ads.js", "planfact.js", "ab.js", "card_compare.js", "home.js", "abc.js", "router.js", "knowledge.js"))
         html = html.replace("</body>", scripts + "</body>")
     return Response(content=html, status_code=response.status_code, headers={"content-type": "text/html; charset=utf-8"})
 
@@ -2115,7 +2116,7 @@ def finance_report(cabinet: str = "") -> dict[str, object]:
     data["cabinets"] = finance.cabinet_options(data["cabinets"], project, configured_cabinets())
     # Status is persisted by ReportRunner, so the UI can explain partial/cache/API runs
     # even after the activity panel has disappeared or the process restarted.
-    raw_status = finance_runner.status()
+    raw_status = finance_runner.pnl_status()
     known_names = {c.name for c in configured_cabinets() if c.token}
     run_status = {**raw_status, "cabinets": {
         k: dict(v) for k, v in (raw_status.get("cabinets") or {}).items() if k in known_names
@@ -2143,6 +2144,48 @@ def finance_report_download() -> FileResponse:
         raise HTTPException(404, "Отчёт ещё не собран")
     return FileResponse(path, filename=path.name,
                         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.get("/api/unit-economics/report")
+def unit_economics_report(marketplace: str = "", cabinet: str = "", brand: str = "", category: str = "",
+                          q: str = Query("", max_length=160), page: int = Query(1, ge=1),
+                          page_size: int = Query(50, ge=1, le=100), date_from: str | None = None,
+                          date_to: str | None = None) -> dict:
+    path = unit_economics.latest_report(finance_project())
+    try:
+        if path is None:
+            unit_economics.validate_period(date_from, date_to)
+            return {"file": None, "available_periods": [], "active_period": {"date_from": None, "date_to": None}}
+        return unit_economics.report_view(path, marketplace, cabinet, brand, category, q, page, page_size,
+                                          date_from, date_to)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except finance.FinanceError as exc:
+        raise HTTPException(500, str(exc)) from exc
+
+
+@app.get("/api/unit-economics/report/download")
+def unit_economics_download() -> FileResponse:
+    path = unit_economics.latest_report(finance_project())
+    if path is None:
+        raise HTTPException(404, "Файл юнит-экономики ещё не собран.")
+    return FileResponse(path, filename=path.name,
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.get("/api/unit-economics/update")
+def unit_economics_update_status() -> dict:
+    return finance_runner.status()
+
+
+@app.post("/api/unit-economics/update")
+def unit_economics_update() -> dict:
+    try:
+        result = finance_runner.start(finance_project(), finance_settings()["python"] or finance.default_python(), "unit")
+    except finance.FinanceError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    draft_store.audit("unit_economics_update_started", details="cache")
+    return result
 
 
 # ---------------------------------------------------------------- номенклатура и себестоимость
@@ -3858,7 +3901,7 @@ async def ab_hypotheses_rollback(hypothesis_id: int, body: ABHypothesisDecision 
 
 @app.get("/api/finance/update")
 def finance_update_status() -> dict[str, object]:
-    return finance_runner.status()
+    return finance_runner.pnl_status(show_busy=True)
 
 
 @app.post("/api/finance/update")

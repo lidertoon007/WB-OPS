@@ -42,6 +42,7 @@
     notifications:   {path: '/notifications',   title: 'Настройки уведомлений', sub: 'Telegram и email: отзывы, вопросы, чаты', show: ['notificationsSettings']},
     team:            {path: '/team',            title: 'Моя команда', sub: 'Приглашения и доступ сотрудников', show: ['team']},
     finances:        {path: '/finances',        title: 'Финансы', sub: 'ОПиУ по всем маркетплейсам и кабинетам', show: ['finances']},
+    'unit-economics': {path: '/unit-economics',  title: 'Фактическая юнит-экономика', sub: 'Продажи, расходы и прибыль по артикулам и кабинетам', show: ['unitEconomics']},
   };
   const SENDS = new Set(['workspace', 'reviews', 'complaints', 'questions', 'chats', 'messengers', 'templates', 'settings', 'ai', 'import']);
   const byPath = Object.fromEntries(Object.entries(PAGES).map(([k, v]) => [v.path, k]));
@@ -135,6 +136,11 @@
     else s.innerHTML = '<h2>Финансы</h2><p class="muted">Не загрузился модуль finance.js.</p>';
   }
 
+  function renderUnitEconomics() {
+    const s = section('unitEconomics', '');
+    if (window.WBOPSUnitEconomics) window.WBOPSUnitEconomics.render(s);
+    else s.innerHTML = '<p class="muted">Не загрузился модуль юнит-экономики.</p>';
+  }
 
   // --- visibility -------------------------------------------------------------
   const settingsPage = (id, fn) => () => {
@@ -234,7 +240,8 @@
     if (window.WBOPSCardCompare) window.WBOPSCardCompare.render(s);
     else s.innerHTML = '<p class="muted">Не загрузился модуль сравнения карточек.</p>';
   };
-  const rendered = {home: homePage, abc: abcPage, ab: abPage, 'card-comparisons': cardComparisonsPage, planfact: planfactPage, ads: adsPage, penalties: penaltiesPage, 'fbs-analytics': fbsPage, stocks: stocksPage, repricer: repricerPage, transfer: transferPage, rnp: rnpPage, dashboard: dashboardPage, 'dashboard-ozon': ozonDashboardPage, nomenclature: nomenclaturePage, complaints: complaintsPage, reviews: reviewsPage, cabinets: settingsPage('cabinets', 'cabinets'), notifications: settingsPage('notificationsSettings', 'notifications'), team: settingsPage('team', 'team'), analytics: renderAnalytics, import: renderImport, profile: renderProfile, messengers: renderMessengers, finances: renderFinances};
+  const rendered = {home: homePage, abc: abcPage, ab: abPage, 'card-comparisons': cardComparisonsPage, planfact: planfactPage, ads: adsPage, penalties: penaltiesPage, 'fbs-analytics': fbsPage, stocks: stocksPage, repricer: repricerPage, transfer: transferPage, rnp: rnpPage, dashboard: dashboardPage, 'dashboard-ozon': ozonDashboardPage, nomenclature: nomenclaturePage, complaints: complaintsPage, reviews: reviewsPage, cabinets: settingsPage('cabinets', 'cabinets'), notifications: settingsPage('notificationsSettings', 'notifications'), team: settingsPage('team', 'team'), analytics: renderAnalytics, import: renderImport, profile: renderProfile, messengers: renderMessengers, finances: renderFinances,
+    'unit-economics': renderUnitEconomics};
   const done = new Set();
   let applying = false;
   function apply() {

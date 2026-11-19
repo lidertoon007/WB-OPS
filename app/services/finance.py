@@ -520,8 +520,16 @@ class ReportRunner:
         self.stop_requested = False
         self.log: deque[str] = deque(maxlen=400)
         self.status_path = Path(status_path or "data/finance_status.json")
-        self.state = {"status": "idle", "mode": None, "marketplace": None, "cabinet": None, "started_at": None,
-                      "finished_at": None, "code": None, "cabinets": {}, "warnings": [], "message": ""}
+        self.state = self._idle_state()
+        self.last_pnl = self._snapshot()
+
+    @staticmethod
+    def _idle_state() -> dict:
+        return {"status": "idle", "mode": None, "marketplace": None, "cabinet": None, "started_at": None,
+                "finished_at": None, "code": None, "cabinets": {}, "warnings": [], "message": ""}
+
+    def _snapshot(self, limit: int = 60) -> dict:
+        return {**self.state, "log": list(self.log)[-limit:]}
 
     def try_run_lock(self) -> BinaryIO | None:
         """Reserve access to the finance cache across workers until the file is closed."""
@@ -551,6 +559,9 @@ class ReportRunner:
                 self.state.update({k: saved[k] for k in self.state if k in saved})
                 self.log.clear()
                 self.log.extend(str(x) for x in saved.get("log", [])[-400:])
+                if self.state["mode"] == "unit":
+                    pnl = saved.get("last_pnl")
+                    self.last_pnl = pnl if isinstance(pnl, dict) else {**self._idle_state(), "log": []}
                 interrupted = self.state.get("status") == "running" or (
                     self.state.get("status") == "error" and self.state.get("code") == -15
                 )
@@ -574,7 +585,9 @@ class ReportRunner:
             pass
 
     def _persist(self):
-        payload = {**self.state, "log": list(self.log)[-400:]}
+        payload = self._snapshot(limit=400)
+        if self.state["mode"] == "unit":
+            payload["last_pnl"] = self.last_pnl
         try:
             self.status_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.status_path.with_suffix(self.status_path.suffix + ".tmp")
@@ -614,26 +627,40 @@ class ReportRunner:
             rows = int(rm.group(1).replace(" ", ""))
         return name, {"status": state, "message": line, **({"rows": rows} if rows is not None else {})}
 
+    def _refresh_status(self):
+        if self.run_lock is None:
+            self._load_state()
+            if self.state["status"] == "running" or (
+                self.state["status"] == "error" and self.state["code"] == -15
+            ):
+                run_lock = self.try_run_lock()
+                if run_lock is not None:
+                    with run_lock:
+                        # Reload under the lock in case the owner finished meanwhile.
+                        self._load_state(recover=True)
+
     def status(self) -> dict:
         with self.lock:
-            if self.run_lock is None:
-                self._load_state()
-                if self.state["status"] == "running" or (
-                    self.state["status"] == "error" and self.state["code"] == -15
-                ):
-                    run_lock = self.try_run_lock()
-                    if run_lock is not None:
-                        with run_lock:
-                            # Reload under the lock in case the owner finished meanwhile.
-                            self._load_state(recover=True)
-            return {**self.state, "log": list(self.log)[-60:]}
+            self._refresh_status()
+            return self._snapshot()
+
+    def pnl_status(self, *, show_busy: bool = False) -> dict:
+        with self.lock:
+            self._refresh_status()
+            if self.state["mode"] != "unit":
+                return self._snapshot()
+            if show_busy and self.state["status"] == "running":
+                return {**self._idle_state(), "status": "running", "log": [],
+                        "message": "Собирается юнит-экономика. Дождитесь окончания."}
+            return {**self.last_pnl}
 
     def start(self, project: Path, python: str, mode: str, note: str = "", marketplace: str | None = None,
               cabinet: str | None = None) -> dict:
         with self.lock:
             if self.run_lock is not None:
                 raise FinanceError("Отчёт уже собирается. Дождитесь окончания.")
-            cmd = [python or sys.executable, str(Path(finance_worker.__file__).resolve()), "opiu_all.py", "--no-unit"]
+            cmd = [python or sys.executable, str(Path(finance_worker.__file__).resolve()), "opiu_all.py"]
+            cmd += ["--only-unit", "--from-cache"] if mode == "unit" else ["--no-unit"]
             if mode == "cache":
                 cmd += ["--from-cache", "--fill-missing"]   # чего нет в кэше — загрузить из API
             elif mode == "reload":
@@ -655,6 +682,11 @@ class ReportRunner:
             except (OSError, ValueError) as exc:
                 run_lock.close()
                 raise FinanceError(str(exc)) from exc
+            if mode == "unit":
+                # Capture the last P&L status while no other build can replace it.
+                self._load_state(recover=True)
+                if self.state["mode"] != "unit":
+                    self.last_pnl = self._snapshot()
             # On Unix the child retains the lock if the serving worker exits unexpectedly.
             process_options = ({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt"
                                else {"pass_fds": (run_lock.fileno(),), "start_new_session": True})

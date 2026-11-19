@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import runpy
 import shutil
 import signal
@@ -16,6 +17,10 @@ from pathlib import Path
 MIB = 1024 * 1024
 ERROR_PREFIX = "WBOPS_FINANCE_ERROR: "
 STAGING_PREFIX = ".wbops-finance-"
+UNIT_REPORT_NAME = re.compile(
+    r"unit_economics_(?:weekly_)?(\d{4}-(?:0[1-9]|1[0-2]))"
+    r"(?:_(\d{4}-(?:0[1-9]|1[0-2])))?(?:_\d{8}_\d{4})?\.xlsx"
+)
 
 
 @dataclass(frozen=True)
@@ -150,14 +155,16 @@ def _artifact(relative: Path) -> bool:
         or relative.name.startswith("cost_missing_backup_")))
 
 
-def publish(stage: Path, project: Path):
+def publish(stage: Path, project: Path, *, unit_only: bool = False):
     """Prepare every replacement before switching files, with rollback on IO failure."""
     changes = []
     applied = []
     try:
         for source in list(stage.rglob("*")):
             rel = source.relative_to(stage)
-            if source.is_symlink() or not source.is_file() or not _artifact(rel) or source.name.endswith(".tmp"):
+            artifact = (len(rel.parts) == 1 and UNIT_REPORT_NAME.fullmatch(rel.name)
+                        if unit_only else _artifact(rel))
+            if source.is_symlink() or not source.is_file() or not artifact or source.name.endswith(".tmp"):
                 continue
             target = project / rel
             if target.exists() and source.stat().st_mtime_ns == target.stat().st_mtime_ns:
@@ -171,7 +178,7 @@ def publish(stage: Path, project: Path):
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(target, backup)
         missing = project / "cost_missing.csv"
-        if missing.exists() and not (stage / missing.name).exists():
+        if not unit_only and missing.exists() and not (stage / missing.name).exists():
             backup = stage / ".rollback" / missing.name
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(missing, backup)
@@ -267,7 +274,11 @@ def run(project: Path, arguments: list[str], limits: Limits) -> int:
         if stopped:
             print(ERROR_PREFIX + "Обновление отменено. Предыдущие данные сохранены.", flush=True)
             return 130
-        publish(stage, project)
+        unit_only = "--only-unit" in arguments
+        if unit_only and not any(p.is_file() and not p.is_symlink() and UNIT_REPORT_NAME.fullmatch(p.name)
+                                 for p in stage.iterdir()):
+            raise ValueError("расчёт не создал Excel юнит-экономики")
+        publish(stage, project, unit_only=unit_only)
     return 0
 
 

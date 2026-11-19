@@ -115,13 +115,64 @@ class ComposerTests(unittest.TestCase):
     def test_wrong_color_and_short_for_tall_rejected(self):
         reply = self.text("Джинсы хорошие, но на 188 рост коротки, и вместо синих прислали черные. Отказ.", rating=5, status="rejected", name="Лидия")
         self.assertRegex(reply, "понравил|по душе")
-        self.assertIn("видео", reply)                      # сборка под камерами — ошибка не наша
-        self.assertNotRegex(reply.lower(), "извин|ошибка комплектации|проверим сборку")
+        self.assertRegex(reply.lower(), "пвз|пункте выдачи")
+        self.assertRegex(reply.lower(), "пересорт|подмен")
+        self.assertNotIn("исключена", reply.lower())
         self.assertNotIn("освещени", reply)                 # а не «оттенок на экране»
         self.assertIn("188 см", reply)
         self.assertIn("по внутреннему шву", reply)
         self.assertNotIn("обхваты талии", reply)            # про длину, а не про обхваты
         self.assertNotIn("комфортной носки", reply)
+
+    def test_maya_collection_variation_reply(self):
+        item = review("Джинсы неплохие, сели хорошо, поэтому и взяли. А так товар пришел не тот, заказывала с оранжевой отсрочкой, а пришли с черной. И состав ткани не тот. Поэтому снимаю одну звезду.", rating=4, name="Майя")
+        facts = analyze(item)
+        reply = self.composer.compose(item)[0]
+        self.assertIn("collection_variation", facts.aspects)
+        self.assertNotIn("not_as_described", facts.aspects)
+        self.assertRegex(reply.lower(), "старой и новой коллекц|старой и новой коллекц")
+        self.assertRegex(reply.lower(), "отделк|состав")
+
+    def test_sergey_wrong_color_reply(self):
+        item = review("Прислан темно-синий цвет, заказывал другой", rating=2, name="Сергей", id="sergey")
+        facts = analyze(item)
+        reply = self.composer.compose(item)[0]
+        self.assertIn("wrong_color_received", facts.aspects)
+        self.assertIn("ПВЗ", reply)
+        self.assertRegex(reply.lower(), "отказаться|отказ")
+        self.assertRegex(reply.lower(), "несоответств|брак")
+        self.assertRegex(reply.lower(), "пересорт|подмен")
+        self.assertNotIn("исключена", reply.lower())
+
+    def test_olga_fold_and_fabric_reply(self):
+        item = review("Плохо сидят. Спереди огромная складка. Ткань дешевая", rating=2, name="Ольга", id="olga")
+        facts = analyze(item)
+        reply = self.composer.compose(item)[0]
+        self.assertIn("fabric_fold", facts.aspects)
+        self.assertIn("качественн", reply.lower())
+        self.assertIn("деним", reply.lower())
+        self.assertRegex(reply.lower(), "может (?:расправиться|стать менее заметным)")
+        self.assertRegex(reply.lower(), "стирк|глажк")
+        self.assertNotRegex(reply.lower(), r"(?:точно|обязательно) (?:уйд|исчез|расправ)")
+
+    def test_alexander_same_size_differs_reply(self):
+        item = review("Одни 52 размер — велики, сегодня другие джинсы 52 размера померил — малы. Как шьёте...", rating=2, name="Александр", id="alexander")
+        facts = analyze(item)
+        reply = self.composer.compose(item)[0]
+        self.assertIn("size_inconsistent", facts.aspects)
+        self.assertNotIn("size_small", facts.aspects)
+        self.assertNotIn("size_big", facts.aspects)
+        self.assertRegex(reply.lower(), "модел|парти")
+        self.assertIn("1–2 см", reply)
+
+    def test_marina_wrong_color_and_big_size_reply(self):
+        item = review("Пришли не того цвета и очень большие", rating=2, name="Марина", id="marina")
+        facts = analyze(item)
+        reply = self.composer.compose(item)[0]
+        self.assertTrue({"wrong_color_received", "size_big"} <= facts.aspects)
+        self.assertIn("ПВЗ", reply)
+        self.assertRegex(reply.lower(), "таблиц.*замер|замер.*таблиц")
+        self.assertRegex(reply.lower(), "отказаться|отказ")
 
     def test_short_for_tall_buyout_is_not_a_tip(self):
         reply = self.text("Джинсы хорошие, но на 188 рост коротки.", rating=5, status="buyout")
@@ -154,6 +205,14 @@ class AIWriterTests(unittest.TestCase):
         self.assertEqual(kwargs["json"]["model"], "claude-test")
         self.assertIn("Сели как влитые", kwargs["json"]["messages"][0]["content"])
         self.assertIn("Тон: дружелюбный", kwargs["json"]["messages"][0]["content"])
+
+    def test_prompt_contains_new_complaint_rules(self):
+        prompt = ai_writer.SYSTEM_PROMPT.lower()
+        self.assertIn("старой и новой коллекций", prompt)
+        self.assertIn("несоответствие/брак", prompt)
+        self.assertIn("качественного денима", prompt)
+        self.assertIn("может расправиться", prompt)
+        self.assertIn("1–2 см", prompt)
 
     def test_rejects_unsafe_answer_and_falls_back(self):
         service = ReplyService(NoKnowledge(), review_mode="ai")
