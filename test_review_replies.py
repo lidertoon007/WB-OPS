@@ -78,6 +78,43 @@ class ComposerTests(unittest.TestCase):
         text = self.text("Товар не увидели, пришел на почту, отказ", rating=1, status="rejected")
         self.assertIn("поддержку Wildberries", text)
 
+    def test_payment_complaints_even_with_other_issues(self):
+        for sample, status in (("С карты списали больше, хотя цена была ниже", "buyout"),
+                               ("Списали за товар больше, не используя вау баллы. Обман!", "buyout"),
+                               ("Вау-баллы так и не начислили", "notSpecified"),
+                               ("Отказ: пришёл другой цвет. Не применили вау баллы", "rejected")):
+            with self.subTest(sample=sample):
+                item = review(sample, status=status)
+                text, facts = self.composer.compose(item)
+                self.assertTrue(facts.negative)
+                self.assertEqual(text.count("поддержку Wildberries"), 1)
+                self.assertFalse(ReplyService(NoKnowledge()).validate(text, item))
+        for sample in ("Начислили вау-баллы, спасибо", "Цена завышена", "Списали баллы как и ожидала",
+                       "Больше денег не списали"):
+            self.assertNotIn("payment_issue", analyze(review(sample)).aspects)
+
+    def test_size_mismatch_suggests_measurements_and_chat(self):
+        for sample in ("Размер не подошёл", "Не соответствует размеру", "Не соответствует размерной сетке",
+                       "Размерная сетка не совпадает"):
+            for status in ("buyout", "rejected"):
+                with self.subTest(sample=sample, status=status):
+                    text = self.text(sample, status=status)
+                    self.assertIn("таблиц", text)
+                    self.assertIn("чат", text)
+        self.assertNotIn("таблиц", self.text("Размер соответствует таблице"))
+
+    def test_received_item_mismatch_suggests_check_before_buyout(self):
+        for sample in ("Пришёл неправильный цвет", "Цвет не соответствует фото", "Товар не совпадает с описанием",
+                       "Вместо брюк пришли джинсы", "Прислан темно-синий цвет, заказывал другой"):
+            with self.subTest(sample=sample):
+                item = review(sample, status="rejected")
+                text, _ = self.composer.compose(item)
+                for phrase in ("видеонаблюдением", "в пункте выдачи", "до выкупа", "зафиксировать причину"):
+                    self.assertIn(phrase, text)
+                self.assertFalse(ReplyService(NoKnowledge()).validate(text, item))
+        for sample in ("Цвет чуть темнее", "Цвет как на фото", "Ткань выглядит дешево"):
+            self.assertNotIn("видеонаблюдением", self.text(sample))
+
     def test_phrase_store_edit_and_reset(self):
         self.phrases.update("wish_buyout", ["Носите на здоровье!", " "])
         self.assertEqual(self.phrases.all()["wish_buyout"], ["Носите на здоровье!"])
@@ -90,6 +127,66 @@ class ComposerTests(unittest.TestCase):
             self.phrases.update("unknown", ["x"])
         self.phrases.reset("wish_buyout")
         self.assertGreater(len(self.phrases.all()["wish_buyout"]), 1)
+
+    def test_new_phrases_work_with_existing_customizations(self):
+        self.phrases.update("size_advice", ["Сверьте таблицу замеров и напишите нам в чат продавца."])
+        self.assertIn("нам в чат продавца", self.text("Размер не подошёл"))
+        self.assertIn("поддержку Wildberries", self.text("Вау-баллы не применили"))
+        self.assertIn("видеонаблюдением", self.text("Прислали не тот цвет"))
+        self.phrases.update("payment_issue", ["Проверьте начисление в поддержке площадки."])
+        self.assertIn("начисление в поддержке площадки", self.text("Вау-баллы не применили"))
+        self.assertIn("нам в чат продавца", self.text("Размер не подошёл"))
+
+    def test_merged_color_patterns_keep_a_single_color_aspect(self):
+        samples = ("Вместо темно-синих прислали черные", "Пришли не того цвета",
+                   "Прислан не тот цвет", "Прислали неправильный цвет",
+                   "Цвет оказался другой", "Цвет не соответствует фото",
+                   "Прислан темно-синий цвет, а заказал не такой",
+                   "Пришли джинсы синего цвета, заказывала иной")
+        for sample in samples:
+            with self.subTest(sample=sample):
+                reply, facts = self.composer.compose(review(sample, rating=2, status="rejected"))
+                self.assertIn("wrong_color_received", facts.aspects)
+                self.assertNotIn("wrong_color_sent", facts.aspects)
+                self.assertNotIn("color_diff", facts.aspects)
+                self.assertEqual(reply.count("видеонаблюдением"), 1)
+                self.assertEqual(reply.count("зафиксировать причину"), 1)
+                self.assertIn("пересорт", reply)
+
+    def test_other_product_is_not_a_wrong_color(self):
+        for sample in ("Вместо брюк пришли джинсы", "Вместо джинсов прислали футболку",
+                       "Вместо штанов выдали другую модель"):
+            with self.subTest(sample=sample):
+                reply, facts = self.composer.compose(review(sample, rating=2, status="rejected"))
+                self.assertIn("order_mismatch", facts.aspects)
+                self.assertNotIn("wrong_color_received", facts.aspects)
+                self.assertEqual(reply.count("зафиксировать причину"), 1)
+                self.assertNotIn("цвет не совпал", reply)
+
+    def test_special_scenarios_override_general_mismatch(self):
+        for sample, aspect in (
+            ("Не соответствует описанию, состав ткани другой", "collection_variation"),
+            ("Не соответствует описанию, складка спереди и дешевая ткань", "fabric_fold"),
+        ):
+            for status in ("buyout", "rejected"):
+                with self.subTest(sample=sample, status=status):
+                    reply, facts = self.composer.compose(review(sample, rating=2, status=status))
+                    self.assertIn(aspect, facts.aspects)
+                    self.assertNotIn("not_as_described", facts.aspects)
+                    self.assertNotIn("order_mismatch", facts.aspects)
+                    self.assertNotIn("видеонаблюдением", reply)
+                    self.assertNotIn("фото", reply)
+                    self.assertIn("коллекци" if aspect == "collection_variation" else "деним", reply)
+
+    def test_mixed_color_and_payment_complaint_emits_each_instruction_once(self):
+        for status in ("buyout", "rejected"):
+            with self.subTest(status=status):
+                reply, facts = self.composer.compose(review(
+                    "Пришёл неправильный цвет, не соответствует фото. Вау-баллы не применили",
+                    rating=2, status=status))
+                self.assertTrue({"wrong_color_received", "order_mismatch", "payment_issue"} <= facts.aspects)
+                self.assertEqual(reply.count("поддержку Wildberries"), 1)
+                self.assertEqual(reply.count("зафиксировать причину"), 1)
 
     def test_service_modes(self):
         service = ReplyService(NoKnowledge(), composer=self.composer)

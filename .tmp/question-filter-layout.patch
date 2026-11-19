@@ -1,0 +1,41 @@
+--- a/app/static/reviews.js
++++ b/app/static/reviews.js
+@@ -7,7 +7,7 @@
+   const METHOD_ICON = {ai: '🤖', individual: '🧩', templates: '📄', knowledge: '📚', manual: '✍️'};
+   const STATUS_CLS = {published: 'ok', approved: 'info', draft: '', nodraft: 'muted', rework: 'warn', error: 'bad'};
+   const RATING_OPTIONS = [['', 'Рейтинг'], ['5', '★★★★★ 5'], ['4', '★★★★ 4'], ['3', '★★★ 3'], ['2', '★★ 2'], ['1', '★ 1'], ['1,2,3', 'Негатив 1–3★'], ['4,5', 'Позитив 4–5★']];
+-  const FILTER_KEYS = ['search', 'from', 'to', 'marketplace', 'cabinet_id', 'order_status', 'answer', 'rating', 'tag', 'sort'].filter(k => !isQuestion || k !== 'rating');
++  const FILTER_KEYS = ['search', 'from', 'to', 'marketplace', 'cabinet_id', 'order_status', 'answer', 'rating', 'tag', 'sort'].filter(k => !isQuestion || !['rating', 'order_status', 'tag'].includes(k));
+   const MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+ 
+   const st = {f: {sort: 'desc'}, page: 0, size: 50, meta: null, data: null, selected: new Set(), open: new Set(), editing: null, busy: new Set(), auto: null};
+@@ -206,10 +206,10 @@
+           <div class="rv-pop-actions"><button type="button" class="btn" data-range-apply>Применить</button><button type="button" class="btn secondary" data-range-clear>Сбросить</button></div></div></div>
+       ${sel('marketplace', 'Маркетплейс', Object.entries(m.marketplaces || {}))}
+       ${sel('cabinet_id', 'Кабинеты', cabinets.map(c => [c.id, c.name]))}
+-      ${sel('order_status', 'Статус', Object.entries(m.order_statuses || {}))}
++      ${isQuestion ? '' : sel('order_status', 'Статус', Object.entries(m.order_statuses || {}))}
+       ${sel('answer', 'Статус ответа', Object.entries(m.answer_statuses || {}))}
+       ${isQuestion ? '' : sel('rating', 'Рейтинг', RATING_OPTIONS.slice(1))}
+-      <div class="rv-pop-wrap"><div class="rv-tagbox ${tags.length ? 'set' : ''}">
++      ${isQuestion ? '' : `<div class="rv-pop-wrap"><div class="rv-tagbox ${tags.length ? 'set' : ''}">
+           <button type="button" class="rv-tagbtn" data-tags aria-haspopup="dialog">${tags.length ? '' : '<span class="rv-ph">Тег</span>'}</button>
+           ${tags.map(t => { const [k, p] = t.split(':'); return `<span class="rv-chip">${tagMeta[k]?.icon || ''} ${esc(tagMeta[k]?.title || k)}${p && p !== 'any' ? ` · ${polarityTitle[p]}` : ''}<button type="button" data-untag="${esc(t)}" aria-label="Убрать тег">×</button></span>`; }).join('')}
+           ${tags.length ? '<button type="button" class="rv-x" data-clear="tag" aria-label="Сбросить теги">×</button>' : ''}<span class="rv-chev" aria-hidden="true">⌄</span></div>
+@@ -218,7 +218,7 @@
+           ${(m.tags || []).map(t => `<div class="rv-tagrow"><span>${t.icon} ${esc(t.title)}</span><span class="rv-tagopts">
+             ${[['any', 'любое']].concat(t.positive ? [['positive', '👍 хвалят']] : []).concat(t.negative ? [['negative', '👎 жалуются']] : []).map(([p, label]) =>
+               `<button type="button" class="${tags.includes(`${t.tag}:${p}`) ? 'on' : ''}" data-tag="${t.tag}:${p}">${label}</button>`).join('')}</span></div>`).join('')}
+-        </div></div>
++        </div></div>`}
+       ${activeFilters() ? `<div class="rv-found">Найдено: <b>${st.data.total}</b> <button type="button" class="rv-link" data-reset>Сбросить все фильтры</button></div>` : ''}`;
+     bindFilters();
+   }
+@@ -261,6 +261,7 @@
+     rangePop.querySelector('[data-range-clear]').onclick = () => { delete st.f.from; delete st.f.to; st.page = 0; load(); };
+     // теги
+     const tagPop = box.querySelector('.rv-tag-pop');
++    if (!tagPop) return;
+     box.querySelector('.rv-tagbox').onclick = e => {
+       if (e.target.closest('[data-untag],[data-clear]')) return;
+       e.stopPropagation(); const open = tagPop.hidden; box.querySelectorAll('.rv-pop').forEach(p => p.hidden = true); tagPop.hidden = !open;

@@ -23,7 +23,7 @@
     ['Что понравилось', ['fit_good', 'length_ok', 'length_long', 'quality_good', 'stretch', 'warm', 'light', 'color_good', 'looks_good', 'wash_ok', 'price_good', 'delivery_fast', 'repeat', 'recommend', 'seller_thanks', 'long_wait_wear', 'size_tip']],
     ['Кому купили', ['for_husband', 'for_son', 'for_teen', 'for_grandson', 'for_father']],
     ['Отказ, возврат, размер', ['size_wrong', 'size_small', 'size_big', 'length_short', 'length_long_bad', 'size_advice', 'reorder', 'rejected_positive', 'rejected_quality']],
-    ['Замечания', ['defect', 'not_as_described', 'thin', 'color_diff', 'price_bad', 'delivery_issue', 'smell', 'negative_general']],
+    ['Замечания', ['defect', 'not_as_described', 'wrong_color_received', 'order_mismatch', 'thin', 'color_diff', 'price_bad', 'payment_issue', 'delivery_issue', 'smell', 'negative_general']],
     ['Завершение', ['wish_buyout', 'wish_other']],
   ];
 

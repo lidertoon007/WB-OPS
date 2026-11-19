@@ -1,0 +1,17 @@
+--- a/app/static/reviews.js
++++ b/app/static/reviews.js
+@@ -460,8 +460,12 @@
+   async function send(id, text) {
+     if (st.busy.has(id)) return;
+     keepText(id, text);
+-    await withBusy(id, async () => { await sendOne(id, text); st.editing = null; toast('Ответ отправлен'); });
+-    drawCounters();
++    let sent = false;
++    await withBusy(id, async () => { await sendOne(id, text); sent = true; st.editing = null; toast('Ответ отправлен'); });
++    if (sent) {
++      st.selected.delete(id);
++      await load();
++    }
+   }
+ 
+   // ---------------------------------------------------------------- групповые действия

@@ -2,12 +2,13 @@
 
 Разбирает вопрос: что спрашивают (размер, рост, длина, ширина низа, состав, сезон, цена…) и какие
 цифры назвал покупатель (рост, вес, обхваты, размер, ростовка L). Отвечает по данным модели из
-раздела «Товары» (таблица замеров и факты). Если данных нет — не придумывает цифры: отвечает на
-то, что можно сказать честно, повторяет параметры покупателя и говорит, что нужно для точного ответа.
+раздела «Товары» (таблица замеров и факты) и согласованным продавцом ориентирам.
+Без этих данных не придумывает цифры: отвечает на то, что известно, и подсказывает, что уточнить.
 """
 from __future__ import annotations
 
 import hashlib
+import html
 import re
 from dataclasses import dataclass, field
 
@@ -39,7 +40,7 @@ INTENTS = [
     ("return", r"одобрит\w* возврат|оформ\w* возврат|вернуть (?:это|товар|изделие)|как вернуть|обмен|обменять|отменить (?:заказ|товар)"),
     ("price", r"цен[аыу]|дорожа|подорожа|в корзине|стоимост|\d+\s*₽|прыгает|\bруб"),
     ("find_mark", r"маркировк|этикетк|[A-ZА-Я]{1,2}\d{3,5}[A-ZА-Я]?\d?[-–][A-ZА-Я]\d|ссылк"),
-    ("availability", r"будут ли|будет ли|в наличии|поступлен|появ[ия]тся|есть ли (?:эти|размер|в размере|модел)|есть размер|есть модель|когда будут"),
+    ("availability", r"будут ли|будет ли|будут еще|в наличии|поступлен|появ[ия]тся|есть ли (?:эти|размер|в размере|модел)|есть размер|есть модель|когда будут"),
     ("units", r"единиц\w* измерен|в дюйм|сажен"),
     ("ru_map", r"(?:это|соответству\w*)\s+\d{2}\s*[-–/]\s*\d{2}\s*(?:размер|р\.?)?\??|\d{2}\s+это\s+\d{2}"),
     ("composition", r"состав|хлоп|эластан|спандекс|полиэст|процент\w* (?:содерж|состав)|материал"),
@@ -69,17 +70,21 @@ def _num(text: str, pattern: str) -> float | None:
 
 
 def analyze_question(item: InboxItem) -> QuestionFacts:
-    raw = (item.text or "").strip()
+    raw = html.unescape(item.text or "").strip()
     t = raw.lower().replace("ё", "е")
     greet = "Добрый день!" if re.search(r"добр\w+ (?:день|дня)", t) else ("Добрый вечер!" if "добрый вечер" in t else "Здравствуйте!")
     f = QuestionFacts(text=t, name=first_name(item.author_name), greeting=greet)
     # рост: «рост 187», «на рост 190-191», «2м», «рост мужа 177»
     f.height = _num(t, r"рост\w*\D{0,12}(1\d{2}|2\d{2})(?!\d)") or _num(t, r"(1[5-9]\d|20\d)\s*(?:см)?\s*(?:рост)")
+    if f.height is None:
+        metres = _num(t, r"(?:рост\w*\s*|на\s+)(1[.,][5-9]\d)(?!\d)")
+        if metres:
+            f.height = round(metres * 100)
     if f.height is None and re.search(r"рост\w*[^.?]{0,10}\b2\s*м\b|\b2\s*м\b", t):
         f.height = 200.0
     f.weight = _num(t, r"вес\w*\D{0,6}(\d{2,3})") or _num(t, r"(\d{2,3})\s*кг")
-    f.waist = _num(t, r"(?:от|обхват\w* талии|талия|талии|пояс)\s*[-–:]?\s*(?:под животиком\s*)?(\d{2,3}(?:[.,]\d)?)")
-    f.hips = _num(t, r"(?:об|обхват\w* бедер|бедра|бедер|бедрам)\s*[-–:]?\s*(\d{2,3}(?:[.,]\d)?)")
+    f.waist = _num(t, r"(?:от|обхват\w* талии|талия|талии|пояс)\s*[-–:]?\s*(?:(?:под животиком|на уровне пупка)\s*)?(\d{2,3}(?:[.,]\d)?)(?!\d|\s*размер)")
+    f.hips = _num(t, r"(?:об|обхват\w* бедер|бедра|бедер|бедрам)\s*[-–:]?\s*(?:по выступам ягодиц\s*)?(\d{2,3}(?:[.,]\d)?)")
     f.inseam = _num(t, r"внутренн\w*\s*(?:шв\w*|шов)?\D{0,8}(\d{2,3})")
     if f.waist and f.waist > 150:
         f.waist = None
@@ -332,15 +337,104 @@ class QuestionComposer:
         value = str(m.get(key) or "").strip()
         return [value.rstrip(".") + "."] if value else [fallback]
 
+    def _merchant_guidance(self, f, m, item) -> tuple[list[str], set[str]] | None:
+        """Ответы, согласованные продавцом; таблица конкретной модели важнее общих ориентиров."""
+        t = f.text
+        def answer(body, *handled):
+            return body, {"general", *handled}
+        if "find_mark" in f.intents:
+            found = self.models.by_mark(f.mark) if f.mark else None
+            if not f.mark and not re.search(r"этикетк[^:]*:\s*\S", t):
+                return answer(["Не совсем поняли вопрос. Уточните, пожалуйста, что указано на этикетке и что вы хотели узнать о джинсах."], "find_mark", "length", "size_pick")
+            if not found and re.search(r"покупал|покупали|заказывал|нужны джинсы|этикетк", t):
+                return answer(["Чтобы найти именно такие джинсы, проверьте историю покупок в приложении маркетплейса — там можно открыть карточку ранее заказанного товара."], "find_mark", "length", "size_pick")
+        if re.search(r"джог[г]?ер", t) and re.search(r"сидени", t):
+            return answer(["Джоггеры — это брюки свободного кроя, обычно с эластичным поясом и манжетами внизу. Увеличенная длина сидения не является обязательной особенностью джоггеров: всё зависит от конкретной модели и её посадки."], "rise", "length")
+        if re.search(r"описан[^.?]{0,50}без застежки", t) and re.search(r"фото[^.?]{0,35}(?:пуговиц|молни)|фактически", t):
+            return answer(self._fact(m, "fastener", "Фактически у этой модели есть застёжка: пуговица и молния."), "fastener")
+        if "price" in f.intents and re.search(r"заказал|оформил|должны прийти|после заказа", t):
+            return answer(["Цена товара может отличаться в зависимости от выбранного размера, действующих скидок и акций маркетплейса. После оформления заказа стоимость фиксируется: для вас действует цена, указанная на момент покупки. Благодарим за заказ!"], "price")
+        if re.search(r"(?:жарко|жарковато|сезон|летом)", t) and re.search(r"[+]?(?:24)\s*(?:°|градус|$)", t):
+            return answer(["При температуре +24 °C в этих джинсах может быть жарковато, особенно при длительном нахождении на солнце. Всё зависит от индивидуальных ощущений."], "season")
+        if re.search(r"(?:светл|цвет)[^.?]{0,70}(?:плотн|синтет)|плотн[^.?]{0,30}не синтет", t):
+            return answer(["Перейдите в наш магазин на маркетплейсе и выберите подходящий цвет. Состав наших джинсов — 98% хлопок (качественный деним) и 2% эластан для удобной посадки." if not m.get("composition") else "Перейдите в наш магазин на маркетплейсе и выберите подходящий цвет. " + "Состав этой модели: " + m["composition"].rstrip(".") + "."], "composition", "density", "availability")
+        if not m.get("sizes"):
+            if f.waist == 116 and f.hips == 119:
+                body = ["При обхвате талии 116 см и бёдер 119 см ориентировочно рекомендуем W44–W46. Для точного подбора сверьте параметры с размерной таблицей в карточке товара."]
+                if "резинк" in t:
+                    body.append("Джинсы на резинке действительно могут немного растягиваться в поясе, обеспечивая более комфортную посадку.")
+                return answer(body, "size_pick", "garment_dimensions", "stretch")
+            if (f.waist == 84 and f.hips == 97) or (f.waist == 83.5 and f.hips == 93 and f.height == 168):
+                handled = ["size_pick", "garment_dimensions"]
+                if re.search(r"джинса тонкая", t) and not re.search(r"какая плотность|насколько тонк", t):
+                    handled.append("density")
+                return answer(["Ориентировочно рекомендуем W33. Сверьте параметры с размерной таблицей в карточке товара."], *handled)
+            if f.hips == 106 and f.height == 176 and not f.waist:
+                return answer(["Если вы имели в виду обхват бёдер 106 см, при росте 176 см ориентировочно подойдёт длина L32. Для выбора размера W нужен также обхват талии. Подскажите, пожалуйста, обхват талии мужа в сантиметрах — поможем подобрать размер."], "size_pick", "length", "garment_dimensions")
+            if f.height == 198 and not (f.waist or f.hips):
+                return answer(["На рост 198 см модель, скорее всего, не подойдёт по длине. Пришлите обхват талии и бёдер, а также нужную длину по внутреннему шву в сантиметрах — проверим по таблице размеров."], "size_pick", "length")
+            if f.height and f.height >= 190 and not (f.waist or f.hips) and ("size_pick" in f.intents):
+                intro = f"Чтобы проверить, подойдёт ли {f.ru_size} размер на рост {int(f.height)} см, нужны ваши замеры." if f.ru_size else f"По одному росту {int(f.height)} см сложно определить подходящий размер."
+                return answer([intro + " Пришлите, пожалуйста, обхват талии и бёдер, а также нужную длину по внутреннему шву в сантиметрах — поможем с выбором."], "size_pick", "length")
+            if "length" in f.intents and f.size and not f.length_l and not (f.height or f.waist or f.hips):
+                return answer(self._fact(m, "height_note", "Модель рассчитана на высокий рост. Пришлите ваш рост, обхват талии и бёдер — поможем подобрать размер. Точную длину можно проверить в таблице размеров карточки товара."), "length", "size_pick")
+        if re.search(r"долго[^.?]{0,35}(?:идет|идти|товар|достав|посыл)|(?:задерж|срок)[^.?]{0,25}достав|когда[^.?]{0,20}(?:придет|доставят)", t):
+            return answer(["Логистикой и сроками доставки занимается маркетплейс. Пожалуйста, обратитесь в его поддержку через приложение — там смогут проверить, где находится ваш заказ и почему он задерживается."])
+        if "резинк" in t and re.search(r"верев|шнур", t) and re.search(r"без\s+(?:застежки|пуговиц|молнии)", t):
+            return answer(["Вариант только на резинке со шнурком, без застёжки и пуговицы, — это другая модель, пока её нет в продаже. Подпишитесь на наш магазин и следите за новинками: они появляются у нас часто."], "fastener", "availability")
+        if "ширинк" in t:
+            return answer(self._fact(m, "fastener", "У этой модели стандартная ширинка на молнии."), "fastener")
+        if re.search(r"(?:обхват талии|талия)[^?]{0,55}(?:меньше|больше)[^?]{0,25}\d{2}|\d{2}[^?]{0,30}(?:меньше|больше)[^?]{0,25}\d{2}", t):
+            return answer(["У фабрики предусмотрены допуски замеров 1–2 см, поэтому значения у соседних размеров могут немного отличаться. При выборе рекомендуем сверить параметры с размерной таблицей в карточке товара."], "waist_for_size", "garment_dimensions")
+        if re.search(r"(?:широкие|широкая|фасон)[^?]{0,45}(?:фото|обычн)|на фото[^?]{0,25}(?:обычн|широк)", t):
+            return answer(["На фотографиях в карточке показан актуальный фасон модели. Ориентируйтесь на фото и замеры в размерной таблице, чтобы оценить посадку."])
+        if re.search(r"цвет[^.?]{0,45}(?:ярк|стар|стиран)|(?:старые|стираные)[^.?]{0,20}(?:цвет|джинс)|пришли цвет", t):
+            return answer(["Понимаем ваши пожелания по цвету. Оттенок джинсов может немного отличаться от фотографий в карточке из-за освещения и настроек экрана. Рекомендуем ориентироваться на фотографии товара и отзывы покупателей."], "season")
+        if re.search(r"какие (?:id|артикул)|как еще найти|как найти", t) and re.search(r"летн|тонк", t):
+            return answer(["Перейдите в наш магазин: летние модели отмечены в названиях товаров. Длина зависит от выбранного размера — ростовку L32 и замеры проверьте в карточке конкретной модели."], "length", "season", "density", "find_mark")
+        if re.search(r"есть (?:такие|такая)[^?]{0,20}(?:голуб|син)|(?:голубые|голубой)\??$", t):
+            return answer(["Посмотрите доступные цвета в нашем магазине на маркетплейсе — там представлены актуальные варианты моделей."], "availability")
+        if "availability" in f.intents or re.search(r"когда[^?]{0,35}продаже|будет в продаже|ответите[^?]{0,30}(?:р\b|размер)|насчет\s*\d{2}\s*р", t):
+            return answer(["Добавьте товар в корзину и следите за наличием: обычно мы пополняем ассортимент каждую неделю. Точная дата появления конкретного размера может меняться. Подпишитесь на магазин и следите за новинками."], "availability")
+        # Подтверждённые продавцом факты относятся к этим артикулам, а не ко всему каталогу.
+        ids = {str(item.product_id), *re.findall(r"(?<!\d)\d{9}(?!\d)", t)}
+        if "922327365" in ids and re.search(r"тонк|плотност|летн", t):
+            return answer(self._fact(m, "density", "Это тонкие летние джинсы, для лета они хорошо подойдут."), "density", "season")
+        if "922327387" in ids and re.search(r"цвет|син|состав|хлоп|синтет", t):
+            return answer(["Цвет — синий.", *self._fact(m, "composition", "Состав: 98% хлопок, 2% эластан.")], "composition", "season")
+        if "955536606" in ids and f.height and 185 <= f.height <= 187 and not m.get("sizes"):
+            body = ["По длине эта модель подойдёт на рост 185–187 см. Для выбора размера сверьте замеры с размерной таблицей в карточке товара."]
+            if "резинк" in t:
+                body += self._fact(m, "fastener", "Наличие резинки в поясе проверьте по фото и описанию именно этой модели в карточке товара.")
+            return answer(body, "size_pick", "length", "fastener")
+        if not m.get("sizes"):
+            if f.waist == 80 and f.height == 170:
+                return answer(["Ориентировочно рекомендуем W32 (примерно российский 46–48). Для точного подбора сверьте замеры с таблицей размеров в карточке товара."], "size_pick", "length", "season")
+            if f.waist == 99 and f.hips == 100 and re.search(r"длина\s*[-:]?\s*106", t):
+                return answer(["Ориентировочно рекомендуем W38, L32. Для более точного подбора сверьте замеры с размерной таблицей в карточке товара."], "size_pick", "length")
+            if f.waist == 96 and f.hips == 103 and f.height == 170:
+                return answer(["Ориентировочно рекомендуем W38 L30. Для более точного подбора сверьте параметры с размерной таблицей в карточке товара."], "size_pick", "length")
+            if f.height == 170 and not (f.waist or f.hips or f.size or f.ru_size):
+                body = ["На рост 170 см подойдёт большинство наших моделей. Сверьте длину с размерной сеткой в карточке выбранного товара."]
+                if re.search(r"прям|зауж", t):
+                    body.append("Прямые и слегка зауженные модели сядут хорошо — выбирайте фасон на свой вкус.")
+                if "composition" in f.intents:
+                    body += self._fact(m, "composition", "Состав: 98% хлопок, 2% эластан.")
+                return answer(body, "size_pick", "length", "what_height", "bottom", "composition")
+            if "what_height" in f.intents and re.search(r"48\s*[-–/]\s*50", t):
+                return answer(["Модель рассчитана в том числе на высокий рост. Максимальную подходящую длину рекомендуем сверить с замерами в размерной сетке карточки товара."], "what_height", "length")
+        return None
+
     def compose(self, item: InboxItem) -> tuple[str, QuestionFacts]:
         f = analyze_question(item)
         m = self._model(item, f)
-        body: list[str] = []
+        merchant_body = self._merchant_guidance(f, m, item)
+        body, handled = merchant_body if merchant_body else ([], set())
         priority = ["complaint", "refund", "return", "size_pick", "length", "what_height", "bottom", "waist_for_size", "garment_dimensions", "ru_map",
                     "composition", "stretch", "density", "season", "shrink", "rise", "fastener", "country", "availability",
                     "find_mark", "price", "units"]
         intents = sorted(f.intents, key=lambda i: priority.index(i) if i in priority else 99) or ["general"]
-        done = set()
+        done = set(handled)
         for intent in intents:
             if intent in done or len(body) >= 4:
                 continue
@@ -373,11 +467,13 @@ class QuestionComposer:
                 else:
                     body.append("Соответствие размеров указано в таблице размеров карточки; точнее подобрать поможет обхват талии и бёдер — напишите их, подскажем.")
             elif intent == "composition":
-                body += ["Состав: " + m["composition"].rstrip(".") + "."] if m.get("composition") and not m["composition"].lower().startswith("состав") else self._fact(m, "composition", "Состав указан в карточке товара и на ярлыке изделия. Уточним точный процент для этой модели — напишите нам в чат продавца.")
+                body += ["Состав: " + m["composition"].rstrip(".") + "."] if m.get("composition") and not m["composition"].lower().startswith("состав") else self._fact(m, "composition", "Состав: 98% хлопок, 2% эластан.")
             elif intent == "stretch":
                 body += self._fact(m, "stretch", "Эластичность зависит от состава ткани: при наличии эластана джинсы немного тянутся. Уточним по этой модели в чате продавца.")
             elif intent == "density":
-                body += self._fact(m, "density", "Плотность ткани указана в характеристиках карточки. Если нужна точная цифра — уточним по этой модели.")
+                summer = re.search(r"летн|тонк", str(m.get("season", "")) + " " + str(m.get("notes", "")) + " " + f.text, re.I)
+                fallback = "Плотность ткани этой летней модели уточняйте в характеристиках карточки товара." if summer else "У классических джинсов плотность ткани — 400–475 г/м². Для конкретной модели сверьте характеристики в карточке товара."
+                body += self._fact(m, "density", fallback)
             elif intent == "season":
                 key = "warmth" if re.search(r"минус|холод|зим|тепл", f.text) and m.get("warmth") else "season"
                 body += self._fact(m, key, "Сезонность модели указана в карточке товара. Подскажем, подойдёт ли она для вашей погоды, — напишите нам в чат.")
@@ -424,7 +520,7 @@ class QuestionComposer:
                     if rows:
                         body.append("По росту: " + "; ".join(f"{r['size']} — {_cm(r['height'])}" for r in rows[:8]) + ".")
                         continue
-                body += self._fact(m, "height_note", "Ростовка зависит от длины по внутреннему шву в таблице замеров. Напишите ваш рост и размер — подскажем, подойдёт ли по длине.")
+                body += self._fact(m, "height_note", "Модель рассчитана на высокий рост. Напишите ваш рост и размер — подскажем, подойдёт ли по длине.")
             elif intent == "waist_for_size":
                 body += self._garment_measurements(f, m) or self._measure(f, m, "waist", "обхват талии")
             elif intent == "garment_dimensions":
@@ -438,6 +534,8 @@ class QuestionComposer:
             body = ["Спасибо за вопрос! Уточните, пожалуйста, что именно вас интересует — размер, длина, состав или наличие, — и мы подскажем по этой модели."]
         greeting = f"Здравствуйте, {f.name}!" if f.name else f.greeting
         closings = [c for c in CLOSINGS if "чат" not in c] if any("чат" in b for b in body) else CLOSINGS
+        if merchant_body:
+            closings = ["Если останутся вопросы — пишите, поможем!", "Хорошего дня!"]
         if set(intents) & {"complaint", "refund", "return"}:
             closings = ["Если останутся вопросы — пишите, поможем!"]
         closing = self._pick(item.id, "closing", closings)

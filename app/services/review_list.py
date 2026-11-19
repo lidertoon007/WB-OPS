@@ -129,7 +129,7 @@ class ReviewList:
                 hay = " ".join(str(x or "") for x in (r["text"], r["author_name"], r["product_name"], r["product_id"], r["vendor_code"], r["draft_text"], r["id"])).lower().replace("ё", "е")
                 if term not in hay:
                     continue
-            if wanted_tags and item_type == "review":
+            if wanted_tags:
                 found = self.tags_of(r)
                 ok = True
                 for want in wanted_tags:
@@ -152,7 +152,7 @@ class ReviewList:
         cabinets = self.cabinet_names()
         items = []
         for r in page:
-            tag_map = self.tags_of(r) if item_type == "review" else {}
+            tag_map = self.tags_of(r)
             warnings = []
             if with_warnings and r["draft_text"] and not r["published"]:
                 item = self.store.get_inbox(r["id"])

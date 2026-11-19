@@ -1,11 +1,13 @@
 /* WB OPS: раздел «Все отзывы» — фильтры, карточки отзывов и ответов, редактирование и отправка, групповые действия. */
-window.WBOPSReviews = (() => {
+const createWBOPSList = (itemType = 'review') => {
+  const isQuestion = itemType === 'question';
+  const pagePath = isQuestion ? '/questions' : '/reviews';
   const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
   const MP = {wildberries: ['wb', 'wb'], ozon: ['ozon', 'ozon'], yandex: ['ym', 'Я.М']};
   const METHOD_ICON = {ai: '🤖', individual: '🧩', templates: '📄', knowledge: '📚', manual: '✍️'};
   const STATUS_CLS = {published: 'ok', approved: 'info', draft: '', nodraft: 'muted', rework: 'warn', error: 'bad'};
   const RATING_OPTIONS = [['', 'Рейтинг'], ['5', '★★★★★ 5'], ['4', '★★★★ 4'], ['3', '★★★ 3'], ['2', '★★ 2'], ['1', '★ 1'], ['1,2,3', 'Негатив 1–3★'], ['4,5', 'Позитив 4–5★']];
-  const FILTER_KEYS = ['search', 'from', 'to', 'marketplace', 'cabinet_id', 'order_status', 'answer', 'rating', 'tag', 'sort'];
+  const FILTER_KEYS = ['search', 'from', 'to', 'marketplace', 'cabinet_id', 'order_status', 'answer', 'rating', 'tag', 'sort'].filter(k => !isQuestion || !['rating', 'order_status', 'tag'].includes(k));
   const MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
 
   const st = {f: {sort: 'desc'}, page: 0, size: 50, meta: null, data: null, selected: new Set(), open: new Set(), editing: null, busy: new Set(), auto: null};
@@ -45,16 +47,17 @@ window.WBOPSReviews = (() => {
     if (+p.get('size')) st.size = +p.get('size');
   }
   function writeUrl() {
-    if (location.pathname !== '/reviews') return;
+    if (location.pathname !== pagePath) return;
     const p = new URLSearchParams();
     FILTER_KEYS.forEach(k => { if (st.f[k] && !(k === 'sort' && st.f[k] === 'desc')) p.set(k, st.f[k]); });
     if (st.page) p.set('page', st.page + 1);
     if (st.size !== 50) p.set('size', st.size);
-    history.replaceState(history.state, '', '/reviews' + (p.toString() ? '?' + p : ''));
+    history.replaceState(history.state, '', pagePath + (p.toString() ? '?' + p : ''));
   }
   const query = (extra = {}) => {
     const p = new URLSearchParams();
     FILTER_KEYS.forEach(k => { if (st.f[k]) p.set(k === 'from' ? 'from' : k === 'to' ? 'to' : k, st.f[k]); });
+    p.set('item_type', itemType);
     Object.entries(extra).forEach(([k, v]) => p.set(k, v));
     return p.toString();
   };
@@ -64,6 +67,7 @@ window.WBOPSReviews = (() => {
   async function render(section) {
     root = section;
     root.className = 'panel rv-page';
+    st.f = {sort: 'desc'}; st.page = 0; st.size = 50; st.selected.clear();
     readUrl();
     root.innerHTML = `<div class="rv-head"><div class="rv-counters" data-counters></div>
         <div class="rv-head-actions"><button type="button" class="rv-dark" data-auto>Автоответы…</button>
@@ -75,8 +79,9 @@ window.WBOPSReviews = (() => {
       <div class="rv-list" data-list aria-live="polite"><p class="muted">Загрузка…</p></div>
       <div class="rv-bulk" data-bulk hidden></div>`;
     bindHead();
+    if (isQuestion) root.querySelector('[data-auto]').hidden = true;
+    else loadAuto();
     await load(true);
-    loadAuto();
   }
 
   function bindHead() {
@@ -113,7 +118,7 @@ window.WBOPSReviews = (() => {
       drawFilters(); drawCounters(); drawBanner(); drawList(); drawBulk();
       loadPhotos();
     } catch (e) {
-      list.innerHTML = `<p class="rv-error">Не удалось загрузить отзывы: ${esc(e.message)}</p>`;
+      list.innerHTML = `<p class="rv-error">Не удалось загрузить ${isQuestion ? 'вопросы' : 'отзывы'}: ${esc(e.message)}</p>`;
     } finally { list.classList.remove('rv-loading'); }
   }
 
@@ -136,7 +141,7 @@ window.WBOPSReviews = (() => {
     const chip = (key, label, n) => `<button type="button" class="rv-count ${st.f.answer === key || (!key && !st.f.answer) ? 'on' : ''}" data-count="${key}">${label} <b>${n}</b></button>`;
     root.querySelector('[data-counters]').innerHTML = chip('', 'Все', total) + chip('unanswered', 'Без ответа', c.unanswered) +
       (c.rework ? chip('rework', 'На доработке', c.rework) : '') + (c.error ? chip('error', 'Ошибка отправки', c.error) : '') + chip('published', 'Отвечено', c.published) +
-      (st.meta && st.meta.complaints ? `<a class="rv-count rv-complaints" href="/complaints" data-nav="complaints">Жалобы к подаче <b>${st.meta.complaints}</b> →</a>` : '');
+      (!isQuestion && st.meta && st.meta.complaints ? `<a class="rv-count rv-complaints" href="/complaints" data-nav="complaints">Жалобы к подаче <b>${st.meta.complaints}</b> →</a>` : '');
     root.querySelectorAll('[data-count]').forEach(b => b.onclick = () => setFilter('answer', b.dataset.count));
   }
   function drawBanner() {
@@ -201,19 +206,19 @@ window.WBOPSReviews = (() => {
           <div class="rv-pop-actions"><button type="button" class="btn" data-range-apply>Применить</button><button type="button" class="btn secondary" data-range-clear>Сбросить</button></div></div></div>
       ${sel('marketplace', 'Маркетплейс', Object.entries(m.marketplaces || {}))}
       ${sel('cabinet_id', 'Кабинеты', cabinets.map(c => [c.id, c.name]))}
-      ${sel('order_status', 'Статус', Object.entries(m.order_statuses || {}))}
+      ${isQuestion ? '' : sel('order_status', 'Статус', Object.entries(m.order_statuses || {}))}
       ${sel('answer', 'Статус ответа', Object.entries(m.answer_statuses || {}))}
-      ${sel('rating', 'Рейтинг', RATING_OPTIONS.slice(1))}
-      <div class="rv-pop-wrap"><div class="rv-tagbox ${tags.length ? 'set' : ''}">
+      ${isQuestion ? '' : sel('rating', 'Рейтинг', RATING_OPTIONS.slice(1))}
+      ${isQuestion ? '' : `<div class="rv-pop-wrap"><div class="rv-tagbox ${tags.length ? 'set' : ''}">
           <button type="button" class="rv-tagbtn" data-tags aria-haspopup="dialog">${tags.length ? '' : '<span class="rv-ph">Тег</span>'}</button>
           ${tags.map(t => { const [k, p] = t.split(':'); return `<span class="rv-chip">${tagMeta[k]?.icon || ''} ${esc(tagMeta[k]?.title || k)}${p && p !== 'any' ? ` · ${polarityTitle[p]}` : ''}<button type="button" data-untag="${esc(t)}" aria-label="Убрать тег">×</button></span>`; }).join('')}
           ${tags.length ? '<button type="button" class="rv-x" data-clear="tag" aria-label="Сбросить теги">×</button>' : ''}<span class="rv-chev" aria-hidden="true">⌄</span></div>
         <div class="rv-pop rv-tag-pop" hidden role="dialog" aria-label="Теги">
-          <p class="muted">Теги находятся по тексту отзыва — те же, что в «Аналитике».</p>
+          <p class="muted">Теги находятся по тексту ${isQuestion ? 'вопроса' : 'отзыва'} — те же, что в «Аналитике».</p>
           ${(m.tags || []).map(t => `<div class="rv-tagrow"><span>${t.icon} ${esc(t.title)}</span><span class="rv-tagopts">
             ${[['any', 'любое']].concat(t.positive ? [['positive', '👍 хвалят']] : []).concat(t.negative ? [['negative', '👎 жалуются']] : []).map(([p, label]) =>
               `<button type="button" class="${tags.includes(`${t.tag}:${p}`) ? 'on' : ''}" data-tag="${t.tag}:${p}">${label}</button>`).join('')}</span></div>`).join('')}
-        </div></div>
+        </div></div>`}
       ${activeFilters() ? `<div class="rv-found">Найдено: <b>${st.data.total}</b> <button type="button" class="rv-link" data-reset>Сбросить все фильтры</button></div>` : ''}`;
     bindFilters();
   }
@@ -256,6 +261,7 @@ window.WBOPSReviews = (() => {
     rangePop.querySelector('[data-range-clear]').onclick = () => { delete st.f.from; delete st.f.to; st.page = 0; load(); };
     // теги
     const tagPop = box.querySelector('.rv-tag-pop');
+    if (!tagPop) return;
     box.querySelector('.rv-tagbox').onclick = e => {
       if (e.target.closest('[data-untag],[data-clear]')) return;
       e.stopPropagation(); const open = tagPop.hidden; box.querySelectorAll('.rv-pop').forEach(p => p.hidden = true); tagPop.hidden = !open;
@@ -280,16 +286,16 @@ window.WBOPSReviews = (() => {
   function drawList() {
     const d = st.data, list = root.querySelector('[data-list]');
     if (!d.items.length) {
-      list.innerHTML = `<div class="rv-empty"><b>${activeFilters() ? 'По фильтрам ничего не найдено' : 'Отзывов пока нет'}</b>
-        <p class="muted">${activeFilters() ? 'Измените или сбросьте фильтры.' : 'Нажмите «Обновить список», чтобы загрузить отзывы из Wildberries, или загрузите историю в «Импорте отзывов».'}</p></div>`;
+      list.innerHTML = `<div class="rv-empty"><b>${activeFilters() ? 'По фильтрам ничего не найдено' : (isQuestion ? 'Вопросов пока нет' : 'Отзывов пока нет')}</b>
+        <p class="muted">${activeFilters() ? 'Измените или сбросьте фильтры.' : (isQuestion ? 'Нажмите «Обновить список», чтобы загрузить вопросы из Wildberries.' : 'Нажмите «Обновить список», чтобы загрузить отзывы из Wildberries, или загрузите историю в «Импорте отзывов».')}</p></div>`;
       return;
     }
     const allOnPage = d.items.length && d.items.every(i => st.selected.has(i.id));
     const pages = Math.max(1, Math.ceil(d.total / st.size));
     list.innerHTML = `<div class="rv-row rv-th"><label class="rv-cb"><input type="checkbox" data-select-all ${allOnPage ? 'checked' : ''} aria-label="Выбрать все на странице"></label>
-        <button type="button" class="rv-sort" data-sort aria-label="Сортировка по дате">Дата ${st.f.sort === 'asc' ? '↑' : '↓'}</button><div>Товар</div><div>Отзыв</div><div>Ответ</div></div>
+        <button type="button" class="rv-sort" data-sort aria-label="Сортировка по дате">Дата ${st.f.sort === 'asc' ? '↑' : '↓'}</button><div>Товар</div><div>${isQuestion ? 'Вопрос' : 'Отзыв'}</div><div>Ответ</div></div>
       ${d.items.map(rowHtml).join('')}
-      <div class="rv-pager"><select data-size aria-label="Отзывов на странице">${[10, 20, 50, 100].map(n => `<option value="${n}" ${n === st.size ? 'selected' : ''}>${n}</option>`).join('')}</select>
+      <div class="rv-pager"><select data-size aria-label="Записей на странице">${[10, 20, 50, 100].map(n => `<option value="${n}" ${n === st.size ? 'selected' : ''}>${n}</option>`).join('')}</select>
         <span>${st.page * st.size + 1} – ${Math.min(d.total, (st.page + 1) * st.size)} из ${d.total}</span>
         <button type="button" class="rv-pg" data-page="${st.page - 1}" ${st.page ? '' : 'disabled'} aria-label="Предыдущая страница">‹</button>
         ${pageButtons(pages)}
@@ -316,7 +322,7 @@ window.WBOPSReviews = (() => {
     const canSend = st.meta?.publishing?.enabled;
     const warn = i.warnings && i.warnings.length;
     return `<div class="rv-row ${st.selected.has(i.id) ? 'sel' : ''}" data-id="${esc(i.id)}">
-      <label class="rv-cb rv-cell"><input type="checkbox" data-select="${esc(i.id)}" ${st.selected.has(i.id) ? 'checked' : ''} aria-label="Выбрать отзыв"></label>
+      <label class="rv-cb rv-cell"><input type="checkbox" data-select="${esc(i.id)}" ${st.selected.has(i.id) ? 'checked' : ''} aria-label="Выбрать запись"></label>
       <div class="rv-cell rv-date">${d1}<br>${d2}<br>${d3}</div>
       <div class="rv-cell rv-product">
         <div class="rv-photo" data-photo="${i.product_id || ''}">${photos[i.product_id] ? `<img loading="lazy" src="${esc(photos[i.product_id])}" alt="" onerror="this.remove()">` : ''}<span aria-hidden="true">👖</span></div>
@@ -327,7 +333,7 @@ window.WBOPSReviews = (() => {
         <div class="rv-icons">${i.tags.map(t => `<span class="rv-tag ${t.polarity}" title="${esc(t.title)}: ${t.polarity === 'positive' ? 'хвалят' : 'жалуются'}">${t.icon}</span>`).join('')}
           ${i.has_photo ? '<span class="rv-tag media" title="Есть фото">📷</span>' : ''}${i.has_video ? '<span class="rv-tag media" title="Есть видео">🎬</span>' : ''}
           <span class="rv-order ${i.order_status}">${esc(i.order_status_title)}</span></div>
-        ${stars(i.rating)}
+        ${isQuestion ? '' : stars(i.rating)}
         <div class="rv-line"><b>Имя:</b> ${esc(i.author_name || 'Аноним')}</div>
         <div class="rv-line rv-text ${open ? 'open' : ''}"><b>Текст:</b> ${i.text ? esc(i.text) : '<span class="muted">без текста</span>'}</div>
         ${longText ? `<button type="button" class="rv-more" data-toggle="${esc(i.id)}">${open ? 'свернуть' : 'подробнее'}</button>` : ''}</div>
@@ -406,7 +412,7 @@ window.WBOPSReviews = (() => {
 
   // ---------------------------------------------------------------- действия
   async function refreshItem(id) {
-    const d = await api(`/api/reviews?search=${encodeURIComponent(id)}&limit=5`).catch(() => null);
+    const d = await api(`/api/reviews?item_type=${itemType}&search=${encodeURIComponent(id)}&limit=5`).catch(() => null);
     const fresh = d && d.items.find(x => x.id === id);
     const idx = st.data.items.findIndex(x => x.id === id);
     if (fresh && idx >= 0) {
@@ -437,7 +443,7 @@ window.WBOPSReviews = (() => {
   async function regenerate(id) {
     await withBusy(id, async () => {
       const it = item(id);
-      if (it && !it.answer) await api('/api/replies/draft', {method: 'POST', body: (await api(`/api/inbox?search=${encodeURIComponent(id)}&limit=1`))[0]});
+      if (it && !it.answer) await api('/api/replies/draft', {method: 'POST', body: (await api(`/api/inbox?item_type=${itemType}&search=${encodeURIComponent(id)}&limit=1`))[0]});
       else await api(`/api/replies/drafts/${encodeURIComponent(id)}/regenerate`, {method: 'POST'});
       toast('Ответ составлен заново');
     });
@@ -454,8 +460,12 @@ window.WBOPSReviews = (() => {
   async function send(id, text) {
     if (st.busy.has(id)) return;
     keepText(id, text);
-    await withBusy(id, async () => { await sendOne(id, text); st.editing = null; toast('Ответ отправлен'); });
-    drawCounters();
+    let sent = false;
+    await withBusy(id, async () => { await sendOne(id, text); sent = true; st.editing = null; toast('Ответ отправлен'); });
+    if (sent) {
+      st.selected.delete(id);
+      await load();
+    }
   }
 
   // ---------------------------------------------------------------- групповые действия
@@ -577,7 +587,12 @@ window.WBOPSReviews = (() => {
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
 @media(max-width:1100px){.rv-row{grid-template-columns:34px minmax(0,1fr) minmax(0,1fr)}.rv-row .rv-date{display:none}.rv-row .rv-product{grid-column:2/-1}.rv-row .rv-review{grid-column:2}.rv-row .rv-answer{grid-column:3}.rv-th>div,.rv-th .rv-sort{display:none}.rv-th{grid-template-columns:34px auto}.rv-th::after{content:'Выбрать все';font-weight:500}}
 @media(max-width:760px){.rv-bulk{bottom:8px}.rv-filters{grid-template-columns:1fr}.rv-search{grid-column:auto}.rv-row{grid-template-columns:30px minmax(0,1fr)}.rv-row .rv-product,.rv-row .rv-review,.rv-row .rv-answer{grid-column:2}.rv-head-actions{flex-wrap:wrap}}`;
-  document.head.appendChild(style);
+  if (!document.getElementById('wbops-list-style')) {
+    style.id = 'wbops-list-style';
+    document.head.appendChild(style);
+  }
 
-  return {render};
-})();
+  return {render, reload: () => load(true)};
+};
+window.WBOPSReviews = createWBOPSList();
+window.WBOPSQuestions = createWBOPSList('question');

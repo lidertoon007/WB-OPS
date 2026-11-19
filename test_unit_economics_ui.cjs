@@ -58,6 +58,70 @@ function setup(respond) {
 
 const settled = () => new Promise(resolve => setImmediate(resolve));
 
+test('router keeps questions, unit economics and plan-fact reachable together', async () => {
+  const events = {}, renders = [];
+  let generated = 0, reloaded = 0;
+  const element = (tagName = 'section', id = '') => ({
+    tagName: tagName.toUpperCase(), id, dataset: {}, style: {}, children: [],
+    classList: {contains: () => false},
+    append(child) { child.parentElement = this; this.children.push(child); },
+    insertBefore(child, anchor) {
+      this.children = this.children.filter(node => node !== child);
+      this.children.splice(anchor ? this.children.indexOf(anchor) : this.children.length, 0, child);
+      child.parentElement = this;
+    },
+    compareDocumentPosition(other) {
+      return this.parentElement.children.indexOf(other) < this.parentElement.children.indexOf(this) ? 2 : 4;
+    },
+    get nextSibling() { return this.parentElement.children[this.parentElement.children.indexOf(this) + 1] || null; },
+    matches: () => false,
+  });
+  const main = element('main');
+  const legacy = element('section', 'questionsPanel');
+  const heading = element('h3'), toolbar = element('div'), run = element('button');
+  toolbar.matches = selector => selector.includes('.toolbar');
+  run.onclick = async () => { generated++; };
+  legacy.append(heading); legacy.append(toolbar); legacy.append(run);
+  legacy.querySelector = selector => selector === '[data-question-run]' ? run : heading;
+  main.append(legacy); main.append(element('section', 'questionRepliesPanel'));
+  const context = {
+    document: {
+      querySelector: selector => selector === 'main.shell' ? main : null,
+      querySelectorAll: () => [],
+      getElementById: id => main.children.find(node => node.id === id) || null,
+      createElement: element,
+      head: {appendChild() {}}, addEventListener() {},
+    },
+    window: {
+      WBOPSQuestions: {render: root => renders.push(root.id), reload: async () => { reloaded++; }},
+      WBOPSUnitEconomics: {render: root => renders.push(root.id)},
+      WBOPSPlanFact: {render: root => renders.push(root.id)},
+      addEventListener: (event, callback) => { events[event] = callback; },
+    },
+    location: {pathname: '/questions'},
+    localStorage: {getItem: () => null},
+    Node: {DOCUMENT_POSITION_PRECEDING: 2},
+    MutationObserver: class { observe() {} },
+  };
+  vm.runInNewContext(fs.readFileSync('app/static/router.js', 'utf8'), context);
+  const visible = () => main.children.filter(node => node.style.display !== 'none').map(node => node.id);
+  assert.deepEqual(visible(), ['questionRepliesPanel', 'questionsPage', 'questionsPanel']);
+  assert.equal(toolbar.style.display, 'none');
+  const generate = run.onclick;
+  for (const [path, section] of [['/unit-economics', 'unitEconomics'], ['/planfact', 'planfactPage']]) {
+    context.location.pathname = path;
+    events.popstate();
+    assert.deepEqual(visible(), [section]);
+  }
+  context.location.pathname = '/questions';
+  events.popstate();
+  assert.deepEqual(renders, ['questionsPage', 'unitEconomics', 'planfactPage']);
+  assert.equal(run.onclick, generate);
+  await run.onclick();
+  assert.equal(generated, 1);
+  assert.equal(reloaded, 1);
+});
+
 test('actual unit economics changes column groups, paginates and sends filter parameters', async () => {
   const {node, filters, tabs, root, requests, runTimer} = setup(({pathname, searchParams}) =>
     pathname.endsWith('/update') ? {status: 'idle'} : fixture(Number(searchParams.get('page'))));
