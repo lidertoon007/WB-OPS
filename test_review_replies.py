@@ -241,6 +241,59 @@ class ComposerTests(unittest.TestCase):
         self.assertRegex(reply.lower(), "пересорт|подмен")
         self.assertNotIn("исключена", reply.lower())
 
+    def test_natalya_knees_stretching_reply(self):
+        item = review("Пока не понятно. Не облегающие. Кажется коленки начинают растягиваться потихоньку. "
+                      "Или просто модель такая, не в облип. Позже будет видно.",
+                      rating=3, name="Наталья", id="natalya")
+        reply, facts = self.composer.compose(item)
+        self.assertIn("knees_stretching", facts.aspects)
+        self.assertIn("Наталья", reply)
+        self.assertRegex(reply.lower(), "плотн.*(?:деним|джинсовой)|(?:деним|джинсовой).*плотн")
+        self.assertRegex(reply.lower(), "не вытягивается.*колен|держит форму.*колен")
+        self.assertNotIn("размер", reply.lower())
+
+    def test_sergey_repeated_wrong_color_and_design_reply(self):
+        item = review("Второй раз прислан товар другого цвета и дизайна.",
+                      rating=1, status="rejected", name="Сергей", id="sergey-repeat")
+        reply, facts = self.composer.compose(item)
+        self.assertIn("repeated_order_mismatch", facts.aspects)
+        self.assertNotIn("repeat", facts.aspects)
+        self.assertIn("Сергей", reply)
+        self.assertRegex(reply.lower(), "повторно|второй раз")
+        for phrase in ("пункте выдачи Wildberries", "под камерами", "отказаться", "цвет", "дизайн"):
+            self.assertIn(phrase, reply)
+        self.assertNotIn("возвращаетесь", reply)
+        self.assertFalse(ReplyService(NoKnowledge()).validate(reply, item))
+
+    def test_anonymous_missing_fleece_reply_only_for_warm_model(self):
+        sample = "никакого флиса там нет. обычные джинсы"
+        item = review(sample, rating=1, status="rejected", name="Аноним", id="fleece",
+                      product="Джинсы утеплённые на флисе")
+        reply, facts = self.composer.compose(item)
+        self.assertIn("missing_fleece", facts.aspects)
+        self.assertNotIn("Аноним", reply)
+        self.assertRegex(reply.lower(), "флисов(?:ая|ую) подкладк")
+        for phrase in ("подмена", "под камерами", "отказаться"):
+            self.assertIn(phrase, reply)
+        self.assertFalse(ReplyService(NoKnowledge()).validate(reply, item))
+        plain_reply, plain_facts = self.composer.compose(review(sample, rating=1, product="Джинсы обычные"))
+        self.assertNotIn("missing_fleece", plain_facts.aspects)
+        self.assertNotIn("флисовая подкладка", plain_reply)
+
+    def test_danil_smell_after_washing_reply(self):
+        item = review("Качество неплохое, но запах просто отвратительный. Они постирались с кондиционером "
+                      "и парфюмерными гранулами но запах не выстирался",
+                      rating=2, status="buyout", name="Данил", id="danil")
+        reply, facts = self.composer.compose(item)
+        self.assertIn("smell_after_wash", facts.aspects)
+        self.assertIn("Данил", reply)
+        self.assertRegex(reply.lower(), "спасибо.*качеств|благодарим.*качеств")
+        self.assertRegex(reply.lower(), "окрашиван.*обработ|обработ.*окрашиван")
+        self.assertRegex(reply.lower(), "после стирки.*(?:менее выраженным|ослабевает)")
+        self.assertNotIn("проверим партию", reply)
+        self.assertFalse(ReplyService(NoKnowledge()).validate(reply, item))
+        self.assertNotIn("smell_after_wash", analyze(review("После стирки запах исчез, спасибо.")).aspects)
+
     def test_olga_fold_and_fabric_reply(self):
         item = review("Плохо сидят. Спереди огромная складка. Ткань дешевая", rating=2, name="Ольга", id="olga")
         facts = analyze(item)
