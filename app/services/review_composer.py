@@ -106,6 +106,10 @@ ASPECTS = {
     ),
     "delivery_issue": r"\bпвз\b|пункт выдачи|на почт|почтой|не дали пример|примерять не|курьер|долго (?:шл|вез|достав)|не привез|потерял",
     "smell": r"запах|воня",
+    "knees_stretching": r"(?:коленк|колен)[^.!?]{0,65}(?:растяг|вытяг)|(?:растяг|вытяг)[^.!?]{0,65}(?:коленк|колен)",
+    "repeated_order_mismatch": r"(?:второй раз|повторно|снова)[^.!?]{0,100}(?:присл|приш[её]л|прислан|товар)[^.!?]{0,100}(?:друг\w* цвет|не тот цвет|друг\w* дизайн|друг\w* модел|не тот товар)",
+    "missing_fleece": r"(?:никак\w*|совсем|вообще)?\s*(?:нет|не было|отсутствует)\s+(?:никак\w*\s+)?флис|флис\w*(?:\s+там)?\s+(?:нет|не было|отсутствует)|без флис|никак\w* флис\w* (?:там )?нет",
+    "smell_after_wash": r"(?:запах|воня)[^.!?]{0,160}(?:не (?:выстир|отстир|исчез|ушел)|остал|сохран)|(?:постирал|стирк|после стирк)[^.!?]{0,160}(?:запах|воня)[^.!?]{0,50}(?:не (?:выстир|отстир|исчез|ушел)|остал|сохран)",
     # прислали не тот цвет (ошибка сборки, а не «оттенок на экране»)
     "wrong_color_received": (
         r"вместо (?:[а-я]+-)?(?:черн|бел|син|голуб|сер|зелен|бежев|красн|розов|коричнев|фиолетов|желт|бордов|оранжев|бирюзов)\w*\s+"
@@ -150,7 +154,8 @@ class ReviewFacts:
 
     @property
     def negative(self) -> bool:
-        return bool(self.aspects & {"defect", "not_as_described", "wrong_color_received", "collection_variation",
+        return bool(self.aspects & {"knees_stretching", "repeated_order_mismatch", "missing_fleece", "smell_after_wash",
+                                    "defect", "not_as_described", "wrong_color_received", "collection_variation",
                                     "fabric_fold", "size_inconsistent", "thin", "color_diff", "price_bad", "smell",
                                     "size_small", "size_big", "length_short", "delivery_issue",
                                     "wear_out", "quality_bad", "refund", "angry", "payment_issue",
@@ -194,6 +199,16 @@ def analyze(item: InboxItem) -> ReviewFacts:
         aspects.discard("thin")
     if "wrong_color_received" in aspects:          # прислали не тот цвет — не оправдываемся освещением
         aspects.discard("color_diff")
+    if "repeated_order_mismatch" in aspects:       # повторный пересорт — отдельный ответ без благодарности за «повторную покупку»
+        aspects -= {"repeat", "wrong_color_received", "order_mismatch", "not_as_described", "color_diff"}
+    if "missing_fleece" in aspects:
+        aspects.discard("warm")
+        if not re.search(r"утепл|флис", (item.product_name or "").lower()):
+            aspects.discard("missing_fleece")       # без данных о модели не утверждаем наличие подкладки
+        else:
+            aspects -= {"thin", "not_as_described", "order_mismatch"}
+    if "smell_after_wash" in aspects:
+        aspects -= {"smell", "quality_good"}
     if "collection_variation" in aspects:          # даём точное объяснение про партии, а не общий ответ «не соответствует»
         aspects -= {"not_as_described", "order_mismatch"}
     if "fabric_fold" in aspects:                   # отдельный ответ про деним и уход без общего требования фото
@@ -281,6 +296,14 @@ DEFAULT_PHRASES: dict[str, list[str]] = {
     "payment_issue": ["Wildberries определяет условия применения и начисления вау-баллов и проводит оплату. Пожалуйста, обратитесь в поддержку Wildberries, чтобы проверили сумму списания и применение баллов по вашему заказу."],
     "delivery_issue": ["По вопросам доставки, выдачи и примерки конкретного заказа рекомендуем обратиться в поддержку Wildberries — там помогут быстрее всего."],
     "smell": ["Передадим информацию в отдел контроля качества и проверим партию."],
+    "knees_stretching": ["{product_cap} выполнены из качественной плотной джинсовой ткани, которая хорошо держит форму и не вытягивается в области коленей.",
+                        "Для этой модели мы используем плотный качественный деним: он держит форму и не вытягивается на коленях."],
+    "repeated_order_mismatch": ["Нам очень жаль, что вы повторно получили товар другого цвета или дизайна. Рекомендуем проверять соответствие заказу прямо в пункте выдачи Wildberries под камерами. Если цвет или модель не совпадают с заказом, рекомендуем отказаться от товара при получении.",
+                                "Сожалеем, что несоответствие цвета или дизайна заказа произошло уже второй раз. Проверяйте товар в пункте выдачи Wildberries под камерами: если цвет или модель не соответствуют заказанным, рекомендуем отказаться от товара при получении."],
+    "missing_fleece": ["У этой модели действительно есть флисовая подкладка. Если вам пришло изделие без флиса, возможно, произошла подмена товара. Рекомендуем проверять его в пункте выдачи Wildberries под камерами и при несоответствии описанию отказаться от него при получении.",
+                       "Данная модель имеет флисовую подкладку. Если полученный товар оказался без флиса, не исключена подмена. Проверяйте изделие в пункте выдачи Wildberries под камерами; если оно не соответствует описанию, рекомендуем отказаться от него при получении."],
+    "smell_after_wash": ["Спасибо, что отметили качество {product}. Нам жаль, что после стирки неприятный запах сохранился. Для новой джинсовой ткани иногда характерен запах, связанный с окрашиванием и обработкой материала; обычно после стирки он становится менее выраженным.",
+                         "Благодарим за оценку качества. Сожалеем, что запах не исчез после стирки. У нового денима бывает специфический запах из-за окрашивания и обработки; как правило, после стирки он ослабевает."],
     "size_tip": ["Спасибо за подсказку по размеру — она поможет другим покупателям с выбором.",
                  "Отдельное спасибо за совет по размеру — другим покупателям это очень поможет."],
     "length_long_bad": ["Жаль, что модель оказалась длинновата.", "Нам жаль, что по длине модель не подошла."],
@@ -329,6 +352,8 @@ PHRASE_TITLES = {
     "defect": "Брак", "not_as_described": "Не соответствует описанию, подмена", "price_bad": "Дорого",
     "payment_issue": "Лишнее списание или вау-баллы", "order_mismatch": "Проверка при получении и отказ на ПВЗ",
     "delivery_issue": "Доставка, ПВЗ", "smell": "Запах", "negative_general": "Негатив без деталей", "empty_low": "Отзыв без текста, 1–3★",
+    "knees_stretching": "Сомнения: вытягиваются колени", "repeated_order_mismatch": "Повторно прислали другой цвет или дизайн",
+    "missing_fleece": "Нет флиса в утеплённой модели", "smell_after_wash": "Запах остался после стирки",
     "wear_out": "Быстро износились, «решето», протёрлись", "care_rules": "Правила ухода и стирки", "quality_bad": "Ругают качество",
     "refund": "Требуют вернуть деньги", "photo_request": "Просьба прислать фото", "negative_strong": "Резкий негатив без деталей",
     "closing_problem": "Прощание при жалобе", "wrong_color_received": "Прислали не тот цвет (проверка на ПВЗ)", "liked": "Модель понравилась",
@@ -342,7 +367,7 @@ POSITIVE_ORDER = ["repeat", "liked", "fit_good", "length_ok", "quality_good", "s
 FOR_WHOM = ["for_husband", "for_son", "for_teen", "for_grandson", "for_father"]
 SIZE_KEYS = ("size_small", "size_big", "length_short", "size_wrong")
 TIP_KEYS = ("size_small", "size_big", "length_short")   # «маломерят, берите на размер больше» при выкупе и 4–5★
-NEGATIVE_ORDER = ["wear_out", "defect", "collection_variation", "wrong_color_received", "fabric_fold", "size_inconsistent", "not_as_described", "quality_bad", "delivery_issue", "size_small", "size_big", "length_short", "size_wrong",
+NEGATIVE_ORDER = ["knees_stretching", "repeated_order_mismatch", "missing_fleece", "smell_after_wash", "wear_out", "defect", "collection_variation", "wrong_color_received", "fabric_fold", "size_inconsistent", "not_as_described", "quality_bad", "delivery_issue", "size_small", "size_big", "length_short", "size_wrong",
                   "thin", "color_diff", "price_bad", "smell", "payment_issue"]
 
 
@@ -412,7 +437,8 @@ class ReviewComposer:
     def _pick(self, bank, item_id, key, facts) -> str:
         variants = bank.get(key) or DEFAULT_PHRASES.get(key) or [""]
         text = variants[self._seed(item_id, key) % len(variants)]
-        return text.replace("{product}", facts.product).replace("{name}", facts.name).replace("{height}", str(facts.height or ""))
+        return (text.replace("{product_cap}", facts.product.capitalize()).replace("{product}", facts.product)
+                .replace("{name}", facts.name).replace("{height}", str(facts.height or "")))
 
     def compose(self, item: InboxItem) -> tuple[str, ReviewFacts]:
         facts = analyze(item)
