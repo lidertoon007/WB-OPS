@@ -28,6 +28,11 @@ class PublicationMode(StrEnum):
     AUTO = "auto"
 
 
+class ReviewPhoto(BaseModel):
+    url: str
+    thumbnail_url: str
+
+
 class InboxItem(BaseModel):
     id: str
     cabinet_id: str
@@ -40,6 +45,8 @@ class InboxItem(BaseModel):
     marketplace: str = "wildberries"
     product_name: str | None = None
     brand: str | None = None
+    vendor_code: str | None = None
+    review_photos: list[ReviewPhoto] | None = None
     has_photo: bool = False
     has_video: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

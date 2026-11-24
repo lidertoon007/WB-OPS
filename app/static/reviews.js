@@ -313,6 +313,25 @@ const createWBOPSList = (itemType = 'review') => {
     return out;
   }
 
+  function reviewPhotosHtml(photos) {
+    if (isQuestion || !Array.isArray(photos)) return '';
+    const safeUrl = value => {
+      if (typeof value !== 'string') return '';
+      try {
+        const url = new URL(value);
+        if (url.protocol === 'https:' && !url.username && !url.password && !url.port) return url.href;
+      } catch (e) { /* Некорректный URL. */ }
+      return '';
+    };
+    const links = photos.map((photo, index) => {
+      const url = safeUrl(photo?.url);
+      if (!url) return '';
+      const thumbnail = safeUrl(photo.thumbnail_url) || url;
+      return `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer" aria-label="Открыть фото отзыва ${index + 1}"><img loading="lazy" referrerpolicy="no-referrer" src="${esc(thumbnail)}" alt=""></a>`;
+    }).join('');
+    return links ? `<div class="rv-review-photos">${links}</div>` : '';
+  }
+
   function rowHtml(i) {
     const [d1, d2, d3] = dateParts(i.created_at);
     const mp = MP[i.marketplace] || ['', i.marketplace];
@@ -336,7 +355,8 @@ const createWBOPSList = (itemType = 'review') => {
         ${isQuestion ? '' : stars(i.rating)}
         <div class="rv-line"><b>Имя:</b> ${esc(i.author_name || 'Аноним')}</div>
         <div class="rv-line rv-text ${open ? 'open' : ''}"><b>Текст:</b> ${i.text ? esc(i.text) : '<span class="muted">без текста</span>'}</div>
-        ${longText ? `<button type="button" class="rv-more" data-toggle="${esc(i.id)}">${open ? 'свернуть' : 'подробнее'}</button>` : ''}</div>
+        ${longText ? `<button type="button" class="rv-more" data-toggle="${esc(i.id)}">${open ? 'свернуть' : 'подробнее'}</button>` : ''}
+        ${reviewPhotosHtml(i.review_photos)}</div>
       <div class="rv-cell rv-answer">
         <div class="rv-ahead">${i.method_title ? `<span class="rv-method">${METHOD_ICON[i.method] || ''} ${esc(i.method_title)}</span>` : ''}
           <span class="rv-status ${STATUS_CLS[i.status] || ''}">${i.status === 'published' ? '✓ ' : ''}${esc(i.status_title)}${i.status === 'published' && i.published_at ? ` ${shortDate(i.published_at)}` : ''}</span>
@@ -561,6 +581,7 @@ const createWBOPSList = (itemType = 'review') => {
 .rv-art{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;color:#4b5563;margin-top:auto}.rv-art span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .rv-art a{flex:none;text-decoration:none;color:#374151;border:1px solid #e5e7eb;border-radius:6px;width:24px;height:24px;display:grid;place-items:center;font-size:13px}.rv-art a:hover{background:#f3f4f6}
 .rv-review,.rv-answer{font-size:13px;line-height:1.45;display:flex;flex-direction:column;gap:5px}
+.rv-review-photos{display:flex;flex-wrap:wrap;gap:6px}.rv-review-photos a{border-radius:6px;background:#f3f4f6}.rv-review-photos img{display:block;width:48px;height:48px;object-fit:cover;border-radius:inherit}
 .rv-icons{display:flex;flex-wrap:wrap;gap:5px;align-items:center}.rv-tag{width:24px;height:24px;border-radius:6px;display:inline-grid;place-items:center;font-size:13px;border:1px solid}
 .rv-tag.positive{background:#effaf3;border-color:#bbe5c8}.rv-tag.negative{background:#fdf0ef;border-color:#f3c0b9}.rv-tag.media{background:#f5f6f8;border-color:#e5e7eb}
 .rv-order{margin-left:auto;font-size:11px;font-weight:600;padding:2px 7px;border-radius:6px;background:#f3f4f6;color:#4b5563;white-space:nowrap}.rv-order.rejected,.rv-order.returned{background:#fff4e5;color:#b45309}.rv-order.buyout{background:#ecfdf3;color:#15803d}

@@ -3,10 +3,11 @@ from datetime import date, datetime, time, timezone
 import math
 import re
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
-from app.models import InboxItem, ItemType, OrderStatus
+from app.models import InboxItem, ItemType, OrderStatus, ReviewPhoto
 
 
 class WBApiError(RuntimeError):
@@ -14,6 +15,35 @@ class WBApiError(RuntimeError):
 
 class WBDeliveryUncertain(WBApiError):
     pass
+
+
+def _photo_url(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    url = value.strip()
+    if not url or re.search(r"[\x00-\x20\x7f\\]", url):
+        return ""
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme == "https" and parsed.hostname and parsed.username is None and parsed.port in (None, 443):
+            return url
+    except ValueError:
+        pass
+    return ""
+
+
+def _review_photos(values: object) -> list[ReviewPhoto]:
+    photos: dict[str, ReviewPhoto] = {}
+    for value in values if isinstance(values, list) else [values]:
+        if isinstance(value, dict):
+            full = _photo_url(value.get("fullSize")) or _photo_url(value.get("url"))
+            thumbnail = _photo_url(value.get("miniSize"))
+        else:
+            full, thumbnail = _photo_url(value), ""
+        url = full or thumbnail
+        if url and url not in photos:
+            photos[url] = ReviewPhoto(url=url, thumbnail_url=thumbnail or url)
+    return list(photos.values())
 
 
 class WBFeedbackClient:
@@ -224,9 +254,24 @@ class WBFeedbackClient:
             if item.get(key):
                 parts.append(f"{label}: {item[key]}")
         product = item.get("productDetails") or {}
-        photos = item.get("photoLinks") or item.get("photos") or []
+        photos = _review_photos(item.get("photoLinks") or item.get("photos"))
+        vendor_code = next((
+            value.strip()
+            for value in (product.get("supplierArticle"), product.get("vendorCode"),
+                          item.get("supplierArticle"), item.get("vendorCode"))
+            if isinstance(value, str) and value.strip()
+        ), None)
         video = item.get("video") or item.get("videoLink")
-        return InboxItem(id=str(item.get("id") or item.get("feedbackId")), cabinet_id="", item_type=ItemType.REVIEW, text="\n".join(filter(None, parts)), rating=item.get("productValuation") or item.get("rating"), product_id=item.get("nmId") or product.get("nmId"), order_status=status, author_name=item.get("userName") or item.get("user_name") or item.get("authorName"), product_name=product.get("productName"), brand=product.get("brandName"), has_photo=bool(photos), has_video=bool(video), created_at=self._created(item), answered_in_wb=item.get("_wb_answered"))
+        return InboxItem(
+            id=str(item.get("id") or item.get("feedbackId")), cabinet_id="", item_type=ItemType.REVIEW,
+            text="\n".join(filter(None, parts)), rating=item.get("productValuation") or item.get("rating"),
+            product_id=item.get("nmId") or product.get("nmId"), order_status=status,
+            author_name=item.get("userName") or item.get("user_name") or item.get("authorName"),
+            product_name=product.get("productName"), brand=product.get("brandName"), vendor_code=vendor_code,
+            review_photos=photos if "photoLinks" in item or "photos" in item else None,
+            has_photo=bool(photos), has_video=bool(video), created_at=self._created(item),
+            answered_in_wb=item.get("_wb_answered"),
+        )
 
     @staticmethod
     def _created(item: dict[str, Any]) -> datetime:

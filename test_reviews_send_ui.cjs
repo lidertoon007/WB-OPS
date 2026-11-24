@@ -17,13 +17,13 @@ function stubFunction(name) {
   code = code.slice(0, body + 1) + code.slice(end - 1);
 }
 for (const name of ['drawFilters', 'drawCounters', 'drawBanner', 'drawList', 'drawBulk', 'loadPhotos', 'redrawRow', 'toast']) stubFunction(name);
-code = code.replace('return {render, reload: () => load(true)};', 'return {st, send, setRoot: value => root = value};');
+code = code.replace('return {render, reload: () => load(true)};', 'return {st, send, rowHtml, setRoot: value => root = value};');
 
 async function scenario(kind, fail) {
   let published = false;
   const requests = [];
   const context = {
-    window: {}, URLSearchParams, setTimeout, clearTimeout,
+    window: {}, URL, URLSearchParams, setTimeout, clearTimeout,
     document: {createElement: () => ({}), getElementById: () => true},
     location: {pathname: kind === 'question' ? '/questions' : '/reviews'},
     history: {replaceState() {}},
@@ -50,6 +50,20 @@ async function scenario(kind, fail) {
   };
   vm.runInNewContext(code, context);
   const list = kind === 'question' ? context.window.WBOPSQuestions : context.window.WBOPSReviews;
+  const row = {id: 'q1', product_id: 111, vendor_code: '<vendor>', tags: [], review_photos: [
+    {url: 'https://feedback04.wbbasket.ru/full.webp?a=1&b=2', thumbnail_url: 'https://feedback04.wbbasket.ru/mini.webp'},
+    {url: 'javascript:alert(1)', thumbnail_url: 'https://feedback04.wbbasket.ru/invalid.webp'},
+  ]};
+  const rowHtml = list.rowHtml(row);
+  assert.match(rowHtml, /&lt;vendor&gt; · 111/);
+  assert.doesNotMatch(rowHtml, /javascript:|invalid\.webp/);
+  assert.doesNotMatch(list.rowHtml({...row, review_photos: []}), /rv-review-photos/);
+  if (kind === 'review') {
+    assert.match(rowHtml, /href="https:\/\/feedback04\.wbbasket\.ru\/full\.webp\?a=1&amp;b=2"/);
+    assert.match(rowHtml, /src="https:\/\/feedback04\.wbbasket\.ru\/mini\.webp"/);
+  } else {
+    assert.doesNotMatch(rowHtml, /rv-review-photos/);
+  }
   list.setRoot({querySelector: () => ({classList: {add() {}, remove() {}}})});
   list.st.f = {sort: 'desc', answer: 'unanswered', cabinet_id: 'main'};
   list.st.data = {items: [{id: 'q1', answer: 'Original answer', status: 'draft'}], counts: {unanswered: 1, published: 0}, total: 1};
