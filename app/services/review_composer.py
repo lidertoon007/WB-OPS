@@ -255,6 +255,9 @@ DEFAULT_PHRASES: dict[str, list[str]] = {
     "greet": ["Здравствуйте!"],
     "thanks_5": ["Спасибо за отзыв и пять звёзд!", "Благодарим за высокую оценку!", "Спасибо, что поделились впечатлениями!",
                  "Благодарим за отзыв и отличную оценку!", "Спасибо за тёплый отзыв!"],
+    "thanks_photo": ["Спасибо за приложенное фото!", "Благодарим за фотографию товара!"],
+    "thanks_video": ["Спасибо за приложенное видео!", "Благодарим за видео товара!"],
+    "thanks_photo_video": ["Спасибо за приложенные фото и видео!", "Благодарим за фотографии и видео товара!"],
     "thanks_long": ["Спасибо за такой подробный отзыв!", "Благодарим за развёрнутый отзыв — это очень ценно для нас!",
                     "Спасибо, что так подробно рассказали о покупке!"],
     "thanks_4": ["Спасибо за отзыв и хорошую оценку!", "Благодарим за отзыв и оценку!"],
@@ -372,6 +375,8 @@ DEFAULT_PHRASES: dict[str, list[str]] = {
 }
 PHRASE_TITLES = {
     "greet_name": "Приветствие с именем", "greet": "Приветствие без имени", "thanks_5": "Благодарность за 5★",
+    "thanks_photo": "Благодарность за фото", "thanks_video": "Благодарность за видео",
+    "thanks_photo_video": "Благодарность за фото и видео",
     "thanks_long": "Благодарность за подробный отзыв", "thanks_4": "Благодарность за 4★", "thanks_neutral": "Благодарность при замечаниях",
     "thanks_empty_5": "Отзыв без текста, 4–5★", "fit_good": "Хорошо сели", "length_ok": "Подшивать не надо",
     "length_long": "Длинноваты", "quality_good": "Хвалят качество", "stretch": "Тянутся, стрейч", "warm": "Тёплые, утеплённые",
@@ -486,12 +491,20 @@ class ReviewComposer:
         has_text = len(facts.text) >= 3 and re.search(r"[а-яa-z]", facts.text)
         problems = [k for k in NEGATIVE_ORDER if k in a]
         received = facts.status == "buyout"
+        has_photo = item.has_photo or bool(item.review_photos)
+        media_key = ("thanks_photo_video" if has_photo and item.has_video else
+                     "thanks_photo" if has_photo else "thanks_video" if item.has_video else "")
+        good_five = facts.rating == 5 and not facts.negative and not problems \
+            and not a & {"angry", "refund"} \
+            and not re.search(r"\b(?:не понрав\w*|не устроил\w*|плох\w*)", facts.text)
 
         if not has_text:
             if facts.rating is not None and facts.rating <= 3:
                 parts.append(pick("empty_low"))
             else:
                 parts.append(pick("thanks_empty_5"))
+                if good_five and media_key:
+                    parts.append(pick(media_key))
                 parts.append(pick("wish_buyout") if received else pick("wish_other"))
             return " ".join(p for p in parts if p), facts
 
@@ -509,6 +522,8 @@ class ReviewComposer:
             parts.append(pick("thanks_4"))
         else:
             parts.append(pick("thanks_5"))
+        if good_five and not has_cons and media_key:
+            parts.append(pick(media_key))
 
         body: list[str] = []
         size_tip = False

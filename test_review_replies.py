@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from app.models import InboxItem
+from app.models import InboxItem, ReviewPhoto
 from app.services import ai_writer
 from app.services.replies import ReplyService
 from app.services.review_composer import DEFAULT_PHRASES, PhraseStore, ReviewComposer, analyze, first_name
@@ -15,9 +15,11 @@ class NoKnowledge:
         return None
 
 
-def review(text, rating=5, status="buyout", name="Майя", id="r1", product="Джинсы прямые классические Турция"):
+def review(text, rating=5, status="buyout", name="Майя", id="r1", product="Джинсы прямые классические Турция",
+           has_photo=False, has_video=False, review_photos=None):
     return InboxItem(id=id, cabinet_id="main", item_type="review", text=text, rating=rating,
-                     order_status=status, author_name=name, product_name=product)
+                     order_status=status, author_name=name, product_name=product,
+                     has_photo=has_photo, has_video=has_video, review_photos=review_photos)
 
 
 class ComposerTests(unittest.TestCase):
@@ -51,6 +53,32 @@ class ComposerTests(unittest.TestCase):
         self.assertGreater(len(texts), 5)
         # тот же отзыв — тот же текст (повторная генерация не «скачет»)
         self.assertEqual(self.text("Хорошие", id="x"), self.text("Хорошие", id="x"))
+
+    def test_media_thanks_match_attachments_on_good_five_star_reviews(self):
+        cases = (({}, False, False),
+                 ({"has_photo": True}, True, False),
+                 ({"has_video": True}, False, True),
+                 ({"has_photo": True, "has_video": True}, True, True),
+                 ({"review_photos": [ReviewPhoto(url="https://example.test/photo", thumbnail_url="https://example.test/thumb")]}, True, False))
+        for attachments, photo, video in cases:
+            with self.subTest(attachments=attachments):
+                reply = self.text("Отличные джинсы, рекомендую", **attachments)
+                self.assertEqual("фото" in reply.lower() or "фотограф" in reply.lower(), photo)
+                self.assertEqual("видео" in reply.lower(), video)
+
+    def test_media_thanks_for_empty_good_five_star_review(self):
+        reply = self.text("", has_photo=True, has_video=True)
+        self.assertIn("фото", reply.lower())
+        self.assertIn("видео", reply.lower())
+
+    def test_media_thanks_exclude_negative_and_other_ratings(self):
+        for rating, text in ((5, "Брак, порвана ткань"), (5, "Хорошие, но недостатки: плохо сидят"),
+                             (5, "Джинсы не понравились"),
+                             (4, "Отличные джинсы"), (3, "Отличные джинсы"), (1, "")):
+            with self.subTest(rating=rating, text=text):
+                reply = self.text(text, rating=rating, has_photo=True, has_video=True)
+                self.assertNotIn("приложенные фото и видео", reply.lower())
+                self.assertNotIn("фотографии и видео товара", reply.lower())
 
     def test_safety_for_refusal_return_unknown(self):
         samples = ["", "Всё отлично, рекомендую", "Брак, порвана ткань", "Не подошёл размер", "Сели идеально, мужу понравились",
