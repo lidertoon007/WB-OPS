@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from collections.abc import Iterator
@@ -35,6 +36,8 @@ class DraftStore:
                 except sqlite3.OperationalError:
                     pass
             connection.execute("CREATE TABLE IF NOT EXISTS inbox_items (id TEXT PRIMARY KEY, cabinet_id TEXT NOT NULL, item_type TEXT NOT NULL, text TEXT NOT NULL, rating INTEGER, product_id INTEGER, created_at TEXT NOT NULL)")
+            # Workers may start against the same database after a release.
+            connection.execute("BEGIN IMMEDIATE")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(inbox_items)")}
             if "order_status" not in columns:
                 connection.execute("ALTER TABLE inbox_items ADD COLUMN order_status TEXT NOT NULL DEFAULT 'notSpecified'")
@@ -46,14 +49,16 @@ class DraftStore:
                 "brand": "TEXT",
                 "has_photo": "INTEGER NOT NULL DEFAULT 0",
                 "has_video": "INTEGER NOT NULL DEFAULT 0",
+                "vendor_code": "TEXT",
+                "review_photos": "TEXT",
                 "review_topics": "TEXT NOT NULL DEFAULT '[]'",
                 "review_sentiment": "TEXT NOT NULL DEFAULT 'neutral'",
                 "wb_unanswered": "INTEGER",
             }
-            columns = {row[1] for row in connection.execute("PRAGMA table_info(inbox_items)")}
             for name, definition in inbox_additions.items():
                 if name not in columns:
                     connection.execute(f"ALTER TABLE inbox_items ADD COLUMN {name} {definition}")
+            connection.commit()
             connection.execute("CREATE TABLE IF NOT EXISTS analytics_history ("
                                "id TEXT PRIMARY KEY, cabinet_id TEXT NOT NULL, item_type TEXT NOT NULL, "
                                "text TEXT NOT NULL, rating INTEGER, product_id INTEGER, created_at TEXT NOT NULL, "
@@ -137,8 +142,15 @@ class DraftStore:
 
     def get_inbox(self, item_id: str) -> InboxItem | None:
         with self._connect() as connection:
-            row = connection.execute("SELECT id,cabinet_id,item_type,text,rating,product_id,created_at,order_status,author_name,marketplace,product_name,brand,has_photo,has_video FROM inbox_items WHERE id=?", (item_id,)).fetchone()
-        return InboxItem(id=row[0], cabinet_id=row[1], item_type=row[2], text=row[3], rating=row[4], product_id=row[5], created_at=row[6], order_status=row[7], author_name=row[8], marketplace=row[9], product_name=row[10], brand=row[11], has_photo=bool(row[12]), has_video=bool(row[13])) if row else None
+            connection.row_factory = sqlite3.Row
+            row = connection.execute("SELECT * FROM inbox_items WHERE id=?", (item_id,)).fetchone()
+        return self._inbox_item(row) if row else None
+
+    @staticmethod
+    def _inbox_item(row: sqlite3.Row) -> InboxItem:
+        item = dict(row)
+        item["review_photos"] = json.loads(item["review_photos"]) if item["review_photos"] is not None else None
+        return InboxItem.model_validate(item)
 
     def get_setting(self, key: str, default: str) -> str:
         with self._connect() as connection:
@@ -199,12 +211,33 @@ class DraftStore:
             connection.close()
 
     def save_inbox(self, items: list[InboxItem]) -> int:
-        import json
         from app.services.review_analysis import analyze_review
+
         with self._connect() as connection:
             for item in items:
                 markup = analyze_review(item.text, item.rating) if item.item_type.value == "review" else None
-                connection.execute("INSERT OR REPLACE INTO inbox_items(id,cabinet_id,item_type,text,rating,product_id,created_at,order_status,author_name,marketplace,product_name,brand,has_photo,has_video,review_topics,review_sentiment) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (item.id, item.cabinet_id, item.item_type.value, item.text, item.rating, item.product_id, item.created_at.isoformat(), item.order_status.value, item.author_name, item.marketplace, item.product_name, item.brand, int(item.has_photo), int(item.has_video), json.dumps(markup.topics if markup else [], ensure_ascii=False), markup.sentiment if markup else "neutral"))
+                photos = item.review_photos
+                connection.execute(
+                    "INSERT INTO inbox_items(id,cabinet_id,item_type,text,rating,product_id,created_at,order_status,"
+                    "author_name,marketplace,product_name,brand,has_photo,has_video,review_topics,review_sentiment,"
+                    "vendor_code,review_photos) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET cabinet_id=excluded.cabinet_id,item_type=excluded.item_type,"
+                    "text=excluded.text,rating=excluded.rating,product_id=excluded.product_id,created_at=excluded.created_at,"
+                    "order_status=excluded.order_status,author_name=excluded.author_name,marketplace=excluded.marketplace,"
+                    "product_name=excluded.product_name,brand=excluded.brand,has_video=excluded.has_video,"
+                    "review_topics=excluded.review_topics,review_sentiment=excluded.review_sentiment,wb_unanswered=NULL,"
+                    "has_photo=CASE WHEN excluded.review_photos IS NULL AND inbox_items.review_photos IS NOT NULL "
+                    "THEN MAX(excluded.has_photo,inbox_items.has_photo) ELSE excluded.has_photo END,"
+                    "vendor_code=COALESCE(excluded.vendor_code, CASE WHEN inbox_items.product_id=excluded.product_id "
+                    "THEN inbox_items.vendor_code END),"
+                    "review_photos=COALESCE(excluded.review_photos,inbox_items.review_photos)",
+                    (item.id, item.cabinet_id, item.item_type.value, item.text, item.rating, item.product_id,
+                     item.created_at.isoformat(), item.order_status.value, item.author_name, item.marketplace,
+                     item.product_name, item.brand, int(item.has_photo or bool(photos)), int(item.has_video),
+                     json.dumps(markup.topics if markup else [], ensure_ascii=False),
+                     markup.sentiment if markup else "neutral", (item.vendor_code or "").strip() or None,
+                     json.dumps([photo.model_dump() for photo in photos]) if photos is not None else None),
+                )
         return len(items)
 
     def reconcile_wb_unanswered(self, cabinet_id: str, item_types: list[str], item_ids: list[str]) -> None:
@@ -244,9 +277,10 @@ class DraftStore:
 
     def list_inbox(self, item_type: str | None = None, rating: int | None = None, product_id: int | None = None, order_status: str | None = None, search: str | None = None, status: str | None = None, limit: int = 200, offset: int = 0, cabinet_id: str | None = None) -> list[InboxItem]:
         with self._connect() as connection:
+            connection.row_factory = sqlite3.Row
             publication_clause = "COALESCE(d.published,0)=1" if status == "published" else "COALESCE(d.published,0)=0"
-            rows = connection.execute(f"SELECT i.id,i.cabinet_id,i.item_type,i.text,i.rating,i.product_id,i.created_at,i.order_status,i.author_name,i.marketplace,i.product_name,i.brand,i.has_photo,i.has_video FROM inbox_items i LEFT JOIN reply_drafts d ON d.item_id=i.id WHERE {publication_clause} ORDER BY i.created_at DESC").fetchall()
-        items = [InboxItem(id=r[0], cabinet_id=r[1], item_type=r[2], text=r[3], rating=r[4], product_id=r[5], created_at=r[6], order_status=r[7], author_name=r[8], marketplace=r[9], product_name=r[10], brand=r[11], has_photo=bool(r[12]), has_video=bool(r[13])) for r in rows]
+            rows = connection.execute(f"SELECT i.* FROM inbox_items i LEFT JOIN reply_drafts d ON d.item_id=i.id WHERE {publication_clause} ORDER BY i.created_at DESC").fetchall()
+        items = [self._inbox_item(row) for row in rows]
         drafts = {draft.item_id: draft for draft in self.list()}
         query = (search or "").strip().lower()
         filtered = [item for item in items if (not cabinet_id or item.cabinet_id == cabinet_id) and (not item_type or item.item_type.value == item_type) and (rating is None or item.rating == rating) and (product_id is None or item.product_id == product_id) and (not order_status or (item.item_type.value == "review" and item.order_status.value == order_status)) and (not query or query in item.text.lower() or query in item.id.lower() or query in str(item.product_id or "").lower()) and (not status or ("published" if drafts.get(item.id, None) and drafts[item.id].published else "draft") == status)]

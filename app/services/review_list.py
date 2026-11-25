@@ -82,7 +82,8 @@ class ReviewList:
             c.row_factory = sqlite3.Row
             rows = [dict(r) for r in c.execute(
                 "SELECT i.id, i.cabinet_id, i.text, i.rating, i.product_id, i.created_at, i.order_status, i.author_name, i.marketplace, "
-                "i.product_name, i.has_photo, i.has_video, i.wb_unanswered, d.text AS draft_text, COALESCE(d.confirmed,0) AS confirmed, "
+                "i.product_name, i.vendor_code, i.review_photos, i.has_photo, i.has_video, i.wb_unanswered, "
+                "d.text AS draft_text, COALESCE(d.confirmed,0) AS confirmed, "
                 "COALESCE(d.published,0) AS published, COALESCE(d.moderation_status,'pending') AS moderation_status, "
                 "COALESCE(d.moderation_comment,'') AS moderation_comment, COALESCE(d.user_edited,0) AS user_edited, COALESCE(d.source,'') AS source, "
                 "s.value AS delivery FROM inbox_items i LEFT JOIN reply_drafts d ON d.item_id=i.id "
@@ -124,7 +125,7 @@ class ReviewList:
             if product_id and r["product_id"] != product_id:
                 continue
             r["product_name"] = r["product_name"] or names.get(r["product_id"], "")
-            r["vendor_code"] = vendor.get(str(r["product_id"]), "")
+            r["vendor_code"] = r["vendor_code"] or vendor.get(str(r["product_id"]), "")
             if term:
                 hay = " ".join(str(x or "") for x in (r["text"], r["author_name"], r["product_name"], r["product_id"], r["vendor_code"], r["draft_text"], r["id"])).lower().replace("ё", "е")
                 if term not in hay:
@@ -163,6 +164,7 @@ class ReviewList:
                 "vendor_code": r["vendor_code"], "rating": r["rating"], "author_name": r["author_name"] or "", "text": r["text"] or "",
                 "order_status": r["order_status"], "order_status_title": ORDER_STATUSES.get(r["order_status"], r["order_status"]),
                 "has_photo": bool(r["has_photo"]), "has_video": bool(r["has_video"]),
+                "review_photos": json.loads(r["review_photos"]) if r["review_photos"] else [],
                 "tags": [{"tag": t, "title": TAGS[t][0], "icon": TAG_ICONS.get(t, "•"), "polarity": p} for t, p in tag_map.items()],
                 "answer": r["draft_text"] or "", "status": r["status"], "status_title": ANSWER_STATUSES[r["status"]],
                 "method": r["method"], "method_title": METHOD_LABELS.get(r["method"], "") if r["method"] else "",

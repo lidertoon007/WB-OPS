@@ -47,6 +47,37 @@ class _AsyncClient:
 
 
 class WBHistoryTests(unittest.TestCase):
+    def test_feedback_loads_buyer_photos_and_supplier_article(self):
+        client = wb_client.WBFeedbackClient("token")
+        full = "https://feedback04.wbbasket.ru/photos/full.webp"
+        mini = "https://feedback04.wbbasket.ru/photos/mini.webp"
+        other = "https://feedback04.wbbasket.ru/photos/other.webp"
+        item = client._feedback({
+            "id": "review",
+            "productDetails": {"nmId": 1942638477, "supplierArticle": " DP02/чёрный "},
+            "photoLinks": [
+                {"fullSize": full, "miniSize": mini},
+                full,
+                other,
+                {"fullSize": "javascript:alert(1)", "miniSize": other},
+                {"fullSize": "https://user:pass@example.org/a.webp"},
+                {"fullSize": "https:///a.webp"},
+                "",
+            ],
+        })
+        self.assertEqual(item.product_id, 1942638477)
+        self.assertEqual(item.vendor_code, "DP02/чёрный")
+        self.assertTrue(item.has_photo)
+        self.assertEqual([photo.model_dump() for photo in item.review_photos], [
+            {"url": full, "thumbnail_url": mini},
+            {"url": other, "thumbnail_url": other},
+        ])
+        legacy = client._feedback({"id": "legacy", "vendorCode": "abc", "photos": [{"miniSize": mini}]})
+        self.assertEqual(legacy.vendor_code, "abc")
+        self.assertEqual(legacy.review_photos[0].url, mini)
+        self.assertEqual(client._feedback({"id": "empty", "photoLinks": None}).review_photos, [])
+        self.assertIsNone(client._feedback({"id": "omitted"}).review_photos)
+
     def test_invalid_queue_entry_aborts_instead_of_truncating_snapshot(self):
         client = _AsyncClient({("/api/v1/feedbacks", "false"): {"data": {"feedbacks": [{"text": "no id"}]}}})
         with self.assertRaises(wb_client.WBApiError):

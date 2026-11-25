@@ -114,6 +114,9 @@ ASPECTS = {
     "repeated_order_mismatch": r"(?:второй раз|повторно|снова)[^.!?]{0,100}(?:присл|приш[её]л|прислан|товар)[^.!?]{0,100}(?:друг\w* цвет|не тот цвет|друг\w* дизайн|друг\w* модел|не тот товар)",
     "missing_fleece": r"(?:никак\w*|совсем|вообще)?\s*(?:нет|не было|отсутствует)\s+(?:никак\w*\s+)?флис|флис\w*(?:\s+там)?\s+(?:нет|не было|отсутствует)|без флис|никак\w* флис\w* (?:там )?нет",
     "smell_after_wash": r"(?:запах|воня)[^.!?]{0,160}(?:не (?:выстир|отстир|исчез|ушел)|остал|сохран)|(?:постирал|стирк|после стирк)[^.!?]{0,160}(?:запах|воня)[^.!?]{0,50}(?:не (?:выстир|отстир|исчез|ушел)|остал|сохран)",
+    "lint_attraction": r"липн\w*[^.!?]{0,50}(?:вс[её]|пыль|ворс)|(?:пыль|ворсинк|ворс)[^.!?]{0,60}липн\w*|(?:вс[её]|всё) липн\w*",
+    "fabric_waves_after_wash": r"(?:волны|волнист\w*)[^.!?]{0,100}(?:ткан|стирк)|(?:ткан|стирк)[^.!?]{0,100}(?:волны|волнист\w*)",
+    "third_order_mismatch": r"(?:третий|3[- ]?й)[.! ]*\s*раз[^.!?]{0,120}(?:доставлен|прислан|прислали|пришел|приш[её]л|товар)[^.!?]{0,120}(?:друг\w* цвет|не тот цвет|друг\w* дизайн|друг\w* модел|не тот товар)",
     # прислали не тот цвет (ошибка сборки, а не «оттенок на экране»)
     "wrong_color_received": (
         r"вместо (?:[а-я]+-)?(?:черн|бел|син|голуб|сер|зелен|бежев|красн|розов|коричнев|фиолетов|желт|бордов|оранжев|бирюзов)\w*\s+"
@@ -159,6 +162,7 @@ class ReviewFacts:
     @property
     def negative(self) -> bool:
         return bool(self.aspects & {"knees_stretching", "repeated_order_mismatch", "missing_fleece", "smell_after_wash",
+                                    "lint_attraction", "fabric_waves_after_wash", "third_order_mismatch",
                                     "defect", "not_as_described", "wrong_color_received", "collection_variation",
                                     "fabric_fold", "size_inconsistent", "thin", "color_diff", "price_bad", "smell",
                                     "size_small", "size_big", "length_short", "height_limit", "waist_grid_mismatch",
@@ -214,6 +218,12 @@ def analyze(item: InboxItem) -> ReviewFacts:
             aspects -= {"thin", "not_as_described", "order_mismatch"}
     if "smell_after_wash" in aspects:
         aspects -= {"smell", "quality_good"}
+    if "third_order_mismatch" in aspects:
+        aspects -= {"repeated_order_mismatch", "wrong_color_received", "order_mismatch", "not_as_described", "color_diff"}
+    if "fabric_waves_after_wash" in aspects:
+        aspects -= {"fabric_fold", "wash_ok", "quality_good"}
+    if "lint_attraction" in aspects:
+        aspects.discard("quality_bad")
     if "collection_variation" in aspects:          # даём точное объяснение про партии, а не общий ответ «не соответствует»
         aspects -= {"not_as_described", "order_mismatch"}
     if "fabric_fold" in aspects:                   # отдельный ответ про деним и уход без общего требования фото
@@ -321,6 +331,12 @@ DEFAULT_PHRASES: dict[str, list[str]] = {
                        "Данная модель имеет флисовую подкладку. Если полученный товар оказался без флиса, не исключена подмена. Проверяйте изделие в пункте выдачи Wildberries под камерами; если оно не соответствует описанию, рекомендуем отказаться от него при получении."],
     "smell_after_wash": ["Спасибо, что отметили качество {product}. Нам жаль, что после стирки неприятный запах сохранился. Для новой джинсовой ткани иногда характерен запах, связанный с окрашиванием и обработкой материала; обычно после стирки он становится менее выраженным.",
                          "Благодарим за оценку качества. Сожалеем, что запах не исчез после стирки. У нового денима бывает специфический запах из-за окрашивания и обработки; как правило, после стирки он ослабевает."],
+    "lint_attraction": ["К джинсовой ткани, как и к любой другой, могут прилипать пыль, ворсинки и мелкие частицы. На тёмных оттенках, особенно чёрном, они заметнее — это особенность тёмной одежды, а не недостаток ткани. Надеемся, что в остальном джинсы вас устроили.",
+                        "Пыль и ворсинки могут оседать на любой ткани, но на чёрной и другой тёмной одежде они сильнее бросаются в глаза. Это связано с контрастом цвета, а не с качеством денима. Надеемся, что остальные характеристики джинсов вам подошли."],
+    "fabric_waves_after_wash": ["Нам жаль, что после второй стирки на ткани появились волны. Качественный деним при соблюдении рекомендаций по уходу должен сохранять форму и внешний вид даже после многократных стирок; такой эффект после второй стирки нехарактерен для этой модели.",
+                                "Появление волн на ткани после второй бережной стирки при 20 °C нехарактерно для этой модели. Наши джинсы выполнены из качественного денима, который при соблюдении рекомендаций по уходу должен сохранять форму и внешний вид."],
+    "third_order_mismatch": ["Мы отправляем товары в соответствии с характеристиками и фотографиями в карточке. При обновлении коллекции возможны небольшие изменения дизайна, при этом цвет модели остаётся неизменным. Мы не заинтересованы в том, чтобы вводить покупателей в заблуждение; не исключаем, что при доставке могла произойти пересортица или подмена. Надеемся на ваше понимание.",
+                             "Нам жаль, что вы снова столкнулись с несоответствием. Мы комплектуем заказы по карточке товара: при обновлении коллекции дизайн может немного измениться, но цвет остаётся прежним. Мы не заинтересованы вводить покупателей в заблуждение и допускаем, что при доставке могла произойти пересортица или подмена. Спасибо за понимание."],
     "size_tip": ["Спасибо за подсказку по размеру — она поможет другим покупателям с выбором.",
                  "Отдельное спасибо за совет по размеру — другим покупателям это очень поможет."],
     "length_long_bad": ["Жаль, что модель оказалась длинновата.", "Нам жаль, что по длине модель не подошла."],
@@ -371,6 +387,8 @@ PHRASE_TITLES = {
     "delivery_issue": "Доставка, ПВЗ", "smell": "Запах", "negative_general": "Негатив без деталей", "empty_low": "Отзыв без текста, 1–3★",
     "knees_stretching": "Сомнения: вытягиваются колени", "repeated_order_mismatch": "Повторно прислали другой цвет или дизайн",
     "missing_fleece": "Нет флиса в утеплённой модели", "smell_after_wash": "Запах остался после стирки",
+    "lint_attraction": "К ткани липнут пыль и ворсинки", "fabric_waves_after_wash": "Волны на ткани после стирки",
+    "third_order_mismatch": "Третий раз другой цвет или дизайн",
     "wear_out": "Быстро износились, «решето», протёрлись", "care_rules": "Правила ухода и стирки", "quality_bad": "Ругают качество",
     "refund": "Требуют вернуть деньги", "photo_request": "Просьба прислать фото", "negative_strong": "Резкий негатив без деталей",
     "closing_problem": "Прощание при жалобе", "wrong_color_received": "Прислали не тот цвет (проверка на ПВЗ)", "liked": "Модель понравилась",
@@ -386,7 +404,7 @@ POSITIVE_ORDER = ["repeat", "liked", "fit_good", "length_ok", "quality_good", "s
 FOR_WHOM = ["for_husband", "for_son", "for_teen", "for_grandson", "for_father"]
 SIZE_KEYS = ("size_small", "size_big", "length_short", "size_wrong")
 TIP_KEYS = ("size_small", "size_big", "length_short")   # «маломерят, берите на размер больше» при выкупе и 4–5★
-NEGATIVE_ORDER = ["knees_stretching", "repeated_order_mismatch", "missing_fleece", "smell_after_wash", "wear_out", "defect", "collection_variation", "wrong_color_received", "fabric_fold", "size_inconsistent", "waist_grid_mismatch", "height_limit", "declared_color_mismatch", "unclear_disadvantages", "not_as_described", "quality_bad", "delivery_issue", "size_small", "size_big", "length_short", "size_wrong",
+NEGATIVE_ORDER = ["knees_stretching", "third_order_mismatch", "repeated_order_mismatch", "missing_fleece", "smell_after_wash", "lint_attraction", "fabric_waves_after_wash", "wear_out", "defect", "collection_variation", "wrong_color_received", "fabric_fold", "size_inconsistent", "waist_grid_mismatch", "height_limit", "declared_color_mismatch", "unclear_disadvantages", "not_as_described", "quality_bad", "delivery_issue", "size_small", "size_big", "length_short", "size_wrong",
                   "thin", "color_diff", "price_bad", "smell", "payment_issue"]
 
 

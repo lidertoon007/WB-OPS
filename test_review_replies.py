@@ -294,6 +294,42 @@ class ComposerTests(unittest.TestCase):
         self.assertFalse(ReplyService(NoKnowledge()).validate(reply, item))
         self.assertNotIn("smell_after_wash", analyze(review("После стирки запах исчез, спасибо.")).aspects)
 
+    def test_anonymous_lint_on_dark_denim_reply(self):
+        item = review("К джинсам липнет абсолютно всё !", rating=2, name="Аноним", id="lint-dark")
+        reply, facts = self.composer.compose(item)
+        self.assertIn("lint_attraction", facts.aspects)
+        self.assertNotIn("Аноним", reply)
+        for phrase in ("пыль", "ворсин", "чёрн"):
+            self.assertIn(phrase, reply.lower())
+        self.assertRegex(reply.lower(), "особенность|связано с контрастом")
+        self.assertRegex(reply.lower(), "не недостаток|не с качеством")
+        self.assertRegex(reply.lower(), "в остальном|остальные характеристики")
+        self.assertNotIn("под камерами", reply.lower())
+
+    def test_anna_waves_after_second_wash_reply(self):
+        item = review("Очень расстроилась! После второй стирки (бережная стирка 20 градусов) появились волны на ткани!",
+                      rating=1, name="Анна", id="anna-waves")
+        reply, facts = self.composer.compose(item)
+        self.assertIn("fabric_waves_after_wash", facts.aspects)
+        self.assertIn("Анна", reply)
+        for phrase in ("второй стирки", "качественн", "деним", "нехарактер"):
+            self.assertIn(phrase, reply.lower())
+        self.assertRegex(reply.lower(), "сохранять форму|форма и внешний вид")
+        self.assertNotIn("запах", reply.lower())
+
+    def test_sergey_third_mismatch_not_accused_of_deception_reply(self):
+        item = review("Третий! раз доставлен товар другого цвета и дизайна. У этого продавца лучше не заказывать, обманет",
+                      rating=1, status="rejected", name="Сергей", id="sergey-third")
+        reply, facts = self.composer.compose(item)
+        self.assertIn("third_order_mismatch", facts.aspects)
+        self.assertNotIn("repeated_order_mismatch", facts.aspects)
+        self.assertIn("Сергей", reply)
+        for phrase in ("карточке", "дизайн", "цвет", "пересортиц", "подмена"):
+            self.assertIn(phrase, reply.lower())
+        self.assertRegex(reply.lower(), "не заинтересованы")
+        self.assertNotIn("рекомендуем отказаться", reply.lower())
+        self.assertNotIn("вы обманываете", reply.lower())
+
     def test_olga_fold_and_fabric_reply(self):
         item = review("Плохо сидят. Спереди огромная складка. Ткань дешевая", rating=2, name="Ольга", id="olga")
         facts = analyze(item)

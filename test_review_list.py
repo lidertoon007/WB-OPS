@@ -1,11 +1,14 @@
 import asyncio
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
 from app.models import InboxItem, ReplyDraft
 from app.services.review_list import ReviewList
+from app.services.wb_client import WBFeedbackClient
 from app.services.wb_images import WBImages, image_url
 from app.storage import DraftStore
 
@@ -34,6 +37,45 @@ class ReviewListTests(unittest.TestCase):
             c.execute("UPDATE reply_drafts SET text='Жаль, что не подошли' WHERE item_id='r2'")
             c.execute("UPDATE reply_drafts SET moderation_status='rework' WHERE item_id='r3'")
         self.list = ReviewList(self.store, cabinet_names=lambda: {"main": "ИП Тест"}, vendor_path=str(Path(self.temp.name) / "none.json"))
+
+    def test_review_metadata_reaches_list_and_survives_sparse_sync(self):
+        self.list.vendor_path.write_text('{"111":"catalog-code","222":"fallback-code"}', encoding="utf-8")
+        client = WBFeedbackClient("token")
+        full = "https://feedback04.wbbasket.ru/photos/full.webp"
+        mini = "https://feedback04.wbbasket.ru/photos/mini.webp"
+        data = {"id": "r1", "productDetails": {"nmId": 111}, "text": "Отзыв"}
+        item = client._feedback({
+            **data, "productDetails": {"nmId": 111, "supplierArticle": "seller-code"},
+            "photoLinks": [{"fullSize": full, "miniSize": mini}],
+        })
+        self.store.save_inbox([item, review(2, "2026-10-02", 1, "", product=222)])
+        self.store.save_inbox([client._feedback(data)])
+        by_id = {entry["id"]: entry for entry in self.list.query()["items"]}
+        self.assertEqual(by_id["r1"]["vendor_code"], "seller-code")
+        self.assertEqual(by_id["r1"]["review_photos"], [{"url": full, "thumbnail_url": mini}])
+        self.assertTrue(by_id["r1"]["has_photo"])
+        self.assertEqual(by_id["r2"]["vendor_code"], "fallback-code")
+        self.assertEqual(by_id["r2"]["review_photos"], [])
+        self.assertEqual(self.list.query(search="seller-code")["total"], 1)
+        self.assertEqual(self.store.get_inbox("r1").review_photos, item.review_photos)
+        self.assertEqual(self.store.list_inbox(status="published")[0].review_photos, item.review_photos)
+        self.store.save_inbox([client._feedback({**data, "photoLinks": []})])
+        self.assertEqual(self.store.get_inbox("r1").review_photos, [])
+        self.assertFalse(self.store.get_inbox("r1").has_photo)
+
+    def test_review_metadata_migration_keeps_old_reviews(self):
+        path = Path(self.temp.name) / "legacy.sqlite3"
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("CREATE TABLE inbox_items (id TEXT PRIMARY KEY, cabinet_id TEXT NOT NULL, "
+                       "item_type TEXT NOT NULL, text TEXT NOT NULL, rating INTEGER, product_id INTEGER, "
+                       "created_at TEXT NOT NULL, has_photo INTEGER NOT NULL DEFAULT 0)")
+            db.execute("INSERT INTO inbox_items VALUES "
+                       "('old','main','review','Старый отзыв',3,111,'2026-10-01T09:00:00+00:00',1)")
+        legacy = DraftStore(f"sqlite:///{path}")
+        row, = ReviewList(legacy, vendor_path=self.list.vendor_path).query()["items"]
+        self.assertEqual(row["text"], "Старый отзыв")
+        self.assertTrue(row["has_photo"])
+        self.assertEqual(row["review_photos"], [])
 
     def test_question_filters_and_tags_do_not_include_reviews(self):
         self.store.save_inbox([
