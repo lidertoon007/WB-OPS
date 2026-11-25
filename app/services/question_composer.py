@@ -37,7 +37,7 @@ class QuestionFacts:
 INTENTS = [
     ("complaint", r"пришл[иа]? (?:не те|друг|темно|тёмно|черн|син|сер)|не турци|не похож|подмен|качеств\w* (?:не очень|плох)"),
     ("refund", r"деньги не|не вернул|не пришли деньги|деньги ещ[её]|вернул\w*[^.?]{0,25}деньги"),
-    ("return", r"одобрит\w* возврат|оформ\w* возврат|вернуть (?:это|товар|изделие)|как вернуть|обмен|обменять|отменить (?:заказ|товар)"),
+    ("return", r"одобрит\w* возврат|оформ\w* возврат|вернуть (?:это|товар|изделие)|как вернуть|обмен|обменять|отменить (?:заказ|товар)|примерк\w* в пвз|отказ\w* от товар"),
     ("price", r"цен[аыу]|дорожа|подорожа|в корзине|стоимост|\d+\s*₽|прыгает|\bруб"),
     ("find_mark", r"маркировк|этикетк|[A-ZА-Я]{1,2}\d{3,5}[A-ZА-Я]?\d?[-–][A-ZА-Я]\d|ссылк"),
     ("availability", r"будут ли|будет ли|будут еще|в наличии|поступлен|появ[ия]тся|есть ли (?:эти|размер|в размере|модел)|есть размер|есть модель|когда будут"),
@@ -167,7 +167,7 @@ class QuestionComposer:
         model = self.models.for_product(item.product_id) or {}
         legacy = (self.products.get(item.product_id) if self.products else None) or {}
         merged = dict(model)
-        for src, dst in (("composition", "composition"), ("season", "season"), ("care", "care"), ("details", "notes")):
+        for src, dst in (("season", "season"), ("care", "care"), ("details", "notes")):
             if legacy.get(src) and not merged.get(dst):
                 merged[dst] = str(legacy[src])
         if legacy.get("measurements") and not merged.get("height_note"):
@@ -342,6 +342,8 @@ class QuestionComposer:
         t = f.text
         def answer(body, *handled):
             return body, {"general", *handled}
+        if "composition" in f.intents and re.search(r"карточк|описан", t) and re.search(r"фото|этикетк|ярлык|ответ", t):
+            return answer(["Если данные о составе расходятся, ориентируйтесь на состав в характеристиках карточки товара для этого артикула. Спасибо, что указали на расхождение — проверим описание и изображения."], "composition", "find_mark")
         if "find_mark" in f.intents:
             found = self.models.by_mark(f.mark) if f.mark else None
             if not f.mark and not re.search(r"этикетк[^:]*:\s*\S", t):
@@ -357,7 +359,7 @@ class QuestionComposer:
         if re.search(r"(?:жарко|жарковато|сезон|летом)", t) and re.search(r"[+]?(?:24)\s*(?:°|градус|$)", t):
             return answer(["При температуре +24 °C в этих джинсах может быть жарковато, особенно при длительном нахождении на солнце. Всё зависит от индивидуальных ощущений."], "season")
         if re.search(r"(?:светл|цвет)[^.?]{0,70}(?:плотн|синтет)|плотн[^.?]{0,30}не синтет", t):
-            return answer(["Перейдите в наш магазин на маркетплейсе и выберите подходящий цвет. Состав наших джинсов — 98% хлопок (качественный деним) и 2% эластан для удобной посадки." if not m.get("composition") else "Перейдите в наш магазин на маркетплейсе и выберите подходящий цвет. " + "Состав этой модели: " + m["composition"].rstrip(".") + "."], "composition", "density", "availability")
+            return answer(["Перейдите в наш магазин на маркетплейсе и выберите подходящий цвет. " + ("Состав этой модели: " + m["composition"].rstrip(".") + "." if m.get("composition") else "Точный состав выбранной модели смотрите в характеристиках её карточки товара.")], "composition", "density", "availability")
         if not m.get("sizes"):
             if f.height and f.height >= 190 and not (f.waist or f.hips) and ("size_pick" in f.intents):
                 intro = f"Чтобы проверить, подойдёт ли {f.ru_size} размер на рост {int(f.height)} см, нужны ваши замеры." if f.ru_size else f"По одному росту {int(f.height)} см сложно определить подходящий размер."
@@ -387,7 +389,7 @@ class QuestionComposer:
         if "922327365" in ids and re.search(r"тонк|плотност|летн", t):
             return answer(self._fact(m, "density", "Это тонкие летние джинсы, для лета они хорошо подойдут."), "density", "season")
         if "922327387" in ids and re.search(r"цвет|син|состав|хлоп|синтет", t):
-            return answer(["Цвет — синий.", *self._fact(m, "composition", "Состав: 98% хлопок, 2% эластан.")], "composition", "season")
+            return answer(["Цвет — синий.", *self._fact(m, "composition", "Точный состав смотрите в характеристиках карточки товара.")], "composition", "season")
         if "955536606" in ids and f.height and 185 <= f.height <= 187 and not m.get("sizes"):
             body = ["По длине эта модель подойдёт на рост 185–187 см. Для выбора размера сверьте замеры с размерной таблицей в карточке товара."]
             if "резинк" in t:
@@ -417,7 +419,10 @@ class QuestionComposer:
             elif intent == "refund":
                 body.append("Сроки возврата денег продавец, к сожалению, не регулирует: обычно Wildberries возвращает их в течение нескольких дней после приёмки товара. Если срок прошёл, напишите, пожалуйста, в поддержку Wildberries — там проверят ваш заказ.")
             elif intent == "return":
-                body.append("Возврат и отмену оформляет Wildberries: заявку можно подать в приложении в разделе «Покупки». Обменять размер напрямую нельзя — нужный размер оформляется отдельным заказом.")
+                if re.search(r"пвз|пункт\w* выдач|примерк", f.text):
+                    body.append("При примерке в ПВЗ Wildberries можно отказаться от неподошедшего товара и выкупить подходящий размер. Условия конкретного заказа проверьте в приложении Wildberries.")
+                else:
+                    body.append("Возврат и отмену оформляет Wildberries: заявку можно подать в приложении в разделе «Покупки». Обменять размер напрямую нельзя — нужный размер оформляется отдельным заказом.")
             elif intent == "price":
                 body.append("Итоговая цена видна в корзине Wildberries перед оформлением заказа. Цена может отличаться у разных размеров и цветов; после оформления заказа стоимость для вас фиксируется на момент покупки.")
             elif intent == "find_mark":
@@ -437,7 +442,7 @@ class QuestionComposer:
                 else:
                     body.append("Соответствие размеров указано в таблице размеров карточки; точнее подобрать поможет обхват талии и бёдер — напишите их, подскажем.")
             elif intent == "composition":
-                body += ["Состав: " + m["composition"].rstrip(".") + "."] if m.get("composition") and not m["composition"].lower().startswith("состав") else self._fact(m, "composition", "Состав: 98% хлопок, 2% эластан.")
+                body += ["Состав: " + m["composition"].rstrip(".") + "."] if m.get("composition") and not m["composition"].lower().startswith("состав") else self._fact(m, "composition", "Точный состав смотрите в характеристиках карточки товара.")
             elif intent == "stretch":
                 body += self._fact(m, "stretch", "Эластичность зависит от состава ткани: при наличии эластана джинсы немного тянутся. Уточним по этой модели в чате продавца.")
             elif intent == "density":
