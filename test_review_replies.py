@@ -7,7 +7,7 @@ from unittest import mock
 from app.models import InboxItem
 from app.services import ai_writer
 from app.services.replies import ReplyService
-from app.services.review_composer import PhraseStore, ReviewComposer, analyze, first_name
+from app.services.review_composer import DEFAULT_PHRASES, PhraseStore, ReviewComposer, analyze, first_name
 
 
 class NoKnowledge:
@@ -328,6 +328,74 @@ class ComposerTests(unittest.TestCase):
         reply = self.text("Джинсы хорошие, но на 188 рост коротки.", rating=5, status="buyout")
         self.assertIn("188 см", reply)
         self.assertNotIn("совет по размеру", reply)
+
+    def test_lada_height_limit_replies(self):
+        samples = ("Маленький рост максимум 175(((", "На маленький рост максимум 175",
+                   "Я не знаю на какой рост на карликов", "Маленький рост (((")
+        for sample in samples:
+            for status in ("buyout", "rejected"):
+                with self.subTest(sample=sample, status=status):
+                    item = review(sample, rating=2, status=status, name="Лада", id=sample + status)
+                    reply, facts = self.composer.compose(item)
+                    self.assertIn("height_limit", facts.aspects)
+                    self.assertIn("Лада", reply)
+                    self.assertRegex(reply.lower(), "длин.*(?:таблиц|сетк)|(?:таблиц|сетк).*длин")
+                    self.assertNotRegex(reply.lower(), "обхват|маломер|карлик|175 см|видеонаблюдени")
+                    self.assertFalse(ReplyService(NoKnowledge()).validate(reply, item))
+        self.assertEqual(len(DEFAULT_PHRASES["height_limit"]), 2)
+        self.assertNotIn("height_limit", analyze(review("Длина подошла на рост 175")).aspects)
+
+    def test_alevtina_and_asker_declared_color_replies(self):
+        for sample, name in (("Цвет совершенно не соответствует заявленному", "Алевтина"),
+                             ("Цвет не соответствует по факту!", "Аскер")):
+            for status in ("buyout", "rejected"):
+                with self.subTest(sample=sample, status=status):
+                    item = review(sample, rating=2, status=status, name=name, id=name + status,
+                                  product="Джинсы синие")
+                    reply, facts = self.composer.compose(item)
+                    self.assertIn("declared_color_mismatch", facts.aspects)
+                    self.assertNotIn("wrong_color_received", facts.aspects)
+                    self.assertIn(name, reply)
+                    self.assertRegex(reply.lower(), "цвет|оттенок")
+                    self.assertIn("освещени", reply.lower())
+                    self.assertRegex(reply.lower(), "проверим|сверим")
+                    self.assertNotRegex(reply.lower(), "пересорт|подмен|пвз|видеонаблюдени|исключен")
+                    self.assertFalse(ReplyService(NoKnowledge()).validate(reply, item))
+        self.assertEqual(len(DEFAULT_PHRASES["declared_color_mismatch"]), 2)
+        self.assertNotIn("declared_color_mismatch", analyze(review("Цвет соответствует заявленному")).aspects)
+
+    def test_vera_waist_measurement_reply(self):
+        sample = "Размерная сетка не точная. Джинсы в талии 100 см."
+        for status in ("buyout", "rejected"):
+            with self.subTest(status=status):
+                item = review(sample, rating=2, status=status, name="Вера", id=status)
+                reply, facts = self.composer.compose(item)
+                self.assertIn("waist_grid_mismatch", facts.aspects)
+                self.assertIn("Вера", reply)
+                self.assertRegex(reply.lower(), "талии|талия")
+                self.assertIn("пару сантиметров", reply)
+                self.assertNotRegex(reply.lower(), "именно ваш|вашего заказа|обхват бедер|пвз|пересорт")
+                self.assertFalse(ReplyService(NoKnowledge()).validate(reply, item))
+        self.assertEqual(len(DEFAULT_PHRASES["waist_grid_mismatch"]), 2)
+        self.assertNotIn("waist_grid_mismatch", analyze(review("Джинсы в талии 100 см, всё подошло")).aspects)
+
+    def test_lusine_unclear_disadvantages_reply(self):
+        sample = "Недостатки: 11111222222344"
+        for status in ("buyout", "rejected"):
+            with self.subTest(status=status):
+                item = review(sample, rating=2, status=status, name="Lusine", id=status)
+                reply, facts = self.composer.compose(item)
+                self.assertIn("unclear_disadvantages", facts.aspects)
+                self.assertIn("Lusine", reply)
+                self.assertRegex(reply.lower(), "уточните|подскажите")
+                self.assertNotRegex(reply.lower(), "размер|цвет|брак|возврат|видеонаблюдени")
+                self.assertFalse(ReplyService(NoKnowledge()).validate(reply, item))
+        self.assertEqual(len(DEFAULT_PHRASES["unclear_disadvantages"]), 2)
+        self.assertNotIn("unclear_disadvantages", analyze(review("Недостатки: 123")).aspects)
+
+    def test_new_scenario_phrase_store_override(self):
+        self.phrases.update("height_limit", ["Сверьте длину в таблице замеров."])
+        self.assertIn("Сверьте длину в таблице замеров.", self.text("Маленький рост (((", rating=2))
 
     def test_positive_reviews_are_not_complaints(self):
         for t in ("Отличные джинсы!!! Рекомендую!!!", "После 3 стирок как новые, катышков нет", "Ужасно понравились, сидят идеально"):
