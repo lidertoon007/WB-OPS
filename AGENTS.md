@@ -7,6 +7,7 @@
 - Аналитика — `analitika.md`.
 - Номенклатура и себестоимость — `nomenklatura.md`.
 - Отзывы — `otzivi.md`.
+- Вопросы и индивидуальные ответы — `voprosi.md`.
 - Остатки FBS и поставки — `stock.md`.
 - Финансы, ОПиУ и PnL — `opiu/PnL.md`.
 
