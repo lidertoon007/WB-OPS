@@ -39,16 +39,16 @@ window.WBOPSRepricer = (() => {
     const matches = st.catalog.filter(item => [key(item.vendor), key(item.nm_id), key(label(item))].includes(key(value)));
     return matches.length === 1 ? matches[0] : null;
   }
-  const empty = row => ['article', 'expected_current', 'target_base', 'target_price'].every(field => row[field] == null || row[field] === '');
+  const empty = row => ['article', 'target_base', 'target_price'].every(field => row[field] == null || row[field] === '');
   const locked = row => st.checking || (st.job?.entries || []).some(entry => entry.uid === row.uid);
   function validation(row) {
     if (!row.article?.trim()) return 'Укажите артикул';
     const item = selected(row.article, row.id);
     if (!item && (!row.id || st.catalog.length)) return 'Артикул не найден или неоднозначен — выберите товар из списка';
     if (item) row.id = item.id;
-    const values = [row.expected_current, row.target_base, row.target_price].map(number);
-    if (values.some(value => !Number.isFinite(value) || value <= 0)) return 'Заполните все три цены положительными числами';
-    if (values[1] < 1 || values[1] < values[2]) return 'Цена до скидки должна быть не меньше цены после скидки';
+    const values = [row.target_base, row.target_price].map(number);
+    if (values.some(value => !Number.isFinite(value) || value <= 0)) return 'Заполните две целевые цены положительными числами';
+    if (values[0] < 1 || values[0] < values[1]) return 'Цена до скидки должна быть не меньше цены после скидки';
     return '';
   }
   function status(row, state, text) { row.state = state; row.status = text; }
@@ -70,7 +70,7 @@ window.WBOPSRepricer = (() => {
     if (!body) return;
     body.innerHTML = st.rows.map(row => {
       const disabled = locked(row) ? 'disabled' : '';
-      const input = (field, title, article = false) => `<input data-field="${field}" name="${field}" value="${esc(row[field])}" ${article ? 'list="pcArticles" autocomplete="off" placeholder="Артикул или WB ID"' : 'inputmode="decimal" placeholder="0"'} aria-label="${title}" ${disabled}>`;
+      const input = (field, title, article = false) => `<input data-field="${field}" name="${field}" value="${esc(row[field])}" ${field === 'expected_current' ? 'readonly aria-readonly="true" style="background:#f8fafc;color:#64748b" placeholder="Из WB"' : article ? 'list="pcArticles" autocomplete="off" placeholder="Артикул или WB ID"' : 'inputmode="decimal" placeholder="0"'} aria-label="${title}" ${disabled}>`;
       return `<tr data-row="${esc(row.uid)}"><td>${input('article', 'Артикул', true)}</td><td>${input('expected_current', 'Цена сейчас')}</td>
         <td>${input('target_base', 'Цена до скидки')}</td><td>${input('target_price', 'Цена после скидки')}</td>
         <td><span data-status class="pc-status ${row.state === 'error' ? 'pc-error' : row.state === 'done' ? 'pc-done' : ''}">${esc(row.status || 'Заполните строку')}</span></td>
@@ -85,7 +85,13 @@ window.WBOPSRepricer = (() => {
   async function loadCatalog(fresh = false) {
     const data = await api('/api/repricer' + (fresh ? '?fresh=true' : ''));
     st.catalog = data.rows || [];
+    st.rows.forEach(row => {
+      const item = selected(row.article, row.id);
+      if (item) row.id = item.id;
+      row.expected_current = item?.price_before_spp ?? '';
+    });
     drawCatalog();
+    save(); drawTable();
     return data;
   }
   function addRow(source = {}) {
@@ -105,7 +111,7 @@ window.WBOPSRepricer = (() => {
       <datalist id="pcArticles" data-articles></datalist><div class="pc-scroll"><table class="pc-table">
         <thead><tr><th>Артикул</th><th>Цена сейчас</th><th>Цена до скидки</th><th>Цена после скидки</th><th>Статус</th><th></th></tr></thead>
         <tbody data-table-body></tbody></table></div><div class="pc-note" data-note role="status" aria-live="polite"></div>
-      <p class="muted pc-help">Цена сейчас — контрольное значение. Перед запуском сервис проверяет актуальную цену WB. Если она отличается, появится предупреждение.</p>
+      <p class="muted pc-help">Цена сейчас загружается автоматически из WB. В Excel эту колонку заполнять не нужно. Перед запуском сервис обновляет данные.</p>
       <style>.pc-page h2{margin-top:0}.pc-actions{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0}.pc-upload{cursor:pointer}.pc-scroll{overflow-x:auto;border:1px solid #e5e7eb;border-radius:10px}.pc-table{width:100%;border-collapse:collapse;min-width:880px}.pc-table th{text-align:left;background:#f8fafc;font-size:12px;padding:12px;white-space:nowrap}.pc-table td{padding:10px;border-top:1px solid #e5e7eb;vertical-align:top}.pc-table th:first-child{width:28%}.pc-table th:nth-child(5){width:24%}.pc-table input{width:100%;min-width:100px;box-sizing:border-box;padding:10px;border:1px solid #d1d5db;border-radius:7px;font:inherit;font-size:13px}.pc-table td:first-child input{min-width:210px}.pc-table input:disabled{background:#f3f4f6;color:#6b7280}.pc-status{display:block;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;padding:6px 0}.pc-error{color:#b91c1c}.pc-done{color:#15803d}.pc-remove{border:0;background:none;color:#6b7280;cursor:pointer;font-size:23px;padding:4px}.pc-note{white-space:pre-wrap;line-height:1.5;margin-top:16px}.pc-help{font-size:12px;margin-top:18px}</style>`;
     root.querySelector('[data-add]').onclick = () => { addRow(); save(); drawTable(); root.querySelector('tr:last-child [data-field=article]')?.focus(); };
     root.querySelector('[data-template]').onclick = downloadTemplate;
@@ -115,7 +121,7 @@ window.WBOPSRepricer = (() => {
     body.oninput = event => {
       const field = event.target.dataset.field, tr = event.target.closest('[data-row]');
       const row = st.rows.find(item => item.uid === tr?.dataset.row);
-      if (!row || !field || locked(row)) return;
+      if (!row || !field || field === 'expected_current' || locked(row)) return;
       row[field] = event.target.value;
       if (field === 'article') {
         const item = selected(row.article);
@@ -188,7 +194,8 @@ window.WBOPSRepricer = (() => {
   }
   function change(row) {
     const target = number(row.target_price);
-    return {id: row.id, first_price: true, expected_current: number(row.expected_current),
+    const current = number(row.expected_current);
+    return {id: row.id, first_price: true, expected_current: Number.isFinite(current) && current > 0 ? current : undefined,
       target_base: number(row.target_base), target_price: target, new_price: target};
   }
   async function startAll() {
@@ -206,6 +213,7 @@ window.WBOPSRepricer = (() => {
     st.checking = true;
     rows.forEach(row => status(row, 'checking', 'Проверяется')); save(); drawTable(); note('Проверяем актуальные цены WB…');
     try {
+      await loadCatalog(true);
       const changes = rows.map(change);
       const result = await api('/api/repricer/preview', {method: 'POST', body: {changes}});
       const checked = new Map((result.items || []).map(item => [item.id, item]));

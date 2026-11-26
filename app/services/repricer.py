@@ -328,17 +328,21 @@ class Repricer:
         if paired_target:
             try:
                 requested_base = float(ch["target_base"])
-                expected = float(ch["expected_current"])
                 if not math.isfinite(requested_base) or requested_base < 1 or requested_base < target:
                     raise ValueError
-                if not math.isfinite(expected) or expected <= 0:
-                    raise ValueError
             except (ValueError, TypeError, KeyError):
-                res["errors"].append("Проверьте «Цена сейчас» и целевые цены: они должны быть больше нуля; цена до скидки не меньше цены после скидки")
+                res["errors"].append("Проверьте целевые цены: они должны быть больше нуля; цена до скидки не меньше цены после скидки")
                 return res
             if not r["price_before_spp"] or r["price_before_spp"] <= 0:
                 res["errors"].append("WB не вернул текущую цену товара — повторите обновление позже")
                 return res
+            expected = r["price_before_spp"]
+            try:
+                supplied = float(ch.get("expected_current"))
+                if math.isfinite(supplied) and supplied > 0:
+                    expected = supplied
+            except (ValueError, TypeError):
+                pass
             d = min(99, max(0, round((1 - target / requested_base) * 100)))
             res.update({"discount": d, "target_base": requested_base, "target_price": target, "expected_current": expected})
             if first_price:

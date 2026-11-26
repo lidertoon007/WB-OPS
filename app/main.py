@@ -3091,7 +3091,7 @@ async def repricer_import(file: UploadFile = File(...)) -> dict[str, object]:
         if not any(cell(i) not in (None, "") for i in (i_article, i_current, i_base, i_after)):
             skipped += 1
             continue
-        source_rows[line_no] = {"article": label, "expected_current": cell(i_current), "target_base": cell(i_base), "target_price": cell(i_after)}
+        source_rows[line_no] = {"article": label, "expected_current": None, "target_base": cell(i_base), "target_price": cell(i_after)}
         info = {"id": f"?:{label}", "vendor": label, "line": line_no}
         match = [r for r in rows if label and (str(r["nm_id"]) == label or norm(r.get("vendor")) == norm(label))]
         if not match:
@@ -3100,12 +3100,14 @@ async def repricer_import(file: UploadFile = File(...)) -> dict[str, object]:
         if len(match) != 1:
             changes.append({**info, "error": "найдено несколько товаров — укажите однозначный WB ID или выберите товар вручную"})
             continue
+        current = match[0].get("price_before_spp")
+        source_rows[line_no]["expected_current"] = current
         try:
-            values = [float("".join(str(cell(i)).split()).replace(",", ".")) for i in (i_current, i_base, i_after)]
+            values = [float("".join(str(cell(i)).split()).replace(",", ".")) for i in (i_base, i_after)]
             if any(not (0 < price < float("inf")) for price in values):
                 raise ValueError
-            ch = {**info, "id": match[0]["id"], "first_price": True}
-            ch.update(dict(zip(("expected_current", "target_base", "target_price"), values)))
+            ch = {**info, "id": match[0]["id"], "first_price": True, "expected_current": current}
+            ch.update(dict(zip(("target_base", "target_price"), values)))
             changes.append(ch)
         except (ValueError, OverflowError):
             changes.append({**info, "error": "цена должна быть конечным числом больше нуля"})

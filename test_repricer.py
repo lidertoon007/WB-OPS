@@ -236,6 +236,17 @@ class RepricerTests(unittest.TestCase):
         self.assertTrue(first["confirm"])
         self.assertEqual(len(first["steps"]), 1)
 
+    def test_first_price_current_is_optional_and_invalid_control_values_are_ignored(self):
+        change = {"id": "wb1:111", "first_price": True, "target_base": 10000, "target_price": 5500}
+        for current in (None, "", "не заполнять", 0, -1, float("nan")):
+            supplied = {**change, "expected_current": current} if current is not None else change
+            item = self.r.preview([supplied])[0]
+            self.assertFalse(item["errors"], item)
+            self.assertEqual(item["expected_current"], 5000)
+            self.assertNotIn("current_warning", item)
+        item = self.r.preview([{**change, "expected_current": 4000}])[0]
+        self.assertIn("current_warning", item)
+
 
 class RepricerApiTests(unittest.TestCase):
     @classmethod
@@ -261,10 +272,10 @@ class RepricerApiTests(unittest.TestCase):
         import openpyxl
         owner, remote = TestClient(self.m.app), TestClient(self.m.app, client=("192.168.1.20", 5000))
         self.assertIn(remote.get("/api/repricer").status_code, (401, 403))
-        row = {"id": "wb1:111", "cabinet_id": "wb1", "cabinet": "ИП", "nm_id": 111}
+        row = {"id": "wb1:111", "cabinet_id": "wb1", "cabinet": "ИП", "nm_id": 111, "price_before_spp": 50000}
         wb = openpyxl.Workbook()
         wb.active.append(["Артикул", "Цена сейчас", "Цена до скидки", "Цена после скидки"])
-        wb.active.append([111, 50000, 15000, 9706])
+        wb.active.append([111, None, 15000, 9706])
         wb.active.append([999, 50000, 15000, 9706])
         wb.active.append(["", "", "", ""])
         buf = io.BytesIO()
@@ -281,7 +292,7 @@ class RepricerApiTests(unittest.TestCase):
         self.assertEqual(res["items"][1]["errors"], ["артикул не найден"])
         self.assertEqual([{key: row[key] for key in ("article", "expected_current", "target_base", "target_price")} for row in res["rows"]],
                          [{"article": "111", "expected_current": 50000, "target_base": 15000, "target_price": 9706},
-                          {"article": "999", "expected_current": 50000, "target_base": 15000, "target_price": 9706}])
+                          {"article": "999", "expected_current": None, "target_base": 15000, "target_price": 9706}])
         self.assertEqual(res["rows"][1]["errors"], ["артикул не найден"])
 
     def import_csv(self, text, rows):
@@ -317,6 +328,14 @@ class RepricerApiTests(unittest.TestCase):
             result = self.import_csv(f"Артикул;Цена сейчас;Цена до скидки;Цена после скидки\nde-90;50000;15000;{price}\n", [row])
             self.assertTrue(result["items"][0]["errors"])
 
+    def test_csv_current_column_is_automatically_filled_from_wb(self):
+        row = {"id": "wb1:111", "cabinet_id": "wb1", "cabinet": "ИП", "nm_id": 111, "vendor": "de-90", "price_before_spp": 50000}
+        for current in ("", "любое значение", "-1", "123"):
+            result = self.import_csv(f"Артикул;Цена сейчас;Цена до скидки;Цена после скидки\nde-90;{current};15000;9706\n", [row])
+            self.assertEqual(result["changes"][0]["expected_current"], 50000)
+            self.assertEqual(result["rows"][0]["expected_current"], 50000)
+            self.assertFalse(result["rows"][0]["errors"])
+
     def test_template_and_prices_page(self):
         from fastapi.testclient import TestClient
         import openpyxl
@@ -349,12 +368,12 @@ const source = fs.readFileSync('app/static/repricer.js', 'utf8');
 const storage = new Map(), elements = new Map();
 for (const name of ['data-table-body', 'data-articles', 'data-note', 'data-start', 'data-import', 'data-add', 'data-template']) elements.set('[' + name + ']', {});
 const root = {querySelector: selector => elements.get(selector) || null};
-const row = (uid, id, article) => ({uid, id, article, expected_current: 50000, target_base: 15000, target_price: 9706, state: 'ready', status: 'Готов к запуску'});
+const row = (uid, id, article) => ({uid, id, article, expected_current: '', target_base: 15000, target_price: 9706, state: 'ready', status: 'Готов к запуску'});
 storage.set('wbops.prices.table.v1', JSON.stringify({rows: [row('r1', 'wb1:111', 'A'), row('r2', 'wb1:222', 'B')], job: null}));
 global.localStorage = {getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value)};
 global.window = {confirm: () => true};
 global.setTimeout = () => 1; global.clearTimeout = () => {};
-let capturedBlob, downloaded, previews = 0, applies = 0, polls = 0;
+let capturedBlob, downloaded, previews = 0, applies = 0, polls = 0, catalogReads = 0;
 URL.createObjectURL = blob => { capturedBlob = blob; return 'blob:test'; }; URL.revokeObjectURL = () => {};
 global.document = {body: {append() {}}, createElement: () => ({click() { downloaded = this.download; }, remove() {}})};
 global.FormData = class {append() {}};
@@ -362,11 +381,12 @@ const catalog = [{id: 'wb1:111', vendor: 'A', cabinet: 'ИП', nm_id: 111, price
 const response = (data, code = 200) => ({ok: code === 200, status: code, json: async () => data});
 global.fetch = async (url, opt = {}) => {
   if (url.startsWith('/api/repricer/template')) return response({detail: 'Not Found'}, 404);
-  if (url.startsWith('/api/repricer?') || url === '/api/repricer') return response({rows: catalog, cabinets: [{id: 'wb1'}]});
+  if (url.startsWith('/api/repricer?') || url === '/api/repricer') { catalogReads++; return response({rows: catalog, cabinets: [{id: 'wb1'}]}); }
   if (url === '/api/repricer/preview') {
     previews++;
     const {changes} = JSON.parse(opt.body); assert.equal(changes.length, 2);
     assert.ok(changes.every(change => change.new_price === change.target_price && change.first_price));
+    assert.ok(changes.every(change => change.expected_current === 50000));
     return response({items: changes.map((change, n) => ({id: change.id, errors: previews === 1 && n === 1 ? ['Ошибка цены WB'] : []}))});
   }
   if (url === '/api/repricer/apply') { applies++; return response({id: 21}); }
@@ -385,11 +405,16 @@ global.fetch = async (url, opt = {}) => {
   let body = elements.get('[data-table-body]');
   assert.equal((body.innerHTML.match(/data-row=/g) || []).length, 2);
   assert.match(body.innerHTML, /name="article"/); assert.match(root.innerHTML, /<th>Статус<\/th>/);
+  assert.match(body.innerHTML, /name="expected_current"[^>]*readonly/);
+  assert.match(root.innerHTML, /Цена сейчас загружается автоматически из WB/);
+  body.oninput({target: {dataset: {field: 'expected_current'}, value: '1', closest: () => ({dataset: {row: 'r1'}})}});
+  assert.equal(JSON.parse(storage.get('wbops.prices.table.v1')).rows[0].expected_current, 50000);
   await elements.get('[data-start]').onclick();
   assert.equal(applies, 0); assert.match(body.innerHTML, /Ошибка цены WB/);
   body.oninput({target: {dataset: {field: 'target_price'}, value: '9706', closest: () => ({dataset: {row: 'r2'}, querySelector: () => ({})})}});
   await elements.get('[data-start]').onclick(); await new Promise(setImmediate);
   assert.equal(applies, 1);
+  assert.ok(catalogReads >= 3);
   let saved = JSON.parse(storage.get('wbops.prices.table.v1'));
   assert.equal(saved.job.id, 21); assert.ok(saved.rows.every(item => item.state === 'running'));
   vm.runInThisContext(source); await window.WBOPSRepricer.render(root); await new Promise(setImmediate);
