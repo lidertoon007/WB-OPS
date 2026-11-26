@@ -138,14 +138,14 @@ class RepricerTests(unittest.TestCase):
 
     def test_steps_preserve_discount_and_require_confirmation(self):
         steps = self.r.price_steps(100000, 10000, 50)
-        self.assertEqual([s["new_price"] for s in steps], [26316, 13851, 7290, 5000])
+        self.assertEqual([s["new_price"] for s in steps], [33333.5, 22222.5, 14815, 9877, 6585, 5000])
         before = 50000
         for step in steps:
-            self.assertLessEqual(before / step["new_price"], 1.9)
+            self.assertLessEqual(before / step["new_price"], 1.5)
             before = step["new_price"]
         # Граничные суммы также округляются в сторону меньшего снижения.
-        self.assertEqual(self.r.price_steps(101, 10, 0)[0]["new_base"], 54)
-        self.assertEqual([s["new_base"] for s in self.r.price_steps(2800, 1000, 0)], [1474, 1000])
+        self.assertEqual(self.r.price_steps(101, 10, 0)[0]["new_base"], 68)
+        self.assertEqual([s["new_base"] for s in self.r.price_steps(2800, 1000, 0)], [1867, 1245, 1000])
         for goods in self.r.cache["wb1"]["goods"]:
             if goods["nmID"] == 111:
                 for size in goods["sizes"]:
@@ -158,10 +158,10 @@ class RepricerTests(unittest.TestCase):
             self.r.apply([{"id": "wb1:111", "new_price": 5000}], False)
         op = self.wait_op(self.r.apply([{"id": "wb1:111", "new_price": 5000}], True))
         self.assertEqual((op["status"], op["ok"]), ("Выполнено", 1))
-        self.assertEqual([u["data"][0]["price"] for u in self.fake.uploads], [52632, 27702, 14580, 10000])
+        self.assertEqual([u["data"][0]["price"] for u in self.fake.uploads], [66667, 44445, 29630, 19754, 13170, 10000])
         self.assertTrue(all(u["data"][0]["discount"] == 50 for u in self.fake.uploads))
         self.assertEqual(self.row(111)["price_before_spp"], 5000)
-        self.assertEqual([h["new_price"] for h in self.r.item_history("wb1:111")], [26316, 13851, 7290, 5000])
+        self.assertEqual([h["new_price"] for h in self.r.item_history("wb1:111")], [33333.5, 22222.5, 14815, 9877, 6585, 5000])
 
     def test_chain_stops_at_error_and_keeps_applied_intermediate_price(self):
         uploads = []
@@ -172,11 +172,11 @@ class RepricerTests(unittest.TestCase):
 
         with mock.patch.object(self.r, "_upload", upload):
             op = self.wait_op(self.r.apply([{"id": "wb1:111", "new_price": 500}], True))
-        self.assertEqual(uploads, [2632, 1385.5])
+        self.assertEqual(uploads, [3333.5, 2222.5])
         self.assertEqual((op["status"], op["ok"]), ("Ошибка", 0))
         self.assertIn("Товар в карантине", op["items"]["wb1:111"])
-        self.assertEqual(self.row(111)["price_before_spp"], 2632)
-        self.assertEqual([h["new_price"] for h in self.r.item_history("wb1:111") if h["status"] == "ok"], [2632])
+        self.assertEqual(self.row(111)["price_before_spp"], 3333.5)
+        self.assertEqual([h["new_price"] for h in self.r.item_history("wb1:111") if h["status"] == "ok"], [3333.5])
 
     def test_timeout_and_missing_or_unknown_details_never_succeed(self):
         cab = self.r._cabinet("wb1")
@@ -207,15 +207,22 @@ class RepricerTests(unittest.TestCase):
         self.assertLess(abs(item["new_price"] - 9706), 0.5)
         before = 50000
         for step in item["steps"]:
-            self.assertLessEqual(before / step["new_price"], 1.9)
+            self.assertLessEqual(before / step["new_price"], 1.5)
             before = step["new_price"]
         self.assertEqual(item["steps"][-1]["new_price"], 9705.8)
-        self.assertGreaterEqual(len(item["steps"]), 3)
+        self.assertEqual(len(item["steps"]), 5)
         self.assertFalse(item["errors"], item)
         with self.assertRaises(RepricerError):
             self.r.apply([change], False)
         operation = self.wait_op(self.r.apply([change], True))
         self.assertEqual(operation["status"], "Выполнено")
+        self.assertEqual(len(self.fake.uploads), 5)
+        previous = 50000
+        for upload in self.fake.uploads:
+            payload = upload["data"][0]
+            after = round(payload["price"] * (100 - payload["discount"]) / 100, 2)
+            self.assertLessEqual(previous / after, 1.5)
+            previous = after
         self.assertEqual(self.fake.uploads[-1]["data"][0], {"nmID": 111, "price": 14932, "discount": 35})
         self.assertEqual(self.row(111)["price_before_spp"], 9705.8)
         self.r.ops.clear()
@@ -228,7 +235,7 @@ class RepricerTests(unittest.TestCase):
         goods["discount"] = 0
         for size in goods["sizes"]:
             size.update(price=15000, discountedPrice=15000)
-        change = {"id": "wb1:111", "expected_current": 15000, "target_base": 15000, "target_price": 10000}
+        change = {"id": "wb1:111", "expected_current": 15000, "target_base": 15000, "target_price": 10050}
         ordinary = self.r.preview([change], fresh=True)[0]
         self.assertTrue(any("дневного лимита" in error for error in ordinary["errors"]))
         first = self.r.preview([{**change, "first_price": True}], fresh=True)[0]
@@ -386,7 +393,7 @@ class RepricerApiTests(unittest.TestCase):
 const assert = require('node:assert/strict'), fs = require('node:fs'), vm = require('node:vm');
 const source = fs.readFileSync('app/static/repricer.js', 'utf8');
 const storage = new Map(), elements = new Map();
-for (const name of ['data-table-body', 'data-articles', 'data-note', 'data-start', 'data-import', 'data-add', 'data-template']) elements.set('[' + name + ']', {});
+for (const name of ['data-table-body', 'data-articles', 'data-note', 'data-start', 'data-import', 'data-add', 'data-template', 'data-clear-done', 'data-clear-all']) elements.set('[' + name + ']', {});
 const root = {querySelector: selector => elements.get(selector) || null};
 const row = (uid, id, article) => ({uid, id, article, expected_current: '', target_base: 15000, target_price: 9706, state: 'ready', status: 'Готов к запуску'});
 storage.set('wbops.prices.table.v1', JSON.stringify({rows: [row('r1', 'wb1:111', 'A'), row('r2', 'wb1:222', 'B')], job: null}));
@@ -437,6 +444,10 @@ global.fetch = async (url, opt = {}) => {
   assert.ok(catalogReads >= 3);
   let saved = JSON.parse(storage.get('wbops.prices.table.v1'));
   assert.equal(saved.job.id, 21); assert.ok(saved.rows.every(item => item.state === 'running'));
+  assert.equal(elements.get('[data-clear-done]').disabled, true);
+  assert.equal(elements.get('[data-clear-all]').disabled, true);
+  elements.get('[data-clear-all]').onclick();
+  assert.equal(JSON.parse(storage.get('wbops.prices.table.v1')).rows.length, 2);
   vm.runInThisContext(source); await window.WBOPSRepricer.render(root); await new Promise(setImmediate);
   saved = JSON.parse(storage.get('wbops.prices.table.v1'));
   assert.equal(saved.job, null); assert.match(saved.rows[0].status, /Готово · фактическая цена/);
@@ -465,10 +476,36 @@ global.fetch = async (url, opt = {}) => {
   assert.equal(applies, 2); assert.equal(saved.job, null);
   assert.ok(saved.rows.every(item => item.state === 'done'));
   assert.match(elements.get('[data-note]').textContent, /Все цены уже установлены/);
+  storage.set('wbops.prices.table.v1', JSON.stringify({rows: [
+    {...row('done', 'wb1:111', 'A'), state: 'done'}, {...row('success', 'wb1:111', 'A'), state: 'success'},
+    {...row('error', 'wb1:222', 'B'), state: 'error', status: 'Ошибка WB'}, row('ready', 'wb1:222', 'B')
+  ], job: null}));
+  vm.runInThisContext(source); await window.WBOPSRepricer.render(root);
+  assert.equal(elements.get('[data-clear-done]').disabled, false);
+  elements.get('[data-clear-done]').onclick();
+  saved = JSON.parse(storage.get('wbops.prices.table.v1'));
+  assert.deepEqual(saved.rows.map(item => item.uid), ['error', 'ready']);
+  assert.equal(saved.rows[0].status, 'Ошибка WB');
+  elements.get('[data-clear-all]').onclick();
+  saved = JSON.parse(storage.get('wbops.prices.table.v1'));
+  assert.equal(saved.rows.length, 1); assert.equal(saved.rows[0].article, ''); assert.equal(saved.job, null);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
         result = subprocess.run(["node", "-e", script], cwd=Path(__file__).parent, capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_local_launcher_checks_health_before_environment_and_uvicorn_start(self):
+        launcher = (Path(__file__).parent / "start_wb_ops.bat").read_text(encoding="utf-8")
+        health = launcher.index("http://127.0.0.1:8000/health")
+        environment = launcher.index('if not exist ".venv\\Scripts\\python.exe"')
+        launch = launcher.index("-m uvicorn app.main:app")
+        self.assertLess(health, environment)
+        self.assertLess(environment, launch)
+        preflight = launcher[health:environment]
+        for text in ("-TimeoutSec 2", "StatusCode -eq 200", "if not errorlevel 1", "exit /b 0", "Повторный запуск не требуется"):
+            self.assertIn(text, preflight)
+        self.assertIn('-m pip install -q -e .', launcher)
+        self.assertIn('--host 127.0.0.1 --port 8000', launcher)
 
 
 if __name__ == "__main__":

@@ -406,13 +406,13 @@ class Repricer:
 
     @staticmethod
     def price_steps(old_base, new_base, discount, old_after=None) -> list:
-        """Эвристика для больших снижений: шаги не более 1.9× с запасом на округление."""
+        """Эвристика для больших снижений: шаги не более 1.5× с запасом на округление."""
         factor = 100 - int(discount)
         current = round(float(old_after) * 100) if old_after is not None else int(old_base or 0) * factor
         target = new_base * factor
         bases = []
-        while current * 10 > target * 19:
-            base = max(new_base, (current * 10 + factor * 19 - 1) // (factor * 19))
+        while current * 2 > target * 3:
+            base = max(new_base, (current * 2 + factor * 3 - 1) // (factor * 3))
             bases.append(base)
             current = base * factor
         if not bases or bases[-1] != new_base:

@@ -3,6 +3,14 @@ setlocal
 
 cd /d "%~dp0"
 
+rem Не запускать второй экземпляр, если локальный WB OPS уже отвечает.
+powershell -NoProfile -Command "try { $wbHealth = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 2; if ($wbHealth.StatusCode -eq 200) { exit 0 } } catch {}; exit 1" >nul 2>&1
+if not errorlevel 1 (
+    echo WB OPS уже работает: http://127.0.0.1:8000
+    echo Повторный запуск не требуется.
+    exit /b 0
+)
+
 if not exist ".venv\Scripts\python.exe" (
     echo Не найдено виртуальное окружение .venv.
     echo Создайте его командой: python -m venv .venv

@@ -64,6 +64,8 @@ window.WBOPSRepricer = (() => {
     start.textContent = count ? `Запустить все готовые (${count})` : 'Запустить все готовые';
     root.querySelector('[data-import]').disabled = !!st.job || st.checking || st.importing;
     root.querySelector('[data-add]').disabled = st.checking || st.importing;
+    root.querySelector('[data-clear-done]').disabled = !!st.job || st.checking || st.importing;
+    root.querySelector('[data-clear-all]').disabled = !!st.job || st.checking || st.importing;
   }
   function drawTable() {
     const body = root?.querySelector('[data-table-body]');
@@ -107,6 +109,8 @@ window.WBOPSRepricer = (() => {
       <div class="pc-actions"><button type="button" class="btn secondary" data-template>Скачать шаблон Excel</button>
         <label class="btn secondary pc-upload">Загрузить Excel<input type="file" accept=".xlsx,.csv" data-import hidden></label>
         <button type="button" class="btn secondary" data-add>Добавить строку</button>
+        <button type="button" class="btn secondary" data-clear-done>Очистить готовые</button>
+        <button type="button" class="btn secondary" data-clear-all>Очистить всё</button>
         <button type="button" class="btn" data-start>Запустить все готовые</button></div>
       <datalist id="pcArticles" data-articles></datalist><div class="pc-scroll"><table class="pc-table">
         <thead><tr><th>Артикул</th><th>Цена сейчас</th><th>Цена до скидки</th><th>Цена после скидки</th><th>Статус</th><th></th></tr></thead>
@@ -114,6 +118,8 @@ window.WBOPSRepricer = (() => {
       <p class="muted pc-help">Цена сейчас загружается автоматически из WB. В Excel эту колонку заполнять не нужно. Перед запуском сервис обновляет данные.</p>
       <style>.pc-page h2{margin-top:0}.pc-actions{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0}.pc-upload{cursor:pointer}.pc-scroll{overflow-x:auto;border:1px solid #e5e7eb;border-radius:10px}.pc-table{width:100%;border-collapse:collapse;min-width:880px}.pc-table th{text-align:left;background:#f8fafc;font-size:12px;padding:12px;white-space:nowrap}.pc-table td{padding:10px;border-top:1px solid #e5e7eb;vertical-align:top}.pc-table th:first-child{width:28%}.pc-table th:nth-child(5){width:24%}.pc-table input{width:100%;min-width:100px;box-sizing:border-box;padding:10px;border:1px solid #d1d5db;border-radius:7px;font:inherit;font-size:13px}.pc-table td:first-child input{min-width:210px}.pc-table input:disabled{background:#f3f4f6;color:#6b7280}.pc-status{display:block;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;padding:6px 0}.pc-error{color:#b91c1c}.pc-done{color:#15803d}.pc-remove{border:0;background:none;color:#6b7280;cursor:pointer;font-size:23px;padding:4px}.pc-note{white-space:pre-wrap;line-height:1.5;margin-top:16px}.pc-help{font-size:12px;margin-top:18px}</style>`;
     root.querySelector('[data-add]').onclick = () => { addRow(); save(); drawTable(); root.querySelector('tr:last-child [data-field=article]')?.focus(); };
+    root.querySelector('[data-clear-done]').onclick = () => clearRows(false);
+    root.querySelector('[data-clear-all]').onclick = () => clearRows(true);
     root.querySelector('[data-template]').onclick = downloadTemplate;
     root.querySelector('[data-import]').onchange = importFile;
     root.querySelector('[data-start]').onclick = startAll;
@@ -150,6 +156,12 @@ window.WBOPSRepricer = (() => {
       buttons();
     } catch (error) { note(error.message, true); }
     if (st.job) { note('Изменение цен выполняется.'); poll(); }
+  }
+  function clearRows(all) {
+    if (st.job || st.checking || st.importing) return;
+    st.rows = all ? [] : st.rows.filter(row => row.state !== 'done' && row.state !== 'success');
+    if (!st.rows.length) addRow();
+    save(); drawTable(); note(all ? 'Таблица очищена.' : 'Готовые строки удалены.');
   }
   async function downloadTemplate(event) {
     const button = event.currentTarget;
