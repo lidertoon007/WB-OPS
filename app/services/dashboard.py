@@ -340,10 +340,18 @@ class Dashboard:
         # С фильтром по товарам — затраты кампаний по артикулам. Удержания (t["ads"]) остаются в «К перечислению».
         spend = self.ad_spend(start.isoformat(), end.isoformat(), cabinet) if with_ads and self.mp == "wb" else None
         if spend is not None:
-            if filtered:
-                t["ads_spend"] = -sum(v for (_, art), v in spend["by_article"].items() if self._match(art, brand, category, articles))
-            else:
-                t["ads_spend"] = -sum(spend["by_day"].values())
+            t["promo_balance"] = spend.get("bonus_balance", 0)
+            t["promo_packages"] = spend.get("promo_packages", [])
+            t["promo_updated_at"] = spend.get("promo_updated_at")
+            t["promo_inflow"] = spend.get("promo_inflow", 0)
+            t["promo_source"] = spend.get("promo_source")
+            if spend.get("available", True):
+                if filtered:
+                    t["ads_spend"] = -sum(v for (_, art), v in spend["by_article"].items() if self._match(art, brand, category, articles))
+                else:
+                    t["ads_spend"] = -sum(spend["by_day"].values())
+                    # Кэшбэк не имеет артикула: учитываем только для всего кабинета/всех кабинетов.
+                    t["promo_bonus"] = sum(spend.get("bonus_by_day", {}).values())
         return dict(t)
 
     def by_article(self, start: date, end: date) -> dict[str, dict]:
@@ -404,12 +412,13 @@ class Dashboard:
         # Маркетинг Ozon (OZON_MARKETING) на дашборде входит в рекламу, на Главной показывается отдельно.
         marketing = t.get("marketing", 0)
         promo = t.get("ads_spend", t.get("ads_promo", 0)) + marketing
-        ads = promo
+        bonus = t.get("promo_bonus", 0)
+        ads = promo + bonus              # чистый рекламный расход после оплаты бонусами
         other = t.get("other", 0) + t.get("advance", 0) + t.get("ads", 0)
-        expenses = withheld - t.get("ads_promo", 0) - marketing + promo
+        expenses = withheld - t.get("ads_promo", 0) - marketing + ads
         cogs, prep, tax = -t.get("cogs", 0), -t.get("prep", 0), -t.get("tax", 0)
         retro = t.get("retro", 0)                       # ретро-бонусы производителей — доход, «+»
-        profit = net - t.get("ads_promo", 0) - marketing + promo + cogs + retro + prep + tax
+        profit = net - t.get("ads_promo", 0) - marketing + ads + cogs + retro + prep + tax
         sold = t.get("sold_qty", 0)
         days = max(1, t.get("days", 1))
         pct = lambda v, base: (v / base * 100) if base else None
@@ -420,7 +429,12 @@ class Dashboard:
             "orders_sum": t.get("orders_sum", 0), "orders_qty": t.get("orders_qty", 0), "cancel_qty": t.get("cancel_qty", 0),
             "revenue": revenue, "sold_qty": sold, "return_qty": t.get("return_qty", 0), "net_qty": t.get("net_qty", 0),
             "paid": t.get("paid", 0),
-            "ads": ads, "ads_source": "spend" if "ads_spend" in t else "withheld", "ads_withheld": t.get("ads_promo", 0),
+            "ads": ads, "ads_gross": promo, "promo_bonus": bonus,
+            "promo_balance": t.get("promo_balance", 0),
+            "promo_packages": t.get("promo_packages", []), "promo_updated_at": t.get("promo_updated_at"),
+            "promo_inflow": t.get("promo_inflow", 0), "promo_source": t.get("promo_source"),
+            "promo_bonus_pct": pct(bonus, revenue),
+            "ads_source": "spend" if "ads_spend" in t else "withheld", "ads_withheld": t.get("ads_promo", 0),
             "ads_only": ads - marketing, "marketing": marketing,
             "drr": pct(-ads, revenue), "drr_orders": pct(-ads, t.get("orders_sum", 0)),
             "cost_per_order": (-ads / t["orders_qty"]) if t.get("orders_qty") else None,

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from collections import defaultdict
@@ -35,6 +36,10 @@ CLUSTER_DAYS = 30        # поисковые кластеры — за 30 дн�
 KEEP_DAYS = 400
 STATUS = {4: "Готова к запуску", 7: "Завершена", 8: "Отклонена", 9: "Активна", 11: "На паузе", -1: "Удаляется"}
 APPS = {1: "Сайт", 32: "Android", 64: "iOS"}
+# Резерв для старого ответа WB без bonus/cashbacks: подтверждённое владельцем начисление.
+# 27.08 — первая доступная операция «Кэшбэк», а не дата начисления.
+# После первого полного ответа /adv/v1/balance остаток берётся только из API.
+PROMO_BONUS_LEDGER = ({"account": "ИП Нгуен", "total": 2_000_000.0, "since": "2026-08-27"},)
 
 
 def _r(v) -> str:
@@ -70,6 +75,10 @@ class AdsAnalytics:
             CREATE INDEX IF NOT EXISTS ads_clusters_day ON ads_clusters(day);
             CREATE TABLE IF NOT EXISTS ads_upd (account TEXT, advert_id INTEGER, upd_time TEXT, upd_num INTEGER, camp_name TEXT, amount REAL,
                 source TEXT, PRIMARY KEY (account, advert_id, upd_time, upd_num, amount));
+            CREATE TABLE IF NOT EXISTS ads_promo_snapshots (account TEXT NOT NULL, at TEXT NOT NULL, balance REAL, bonus REAL,
+                packages_json TEXT NOT NULL, cashback_spend_total REAL NOT NULL, inflow REAL NOT NULL, source TEXT NOT NULL,
+                PRIMARY KEY (account, at));
+            CREATE INDEX IF NOT EXISTS ads_promo_snapshots_latest ON ads_promo_snapshots(account, at DESC);
             """)
 
     # ------------------------------------------------------------------ запросы к WB
@@ -142,6 +151,17 @@ class AdsAnalytics:
                 if aid and aid not in seen:
                     changes[aid] = (group.get("status"), str(adv.get("changeTime") or ""))
         if not changes:
+            # У нового кабинета может ещё не быть кампаний, но бонусы уже начислены.
+            # Если кампании есть, это второй ключ того же продавца — не удваиваем снимок.
+            if not any(group.get("advert_list") for group in count.get("adverts") or []):
+                try:
+                    bal = self._req(client, "GET", BALANCE_URL, token, f"balance:{tk}", 1.1) or {}
+                    self.store.set_setting(f"ads_balance:{account}", json.dumps({"balance": bal.get("balance"), "net": bal.get("net"),
+                                                                               "bonus": bal.get("bonus"), "cashbacks": bal.get("cashbacks"),
+                                                                               "at": datetime.now(MSK).isoformat(timespec="minutes")}))
+                    self._record_promo_snapshot(account, bal)
+                except AdsError:
+                    self._record_promo_snapshot(account, None)
             return
         seen.update(changes)
         today = datetime.now(MSK).date()
@@ -237,9 +257,11 @@ class AdsAnalytics:
             with self.store._connect() as c:
                 c.executemany("UPDATE ads_campaigns SET budget=? WHERE id=?",
                               [(float(a.get("total") or 0), a.get("advertId")) for a in data.get("adverts") or []])
+        bal = None
         try:
             bal = self._req(client, "GET", BALANCE_URL, token, f"balance:{tk}", 1.1) or {}
-            self.store.set_setting(f"ads_balance:{account}", json.dumps({"balance": bal.get("balance"), "net": bal.get("net"), "bonus": bal.get("bonus"),
+            self.store.set_setting(f"ads_balance:{account}", json.dumps({"balance": bal.get("balance"), "net": bal.get("net"),
+                                                                       "bonus": bal.get("bonus"), "cashbacks": bal.get("cashbacks"),
                                                                        "at": datetime.now(MSK).isoformat(timespec="minutes")}))
         except AdsError:
             pass
@@ -256,6 +278,7 @@ class AdsAnalytics:
                                 float(u.get("updSum") or 0), u.get("paymentType") or "") for u in data if isinstance(u, dict)])
             ustart = uend + timedelta(days=1)
         self.store.set_setting(f"ads_since:{account}", today.isoformat())
+        self._record_promo_snapshot(account, bal)
 
     def _trim(self):
         edge = (date.today() - timedelta(days=KEEP_DAYS)).isoformat()
@@ -277,25 +300,144 @@ class AdsAnalytics:
                 pass
         return out
 
+    @staticmethod
+    def _promo_packages(raw) -> list[dict]:
+        """Нормализованные пакеты из /adv/v1/balance; net — обычные деньги, не бонусы."""
+        if not isinstance(raw, list):
+            return []
+        packages = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                amount = float(item.get("sum"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(amount) or amount < 0:
+                continue
+            packages.append({"sum": amount, "percent": item.get("percent"),
+                             "expiration_date": item.get("expiration_date") or None})
+        return packages
+
+    @staticmethod
+    def _active_packages(packages: list[dict], at: datetime) -> list[dict]:
+        active = []
+        for item in packages:
+            expiry = item.get("expiration_date")
+            if expiry:
+                try:
+                    end = datetime.fromisoformat(str(expiry).replace("Z", "+00:00"))
+                    if end.tzinfo is None:
+                        end = end.replace(tzinfo=MSK)
+                    if end <= at:
+                        continue
+                except ValueError:
+                    pass  # Неизвестный формат даты не должен скрывать действующий пакет.
+            active.append(item)
+        return active
+
+    @staticmethod
+    def _cashback_total(c, account: str, since: str | None = None) -> float:
+        # Та же идентичность списания, что в spend(): повторный ключ продавца не удваивает расход.
+        where = " AND substr(upd_time,1,10)>=?" if since else ""
+        args = [account, since] if since else [account]
+        return float(c.execute("SELECT COALESCE(SUM(amount),0) FROM (SELECT DISTINCT advert_id, upd_time, upd_num, amount "
+                               f"FROM ads_upd WHERE account=? AND source='Кэшбэк'{where})", args).fetchone()[0] or 0)
+
+    @staticmethod
+    def _promo_credit(account: str) -> dict | None:
+        return next((entry for entry in PROMO_BONUS_LEDGER if entry["account"] == account), None)
+
+    def _record_promo_snapshot(self, account: str, response: dict | None) -> None:
+        """После синхронизации списаний фиксируем баланс и вычисляем новое начисление по дельте."""
+        now = datetime.now(MSK)
+        packages = self._promo_packages((response or {}).get("cashbacks"))
+        raw_bonus = (response or {}).get("bonus")
+        try:
+            bonus = float(raw_bonus) if raw_bonus is not None else None
+        except (TypeError, ValueError):
+            bonus = None
+        if bonus is not None and (not math.isfinite(bonus) or bonus < 0):
+            bonus = None
+        credit = self._promo_credit(account)
+        with self.store._connect() as c:
+            spent = self._cashback_total(c, account, credit["since"] if credit else None)
+            previous = c.execute("SELECT balance, cashback_spend_total, packages_json, source FROM ads_promo_snapshots "
+                                 "WHERE account=? AND balance IS NOT NULL ORDER BY at DESC LIMIT 1", (account,)).fetchone()
+            if packages:
+                source, balance = "cashbacks", sum(p["sum"] for p in self._active_packages(packages, now))
+            elif bonus is not None:
+                source, balance = "bonus", bonus
+            elif credit and (not previous or previous[3] == "bootstrap"):
+                source, balance = "bootstrap", max(0.0, credit["total"] - spent)
+            else:
+                source, balance = "unavailable", None
+            inflow = 0.0
+            # Переход с ручной оценки на первый ответ API — смена источника, не доказанное начисление.
+            if source in ("cashbacks", "bonus") and previous and previous[3] in ("cashbacks", "bonus"):
+                old_balance, old_spent, old_json, old_source = previous
+                if old_source == "cashbacks":
+                    old_balance = sum(p["sum"] for p in self._active_packages(json.loads(old_json), now))
+                inflow = max(0.0, balance - old_balance + max(0.0, spent - old_spent))
+            c.execute("INSERT INTO ads_promo_snapshots VALUES (?,?,?,?,?,?,?,?)",
+                      (account, now.isoformat(timespec="microseconds"), balance, bonus,
+                       json.dumps(packages, ensure_ascii=False), spent, inflow, source))
+
+    def _promo_state(self, c, account: str, now: datetime) -> dict:
+        row = c.execute("SELECT at, balance, packages_json, inflow, source FROM ads_promo_snapshots "
+                        "WHERE account=? AND balance IS NOT NULL ORDER BY at DESC LIMIT 1", (account,)).fetchone()
+        credit = self._promo_credit(account)
+        if row:
+            at, balance, raw_packages, inflow, source = row
+            packages = self._active_packages(json.loads(raw_packages), now) if source == "cashbacks" else []
+            if source == "cashbacks":
+                balance = sum(p["sum"] for p in packages)
+            elif source == "bootstrap" and credit:
+                balance = max(0.0, credit["total"] - self._cashback_total(c, account, credit["since"]))
+            return {"balance": balance, "packages": [{**p, "account": account} for p in packages],
+                    "updated_at": at, "inflow": inflow, "source": source}
+        balance = max(0.0, credit["total"] - self._cashback_total(c, account, credit["since"])) if credit else 0.0
+        return {"balance": balance, "packages": [], "updated_at": None, "inflow": 0.0,
+                "source": "bootstrap" if credit else "unavailable"}
+
     def spend(self, start: str, end: str, account: str | None = None) -> dict | None:
         """Затраты на рекламу для дашборда: {"by_day": {день: ₽ по истории затрат WB}, "by_article": {(день, артикул): ₽
-        по статистике кампаний}}. None — история затрат не загружена или не покрывает начало периода."""
+        по статистике кампаний}, "bonus_by_day": {день: ₽, списанные с кэшбэка WB}}.
+        Текущий promo balance и пакеты не зависят от выбранного периода."""
         where, args = "", []
         if account:
             where, args = " AND account=?", [account]
         with self.store._connect() as c:
+            names = ([account] if account else sorted({entry["account"] for entry in PROMO_BONUS_LEDGER} |
+                                                {row[0] for row in c.execute("SELECT DISTINCT account FROM ads_promo_snapshots")}))
+            states = [self._promo_state(c, name, datetime.now(MSK)) for name in names]
+            promo = {"bonus_balance": sum(s["balance"] for s in states),
+                     "promo_packages": [p for s in states for p in s["packages"]],
+                     "promo_updated_at": max((s["updated_at"] for s in states if s["updated_at"]), default=None),
+                     "promo_inflow": sum(s["inflow"] for s in states),
+                     "promo_source": ("api" if any(s["source"] in ("cashbacks", "bonus") for s in states)
+                                      else "bootstrap" if any(s["source"] == "bootstrap" for s in states) else "unavailable")}
             first = c.execute(f"SELECT MIN(substr(upd_time,1,10)) FROM ads_upd WHERE 1=1{where}", args).fetchone()[0]
             if not first or first > start:
-                return None
-            # Один продавец под двумя ключами — одно и то же списание не считаем дважды
-            by_day = dict(c.execute("SELECT substr(upd_time,1,10), SUM(amount) FROM (SELECT DISTINCT advert_id, upd_time, upd_num, amount "
-                                    f"FROM ads_upd WHERE substr(upd_time,1,10) BETWEEN ? AND ?{where}) GROUP BY 1", [start, end, *args]).fetchall())
+                return {"by_day": {}, "by_article": {}, "bonus_by_day": {}, **promo,
+                        "available": False} if states and any(s["source"] != "unavailable" for s in states) else None
+            # Один продавец под двумя ключами — одно списание считаем один раз.
+            # «Кэшбэк» — способ оплаты расхода, а не дополнительное начисление на баланс.
+            rows = c.execute("SELECT substr(upd_time,1,10), amount, MAX(CASE WHEN source='Кэшбэк' THEN 1 ELSE 0 END) "
+                             f"FROM ads_upd WHERE substr(upd_time,1,10) BETWEEN ? AND ?{where} "
+                             "GROUP BY advert_id, upd_time, upd_num, amount", [start, end, *args]).fetchall()
             stats = c.execute("SELECT s.day, s.nm_id, SUM(s.spend) FROM ads_stats s LEFT JOIN ads_campaigns k ON k.id=s.advert_id "
                               f"WHERE s.day BETWEEN ? AND ?{where.replace('account', 'k.account')} GROUP BY 1, 2", [start, end, *args]).fetchall()
+        by_day, bonus_by_day = defaultdict(float), defaultdict(float)
+        for day, amount, cashback in rows:
+            by_day[day] += amount or 0
+            if cashback:
+                bonus_by_day[day] += amount or 0
         meta, by_article = self._meta(), defaultdict(float)
         for day, nm, value in stats:
             by_article[(day, art_key((meta.get(nm) or {}).get("article") or f"nmId {nm}"))] += value or 0
-        return {"by_day": by_day, "by_article": dict(by_article)}
+        return {"by_day": dict(by_day), "by_article": dict(by_article), "bonus_by_day": dict(bonus_by_day),
+                **promo, "available": True}
 
     def _campaigns(self) -> dict:
         with self.store._connect() as c:

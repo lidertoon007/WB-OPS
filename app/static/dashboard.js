@@ -15,11 +15,14 @@ window.WBOPSDashboard = (() => {
 
   // Плитки: значение (+ доля), направление «хорошо», подсказка. money — показывать по модулю (расходы).
   const TILES = [
-    {id: 'profit', title: 'Прибыль / Маржинальность', v: 'profit', pct: 'margin', good: 'up', hint: 'Выручка за вычетом возвратов минус все удержания WB, себестоимость, подготовка и налог, плюс ретро-бонусы производителей — как строка «Прибыль» в ОПиУ. Маржинальность — прибыль к выручке.'},
+    {id: 'profit', title: 'Прибыль / Маржинальность', v: 'profit', pct: 'margin', good: 'up', hint: 'Выручка за вычетом возвратов минус удержания WB, чистые затраты на рекламу после использованных промо-бонусов, себестоимость, подготовка и налог, плюс ретро-бонусы производителей. Маржинальность — прибыль к выручке.'},
     {id: 'orders', title: 'Заказы', v: 'orders_sum', qty: 'orders_qty', good: 'up', hint: 'Все заказы покупателей за период (включая будущие отмены), по ценам заказа.'},
     {id: 'sales', title: 'Продажи', v: 'revenue', qty: 'net_qty', good: 'up', hint: 'Выручка по цене продавца за вычетом возвратов и количество выкупленных штук минус возвраты.'},
-    {id: 'ads', title: 'Реклама / ДРР', v: 'ads', pct: 'drr', money: true, good: 'down', by: 'pct', hint: 'Затраты рекламного кабинета за период — как «История затрат» в ЛК WB (раздел «Аналитика рекламы» загружает их сам). С фильтром по товарам — затраты кампаний по артикулам. «К перечислению» считается по фактическим удержаниям WB. ДРР — доля от продаж.'},
-    {id: 'cost_per_order', title: 'Стоимость за заказ', v: 'cost_per_order', digits: 2, good: 'down', hint: 'Расходы на рекламу за период, делённые на количество заказов за тот же период (все заказы, включая будущие отмены). Сравнение — с прошлым периодом: зелёный — заказ стал дешевле, красный — дороже.'},
+    {id: 'ads', title: 'Реклама после бонусов / ДРР', v: 'ads', pct: 'drr', money: true, good: 'down', by: 'pct', hint: 'Чистые затраты на рекламу: списания WB за период минус часть, оплаченная кэшбэком. ДРР — доля от продаж. С фильтром по товарам бонусы без артикула не распределяются.'},
+    {id: 'ads_gross', title: 'Реклама до бонусов', v: 'ads_gross', money: true, good: 'down', hint: 'Все рекламные списания из истории затрат WB до вычета кэшбэка. С фильтром по товарам — расходы кампаний по артикулам.'},
+    {id: 'promo_bonus', title: 'Промо-бонусы WB', v: 'promo_bonus', pct: 'promo_bonus_pct', good: 'up', hint: 'Фактически использованный кэшбэк WB по истории рекламных списаний за выбранные дни. Начисленный, но ещё не потраченный остаток не увеличивает прибыль. Бонусы не распределяются по товарам.'},
+    {id: 'promo_balance', title: 'Остаток промо-бонусов', v: 'promo_balance', fixed: true, hint: 'Последний баланс промо-бонусов из API WB, обновляется при синхронизации рекламы. Пакеты имеют срок действия. Если API ещё не вернул бонусы, используется подтверждённый резервный расчёт для ИП Нгуен. Остаток не зависит от выбранного периода и не увеличивает прибыль.'},
+    {id: 'cost_per_order', title: 'Стоимость за заказ', v: 'cost_per_order', digits: 2, good: 'down', hint: 'Чистые расходы на рекламу после бонусов, делённые на количество заказов за тот же период (все заказы, включая будущие отмены). Сравнение — с прошлым периодом: зелёный — заказ стал дешевле, красный — дороже.'},
     {id: 'net_to_pay', title: 'К перечислению от WB', v: 'net_to_pay', good: 'up', hint: 'Выручка минус все удержания WB плюс компенсации — сколько WB перечислит за период.'},
     {id: 'logistics', title: 'Логистика', v: 'logistics', pct: 'logistics_pct', money: true, good: 'down', by: 'pct', hint: 'Доставка к покупателю, обратная логистика при отменах и возвратах.'},
     {id: 'buyout', title: 'Процент выкупа', pctOnly: 'buyout', good: 'up', hint: 'Как в воронке продаж WB: выкуплено / (выкуплено + отменено) по заказам периода. Нужен доступ ключа к разделу «Аналитика»; если WB не ответил — прочерк.'},
@@ -39,7 +42,7 @@ window.WBOPSDashboard = (() => {
     {id: 'penalty', title: 'Штрафы', v: 'penalty', pct: 'penalty_pct', money: true, good: 'down', hint: 'Штрафы WB, включая хранение возвратов на ПВЗ.'},
     {id: 'compensation', title: 'Компенсации', v: 'compensation', pct: 'compensation_pct', good: 'up', hint: 'Компенсации ущерба и доплаты от WB.'},
     {id: 'avg_paid', title: 'Сред. цена продажи', v: 'avg_price_paid', good: 'up', hint: 'Сколько в среднем заплатил покупатель за штуку (после скидок WB).'},
-    {id: 'drr_orders', title: 'Реклама / ДРРз', v: 'ads', pct: 'drr_orders', money: true, good: 'down', by: 'pct', hint: 'Реклама к сумме заказов.'},
+    {id: 'drr_orders', title: 'Реклама после бонусов / ДРРз', v: 'ads', pct: 'drr_orders', money: true, good: 'down', by: 'pct', hint: 'Чистые затраты на рекламу после бонусов к сумме заказов.'},
     {id: 'log_unit', title: 'Ср. стоимость логистики на 1 шт.', v: 'logistics_unit', good: 'down', hint: 'Вся логистика периода на одну проданную штуку.'},
     {id: 'turn_sales', title: 'Оборачиваемость по прод.', days: 'turnover_sales', good: 'down', hint: 'На сколько дней хватит текущего остатка при темпе продаж (выкупов) периода.'},
     {id: 'turn_orders', title: 'Оборачиваемость по зак.', days: 'turnover_orders', good: 'down', hint: 'На сколько дней хватит текущего остатка при темпе заказов периода.'},
@@ -50,7 +53,9 @@ window.WBOPSDashboard = (() => {
   // Ozon: свои подписи и подсказки там, где WB и Ozon считают по-разному
   const OZON = {
     profit: {hint: 'Выручка за вычетом возвратов минус все начисления Ozon, себестоимость, подготовка и налог, плюс ретро-бонусы производителей — как строка «Прибыль» в ОПиУ. Маржинальность — прибыль к выручке.'},
-    ads: {hint: 'Реклама и продвижение из начислений Ozon: продвижение товара и бренда, оплата за клик, звёздные товары, бейджи, сбор отзывов. ДРР — доля от продаж.'},
+    ads: {title: 'Реклама / ДРР', hint: 'Реклама и продвижение из начислений Ozon: продвижение товара и бренда, оплата за клик, звёздные товары, бейджи, сбор отзывов. ДРР — доля от продаж.'},
+    cost_per_order: {hint: 'Расходы на рекламу за период, делённые на количество заказов за тот же период.'},
+    drr_orders: {title: 'Реклама / ДРРз', hint: 'Реклама к сумме заказов.'},
     net_to_pay: {title: 'К перечислению от Ozon', hint: 'Выручка минус все начисления Ozon плюс компенсации — сколько Ozon перечислит за период.'},
     logistics: {hint: 'Доставка, обработка отправлений, обратная логистика и обработка возвратов и отмен.'},
     buyout: {hint: 'Доля заказанных за период штук без отмен. Воронка Ozon есть только по месяцам, поэтому выкуп считается по заказам; невыкупы после доставки здесь не видны.'},
@@ -65,7 +70,7 @@ window.WBOPSDashboard = (() => {
     cap_cost: {hint: 'Остатки на складах сейчас × себестоимость.'}, cap_retail: {hint: 'Остатки на складах сейчас × текущая цена продавца.'},
   };
   const MP = {wb: {title: 'WB', key: 'wbops.dashboard'}, ozon: {title: 'Ozon', key: 'wbops.dashboard.ozon'}};
-  const tiles = () => mp === 'ozon' ? TILES.filter(t => t.id !== 'acceptance').map(t => ({...t, ...(OZON[t.id] || {}), hint: (OZON[t.id] || {}).hint || t.hint.replace(/\bWB\b/g, 'Ozon')})) : TILES;
+  const tiles = () => mp === 'ozon' ? TILES.filter(t => !['acceptance', 'ads_gross', 'promo_bonus', 'promo_balance'].includes(t.id)).map(t => ({...t, ...(OZON[t.id] || {}), hint: (OZON[t.id] || {}).hint || t.hint.replace(/\bWB\b/g, 'Ozon')})) : TILES;
   let mp = 'wb', st = null, root = null, hidden = new Set();
   function restore() {
     st = {preset: 'week:1', from: '', to: '', cabinet: '', brand: '', category: '', article: '', data: null, poll: null};
@@ -187,7 +192,7 @@ window.WBOPSDashboard = (() => {
     if (c.no_cost_qty > 0) notes.push(`Продано ${fmt(c.no_cost_qty)} шт. товаров без себестоимости — прибыль завышена. Задайте цены в «Товары → Номенклатура и себестоимость».`);
     const t = MP[mp].title;
     if (o.ordered_from && from < o.ordered_from) notes.push(`Заказы ${t} сохранены с ${ru(o.ordered_from)} — за более ранние дни заказы, выкуп и ДРРз не посчитаны.`);
-    if (st.brand || st.category || st.article) notes.push(`С фильтром не учитываются расходы ${t} без артикула: часть рекламы, хранения, подписок и штрафов.`);
+    if (st.brand || st.category || st.article) notes.push(`С фильтром не учитываются расходы ${t} без артикула: часть рекламы, хранения, подписок и штрафов.${mp === 'wb' ? ' Использованные промо-бонусы не распределяются по товарам; их текущий остаток показан отдельно.' : ''}`);
     if (st.data.state?.status === 'running') notes.push(`Подтягиваю свежие данные из кэша ${t} — цифры обновятся сами.`);
     root.querySelector('[data-notes]').innerHTML = notes.map(n => `<div class="db-note">${esc(n)}</div>`).join('');
   }
@@ -222,8 +227,12 @@ window.WBOPSDashboard = (() => {
     } else if (!t.fixed && before == null && base != null) {
       delta = '<span class="db-delta muted">нет данных за прошлый период</span>';
     }
-    return `<article class="db-tile ${cls}" data-tile="${t.id}"><div class="db-title">${esc(t.title)} <span class="db-i" tabindex="0" role="note" title="${esc(t.hint)}" aria-label="${esc(t.hint)}">i</span></div>
-      <div class="db-value ${main.replace(/<[^>]+>/g, '').length > 17 ? 'long' : main.replace(/<[^>]+>/g, '').length > 14 ? 'mid' : ''}">${main}</div>${t.fixed ? '<div class="db-fixed">на сегодня</div>' : `<div class="db-change">${delta}</div>`}</article>`;
+    const packages = t.id === 'promo_balance' ? (c.promo_packages || []) : [];
+    const detail = packages.length ? ` Пакеты: ${packages.map(p => `${p.account}: ${fmt(p.sum)} ₽${p.percent != null ? `, до ${fmt(p.percent)}% пополнения` : ''}${p.expiration_date ? `, до ${ru(String(p.expiration_date).slice(0, 10))}` : ''}`).join('; ')}.` : '';
+    const hint = t.id === 'promo_balance' ? `${t.hint}${detail}${c.promo_inflow ? ` Последнее обнаруженное начисление: ${fmt(c.promo_inflow)} ₽.` : ''}` : t.hint;
+    const fixedLabel = t.id === 'promo_balance' ? (c.promo_source === 'bootstrap' ? 'резервный расчёт' : c.promo_updated_at ? `по данным на ${ru(c.promo_updated_at.slice(0, 10))} ${c.promo_updated_at.slice(11, 16)}` : 'нет снимка API') : 'на сегодня';
+    return `<article class="db-tile ${cls}" data-tile="${t.id}"><div class="db-title">${esc(t.title)} <span class="db-i" tabindex="0" role="note" title="${esc(hint)}" aria-label="${esc(hint)}">i</span></div>
+      <div class="db-value ${main.replace(/<[^>]+>/g, '').length > 17 ? 'long' : main.replace(/<[^>]+>/g, '').length > 14 ? 'mid' : ''}">${main}</div>${t.fixed ? `<div class="db-fixed">${esc(fixedLabel)}</div>` : `<div class="db-change">${delta}</div>`}</article>`;
   }
   function drawGrid() {
     root.querySelector('[data-grid]').innerHTML = tiles().filter(t => !hidden.has(t.id)).map(tileHtml).join('') || '<p class="muted">Все виджеты скрыты — включите их в «Настройке виджетов».</p>';

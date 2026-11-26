@@ -91,6 +91,48 @@ class DashboardTests(unittest.TestCase):
         c = self.db.summary(date(2026, 10, 1), date(2026, 10, 2), brand="Бренд A")["current"]
         self.assertEqual(c["ads"], -500)                                   # с фильтром — по артикулам кампаний
 
+    def test_promo_bonus_offsets_only_used_ad_spend(self):
+        """Бонус — часть рекламного списания: влияет на прибыль, но не на выплату WB."""
+        base = self.db.summary(date(2026, 10, 1), date(2026, 10, 2))["current"]
+
+        def spend(start, end, cabinet):
+            if cabinet and cabinet != CAB:
+                return None
+            return {"by_day": {"2026-10-01": 800}, "bonus_by_day": {"2026-10-01": 300},
+                    "bonus_balance": 466_517, "promo_packages": [{"account": CAB, "sum": 466_517,
+                                                                      "percent": 50, "expiration_date": "2026-12-31"}],
+                    "promo_updated_at": "2026-10-03T12:00:00+03:00", "promo_inflow": 100_000,
+                    "promo_source": "api", "by_article": {("2026-10-01", "A-1"): 500}}
+
+        self.db.ad_spend = spend
+        c = self.db.summary(date(2026, 10, 1), date(2026, 10, 2))["current"]
+        self.assertEqual((c["ads_gross"], c["promo_bonus"], c["ads"]), (-800, 300, -500))
+        self.assertEqual(c["promo_balance"], 466_517)
+        self.assertEqual((c["promo_packages"][0]["percent"], c["promo_inflow"], c["promo_source"]),
+                         (50, 100_000, "api"))
+        self.assertAlmostEqual(c["profit"], base["profit"] + 500)
+        self.assertAlmostEqual(c["drr"], 500 / c["revenue"] * 100)
+        self.assertAlmostEqual(c["cost_per_order"], 500 / c["orders_qty"])
+        self.assertEqual(c["net_to_pay"], base["net_to_pay"])
+        scoped = self.db.summary(date(2026, 10, 1), date(2026, 10, 2), cabinet=CAB)["current"]
+        self.assertEqual(scoped["promo_bonus"], 300)
+        product = self.db.summary(date(2026, 10, 1), date(2026, 10, 2), brand="Бренд A")["current"]
+        self.assertEqual((product["ads"], product["promo_bonus"]), (-500, 0))
+        self.assertEqual(product["promo_balance"], 466_517)
+        self.assertEqual(self.db.summary(date(2026, 9, 30), date(2026, 9, 30))["current"]["promo_balance"], 466_517)
+
+    def test_november_cashback_amount_is_not_full_credit(self):
+        """Из 2 млн начисления в прибыль идёт только 1 406 636 ₽ реально оплаченной рекламы."""
+        gross = self.db.derive({"revenue_sales": 36_181_357.34, "ads_spend": -4_762_789})
+        used = self.db.derive({"revenue_sales": 36_181_357.34, "ads_spend": -4_762_789,
+                               "promo_bonus": 1_406_636})
+        self.assertEqual((used["ads_gross"], used["promo_bonus"], used["ads"]),
+                         (-4_762_789, 1_406_636, -3_356_153))
+        self.assertEqual(used["profit"] - gross["profit"], 1_406_636)
+        with_balance = self.db.derive({"revenue_sales": 36_181_357.34, "ads_spend": -4_762_789,
+                                       "promo_balance": 466_517})
+        self.assertEqual(with_balance["profit"], gross["profit"])
+
     def test_buyout_from_wb_funnel(self):
         """Выкуп — как в воронке WB: выкуплено / (выкуплено + отменено), а не продано / заказано (уходило за 100%)."""
         c = self.db.summary(date(2026, 10, 1), date(2026, 10, 2))["current"]
