@@ -2987,7 +2987,8 @@ def repricer_items_put(body: dict) -> dict[str, object]:
 
 @app.post("/api/repricer/preview")
 def repricer_preview(body: dict) -> dict[str, object]:
-    return {"items": _repricer_call(repricer.preview, body.get("changes"), body.get("mass"), body.get("ids"))}
+    return {"items": _repricer_call(repricer.preview, body.get("changes"), body.get("mass"), body.get("ids"),
+                                    fresh=any("target_base" in c for c in body.get("changes") or []))}
 
 
 @app.post("/api/repricer/apply")
@@ -3033,7 +3034,9 @@ def repricer_export(body: dict):
 
 @app.get("/api/repricer/template")
 def repricer_template():
-    return _table_download({"Цены": [["Артикул", "Цена"]]}, "xlsx", "prices_wb_template")
+    response = _table_download({"Цены": [["Артикул", "Цена сейчас", "Цена до скидки", "Цена после скидки"]]}, "xlsx", "shablon_cen_wb")
+    response.headers["Content-Disposition"] = 'attachment; filename="shablon_cen_wb.xlsx"'
+    return response
 
 
 @app.post("/api/repricer/import")
@@ -3065,14 +3068,11 @@ async def repricer_import(file: UploadFile = File(...)) -> dict[str, object]:
     def col(*names):
         return next((head.index(norm(name)) for name in names if norm(name) in head), None)
 
-    i_shop = col("магазин", "кабинет", "cabinet")
-    i_nm = col("артикул мп", "артикул wb", "nmID", "WB ID")
-    i_vendor = col("артикул продавца", "vendorCode", "vendor code", "offer_id")
     i_article = col("артикул", "article")
-    i_before = col("новая цена после скидки продавца", "новая цена до СПП", "цена", "новая цена", "цена после скидки продавца", "price")
-    i_client = col("новая цена для клиента")
-    if all(i is None for i in (i_nm, i_vendor, i_article)) or (i_before is None and i_client is None):
-        raise HTTPException(400, "Нужны колонки «Артикул» и «Цена» (после скидки продавца). Для выбора кабинета добавьте «Магазин».")
+    i_current, i_base, i_after = col("цена сейчас"), col("цена до скидки"), col("цена после скидки")
+    if any(i is None for i in (i_article, i_current, i_base, i_after)) or len(head) != 4:
+        raise HTTPException(400, "В шаблоне должно быть 4 колонки: «Артикул», «Цена сейчас», «Цена до скидки», «Цена после скидки»")
+    _repricer_call(repricer.refresh_prices)
     rows = repricer.rows()
     changes, skipped = [], 0
 
@@ -3084,36 +3084,24 @@ async def repricer_import(file: UploadFile = File(...)) -> dict[str, object]:
 
     for line_no, line in enumerate(table[1:], start=2):
         cell = lambda i: (line[i] if i is not None and i < len(line) else None)        # noqa: E731,B023
-        nm, vendor, generic = article(cell(i_nm)), article(cell(i_vendor)), article(cell(i_article))
-        label = nm or vendor or generic
-        before, client = cell(i_before), cell(i_client)
-        if not label or (before in (None, "") and client in (None, "")):
+        label = article(cell(i_article))
+        if not any(cell(i) not in (None, "") for i in (i_article, i_current, i_base, i_after)):
             skipped += 1
             continue
-        shop = norm(cell(i_shop))
-        scoped = [r for r in rows if not shop or shop in (norm(r["cabinet_id"]), norm(r["cabinet"]))]
         info = {"id": f"?:{label}", "vendor": label, "line": line_no}
-        if shop and not scoped:
-            changes.append({**info, "error": "магазин не найден или в нём нет загруженных товаров"})
-            continue
-        match = [r for r in scoped if (not nm or str(r["nm_id"]) == nm)
-                 and (not vendor or norm(r.get("vendor")) == norm(vendor))
-                 and (not generic or str(r["nm_id"]) == generic or norm(r.get("vendor")) == norm(generic))]
+        match = [r for r in rows if label and (str(r["nm_id"]) == label or norm(r.get("vendor")) == norm(label))]
         if not match:
             changes.append({**info, "error": "артикул не найден"})
             continue
         if len(match) != 1:
-            changes.append({**info, "error": "найдено несколько товаров — укажите «Магазин» и/или «Артикул МП»"})
+            changes.append({**info, "error": "найдено несколько товаров — укажите однозначный WB ID или выберите товар вручную"})
             continue
         try:
-            price = float("".join(str(before if before not in (None, "") else client).split()).replace(",", "."))
-            if not (0 < price < float("inf")):
+            values = [float("".join(str(cell(i)).split()).replace(",", ".")) for i in (i_current, i_base, i_after)]
+            if any(not (0 < price < float("inf")) for price in values):
                 raise ValueError
-            ch = {**info, "id": match[0]["id"]}
-            if before not in (None, ""):
-                ch["new_price"] = price
-            else:
-                ch["new_client"] = price
+            ch = {**info, "id": match[0]["id"], "first_price": True}
+            ch.update(dict(zip(("expected_current", "target_base", "target_price"), values)))
             changes.append(ch)
         except (ValueError, OverflowError):
             changes.append({**info, "error": "цена должна быть конечным числом больше нуля"})
@@ -3130,7 +3118,8 @@ async def repricer_import(file: UploadFile = File(...)) -> dict[str, object]:
     items = _repricer_call(repricer.preview, good) + [{"id": c["id"], "errors": [c["error"]], "warnings": [], "nm_id": c["id"].split(":")[-1],
                                                      "vendor": c["vendor"], "name": f"Строка {c['line']}"}
                                                       for c in changes if c.get("error")]
-    return {"items": items, "skipped": skipped}
+    accepted = {item["id"] for item in items if not item.get("errors")}
+    return {"items": items, "changes": [{k: c[k] for k in ("id", "expected_current", "target_base", "target_price", "first_price")} for c in good if c["id"] in accepted], "skipped": skipped}
 
 
 # ---------------------------------------------------------------- остатки FBS

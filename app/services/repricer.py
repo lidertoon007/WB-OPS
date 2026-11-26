@@ -134,6 +134,15 @@ class Repricer:
                 time.sleep(0.7)
         return goods
 
+    def refresh_prices(self, ids=None):
+        """Перед расчётом первой цены читаем реальные цены WB без устаревшего кэша."""
+        selected = {str(rid).split(":", 1)[0] for rid in ids or []}
+        for cab in self.wb_cabinets():
+            if selected and cab.id not in selected:
+                continue
+            goods = self._load_goods(cab)
+            self.cache[cab.id] = {**(self.cache.get(cab.id) or {}), "goods": goods, "at": time.time(), "error": ""}
+
     def _load_showcase(self, nm_ids: list) -> dict:
         """nmID -> цена для клиента (после СПП, без Кошелька) с витрины WB."""
         out = {}
@@ -257,8 +266,10 @@ class Repricer:
                     c.execute("UPDATE repricer_items SET max_price=? WHERE cabinet_id=? AND nm_id=?", (max_price, cid, int(nm)))
 
     # ------------------------------------------------------------------ расчёт изменений
-    def preview(self, changes: list | None = None, mass: dict | None = None, ids: list | None = None) -> list:
+    def preview(self, changes: list | None = None, mass: dict | None = None, ids: list | None = None, fresh: bool = False) -> list:
         """changes: [{id, new_price | new_client}] или mass: {kind: before|client, action: set|up|down, unit: rub|pct, value} для ids."""
+        if fresh:
+            self.refresh_prices([c.get("id") for c in changes or []] or ids)
         rows = {r["id"]: r for r in self.rows()}
         econ, cfg = self._econ(), self.settings()
         todo = []
@@ -285,7 +296,7 @@ class Repricer:
         for ch in todo:
             r = rows.get(ch.get("id"))
             if not r:
-                out.append({"id": ch.get("id"), "error": "товар не найден — обновите данные"})
+                out.append({"id": ch.get("id"), "errors": ["товар не найден — обновите данные"], "warnings": []})
                 continue
             out.append(self._check(r, ch, econ, cfg))
         return out
@@ -297,7 +308,7 @@ class Repricer:
         if ch.get("error"):
             res["errors"].append(ch["error"])
             return res
-        target = ch.get("new_price")
+        target = ch.get("target_price", ch.get("new_price"))
         if target in (None, "") and ch.get("new_client") not in (None, ""):
             if not r.get("spp") and r.get("spp") != 0:
                 res["errors"].append("нет данных о СПП — задайте цену до СПП")
@@ -311,7 +322,30 @@ class Repricer:
         if not math.isfinite(target) or target <= 0:
             res["errors"].append("цена должна быть конечным числом больше нуля")
             return res
+        paired_target = "target_base" in ch
+        first_price = paired_target and ch.get("first_price") is True
         d = r["discount"] or 0
+        if paired_target:
+            try:
+                requested_base = float(ch["target_base"])
+                expected = float(ch["expected_current"])
+                if not math.isfinite(requested_base) or requested_base < 1 or requested_base < target:
+                    raise ValueError
+                if not math.isfinite(expected) or expected <= 0:
+                    raise ValueError
+            except (ValueError, TypeError, KeyError):
+                res["errors"].append("Проверьте «Цена сейчас» и целевые цены: они должны быть больше нуля; цена до скидки не меньше цены после скидки")
+                return res
+            if not r["price_before_spp"] or r["price_before_spp"] <= 0:
+                res["errors"].append("WB не вернул текущую цену товара — повторите обновление позже")
+                return res
+            d = min(99, max(0, round((1 - target / requested_base) * 100)))
+            res.update({"discount": d, "target_base": requested_base, "target_price": target, "expected_current": expected})
+            if first_price:
+                res.update({"first_price": True, "confirm": True})
+            if abs(expected - r["price_before_spp"]) >= 0.01:
+                res["confirm"] = True
+                res["current_warning"] = f"Цена сейчас в файле/форме: {expected:g} ₽; актуальная цена WB: {r['price_before_spp']:g} ₽. Для изменения будет использована цена WB."
         if not 0 <= d < 100:
             res["errors"].append("некорректная скидка продавца — обновите данные WB")
             return res
@@ -331,7 +365,7 @@ class Repricer:
         if hi and new_before > hi:
             res["errors"].append(f"выше максимума {scope}: {hi:,.0f} ₽".replace(",", " "))
         old = r["price_before_spp"] or 0
-        steps = self.price_steps(r["price"], base, d)
+        steps = self.price_steps(r["price"], base, d, old_after=r["price_before_spp"])
         res["steps"] = steps
         staged = len(steps) > 1
         if staged:
@@ -340,13 +374,13 @@ class Repricer:
                                    + ". Дневной лимит для этой цепочки не применяется. Ошибка или карантин WB остановят следующие шаги.")
         change = abs(new_before - old) / old * 100 if old else 0
         res["change_pct"] = round((new_before - old) / old * 100, 2) if old else None
-        if old and abs(new_before - old) < 0.5:
+        if old and abs(new_before - old) < 0.005 and r["price"] == base and r["discount"] == d:
             res["errors"].append("цена не меняется")
         if cfg.get("max_change_pct") and change > cfg["max_change_pct"]:
             res["confirm"] = True
             res["warnings"].append(f"изменение {change:.1f}% больше лимита {cfg['max_change_pct']:g}% за операцию — нужно подтверждение")
         start = self._day_start_price(r)
-        if cfg.get("daily_limit_pct") and start and not staged:
+        if cfg.get("daily_limit_pct") and start and not staged and not first_price:
             day_change = abs(new_before - start) / start * 100
             if day_change > cfg["daily_limit_pct"]:
                 res["errors"].append(f"за сутки цена изменится на {day_change:.1f}% — больше дневного лимита {cfg['daily_limit_pct']:g}%")
@@ -364,16 +398,19 @@ class Repricer:
         return res
 
     @staticmethod
-    def price_steps(old_base, new_base, discount) -> list:
+    def price_steps(old_base, new_base, discount, old_after=None) -> list:
         """Эвристика для больших снижений: шаги не более 2.5× с запасом на округление."""
-        current = int(old_base or 0)
+        factor = 100 - int(discount)
+        current = round(float(old_after) * 100) if old_after is not None else int(old_base or 0) * factor
+        target = new_base * factor
         bases = []
-        while current * 2 > new_base * 5:
-            current = max(new_base, (current * 2 + 4) // 5)
-            bases.append(current)
+        while current * 2 > target * 5:
+            base = max(new_base, (current * 2 + factor * 5 - 1) // (factor * 5))
+            bases.append(base)
+            current = base * factor
         if not bases or bases[-1] != new_base:
             bases.append(new_base)
-        return [{"new_base": base, "new_price": round(base * (1 - discount / 100), 2)} for base in bases]
+        return [{"new_base": base, "new_price": round(base * factor / 100, 2), "discount": int(discount)} for base in bases]
 
     def _day_start_price(self, r):
         since = datetime.now(timezone.utc) - timedelta(hours=24)
@@ -387,7 +424,7 @@ class Repricer:
         if not self._send_lock.acquire(blocking=False):
             raise RepricerError("Дождитесь завершения текущей отправки цен")
         try:
-            checked = self.preview(changes=changes)
+            checked = self.preview(changes=changes, fresh=any("target_base" in change for change in changes))
             bad = [c for c in checked if c["errors"]]
             if bad:
                 raise RepricerError(f"Есть ошибки у {len(bad)} товаров — исправьте или уберите их из списка")
@@ -444,7 +481,7 @@ class Repricer:
                     for original, step in zip(active, batch):
                         error = sent.get(step["id"], "WB не подтвердил применение цены")
                         if error:
-                            results[step["id"]] = f"Шаг {step_no + 1}: {error}" if len(original["steps"]) > 1 else error
+                            results[step["id"]] = error
                             continue
                         self._cache_price(step)
                         # Промежуточный успех сохраняется: после сбоя видна последняя принятая цена.
