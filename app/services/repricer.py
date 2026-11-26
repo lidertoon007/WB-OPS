@@ -399,13 +399,13 @@ class Repricer:
 
     @staticmethod
     def price_steps(old_base, new_base, discount, old_after=None) -> list:
-        """Эвристика для больших снижений: шаги не более 2.5× с запасом на округление."""
+        """Эвристика для больших снижений: шаги не более 1.9× с запасом на округление."""
         factor = 100 - int(discount)
         current = round(float(old_after) * 100) if old_after is not None else int(old_base or 0) * factor
         target = new_base * factor
         bases = []
-        while current * 2 > target * 5:
-            base = max(new_base, (current * 2 + factor * 5 - 1) // (factor * 5))
+        while current * 10 > target * 19:
+            base = max(new_base, (current * 10 + factor * 19 - 1) // (factor * 19))
             bases.append(base)
             current = base * factor
         if not bases or bases[-1] != new_base:
@@ -463,7 +463,7 @@ class Repricer:
         by_cab = {}
         for c in checked:
             by_cab.setdefault(c["id"].split(":", 1)[0], []).append(c)
-        results, attempted = {}, {}
+        results, attempted, applied_prices = {}, {}, {}
         for cid, items in by_cab.items():
             try:
                 cab = self._cabinet(cid)
@@ -484,6 +484,7 @@ class Repricer:
                             results[step["id"]] = error
                             continue
                         self._cache_price(step)
+                        applied_prices[step["id"]] = step["new_price"]
                         # Промежуточный успех сохраняется: после сбоя видна последняя принятая цена.
                         if step_no + 1 < len(original["steps"]):
                             self._log_step(op["id"], step, author)
@@ -505,10 +506,11 @@ class Repricer:
                           "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (op["id"], now, it["id"].split(":", 1)[0], it["nm_id"], it["vendor"], it["old_price"],
                                                             it["new_price"], it["old_client"], it.get("new_client"), author, "ok" if err == "" else "error", err))
             status = "Выполнено" if ok == len(checked) else ("Ошибка" if ok == 0 else "Выполнено частично")
+            result_items = {k: ("ok" if value == "" else value) for k, value in results.items()}
             c.execute("UPDATE repricer_ops SET ok=?, errors=?, status=?, details=? WHERE id=?",
-                      (ok, len(checked) - ok, status, json.dumps({k: v for k, v in results.items() if v}, ensure_ascii=False), op["id"]))
+                      (ok, len(checked) - ok, status, json.dumps({"items": result_items, "prices": applied_prices}, ensure_ascii=False), op["id"]))
         op.update({"status": status, "ok": ok, "errors": len(checked) - ok,
-                   "items": {k: ("ok" if v == "" else v) for k, v in results.items()}})
+                   "items": result_items, "prices": applied_prices})
 
     def _log_step(self, op_id, step, author):
         with self.store._connect() as c:
@@ -592,7 +594,10 @@ class Repricer:
             row = c.execute("SELECT id, status, count, ok, errors, details FROM repricer_ops WHERE id=?", (op_id,)).fetchone()
         if not row:
             raise RepricerError("Операция не найдена")
-        return {"id": row[0], "status": row[1], "count": row[2], "ok": row[3], "errors": row[4], "items": json.loads(row[5] or "{}")}
+        details = json.loads(row[5] or "{}")
+        nested = isinstance(details.get("items"), dict)
+        return {"id": row[0], "status": row[1], "count": row[2], "ok": row[3], "errors": row[4],
+                "items": details["items"] if nested else details, "prices": details.get("prices", {}) if nested else {}}
 
     def item_history(self, item_id: str, days: int = 30) -> list:
         cid, nm = item_id.split(":", 1)

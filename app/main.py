@@ -2948,10 +2948,12 @@ def _repricer_call(fn, *args, **kwargs):
 
 
 @app.get("/api/repricer")
-def repricer_table() -> dict[str, object]:
+def repricer_table(fresh: bool = False) -> dict[str, object]:
     stale = [c for c in repricer.wb_cabinets() if not (repricer.cache.get(c.id) or {}).get("at")
              or time.time() - repricer.cache[c.id]["at"] > 600]
-    if stale:
+    if fresh:
+        _repricer_call(repricer.refresh_prices)
+    elif stale:
         repricer.refresh()
     return {"rows": repricer.rows(), "state": repricer.state(), "settings": repricer.settings(), "now": time.time(),
             "cabinets": [{"id": c.id, "name": c.name} for c in repricer.wb_cabinets()]}
@@ -3033,6 +3035,7 @@ def repricer_export(body: dict):
 
 
 @app.get("/api/repricer/template")
+@app.get("/api/repricer/template.xlsx")
 def repricer_template():
     response = _table_download({"Цены": [["Артикул", "Цена сейчас", "Цена до скидки", "Цена после скидки"]]}, "xlsx", "shablon_cen_wb")
     response.headers["Content-Disposition"] = 'attachment; filename="shablon_cen_wb.xlsx"'
@@ -3074,7 +3077,7 @@ async def repricer_import(file: UploadFile = File(...)) -> dict[str, object]:
         raise HTTPException(400, "В шаблоне должно быть 4 колонки: «Артикул», «Цена сейчас», «Цена до скидки», «Цена после скидки»")
     _repricer_call(repricer.refresh_prices)
     rows = repricer.rows()
-    changes, skipped = [], 0
+    changes, skipped, source_rows = [], 0, {}
 
     def article(value):
         # Excel хранит числовой nmID как int или float; точки в vendorCode сохраняем.
@@ -3088,6 +3091,7 @@ async def repricer_import(file: UploadFile = File(...)) -> dict[str, object]:
         if not any(cell(i) not in (None, "") for i in (i_article, i_current, i_base, i_after)):
             skipped += 1
             continue
+        source_rows[line_no] = {"article": label, "expected_current": cell(i_current), "target_base": cell(i_base), "target_price": cell(i_after)}
         info = {"id": f"?:{label}", "vendor": label, "line": line_no}
         match = [r for r in rows if label and (str(r["nm_id"]) == label or norm(r.get("vendor")) == norm(label))]
         if not match:
@@ -3119,7 +3123,16 @@ async def repricer_import(file: UploadFile = File(...)) -> dict[str, object]:
                                                      "vendor": c["vendor"], "name": f"Строка {c['line']}"}
                                                       for c in changes if c.get("error")]
     accepted = {item["id"] for item in items if not item.get("errors")}
-    return {"items": items, "changes": [{k: c[k] for k in ("id", "expected_current", "target_base", "target_price", "first_price")} for c in good if c["id"] in accepted], "skipped": skipped}
+    by_id = {item["id"]: item for item in items if item["id"] in accepted or not item["id"].startswith("?:")}
+    imported_rows = []
+    for change in changes:
+        checked = by_id.get(change["id"], {})
+        imported_rows.append({**source_rows[change["line"]], "line": change["line"],
+                              "id": "" if change["id"].startswith("?:") else change["id"],
+                              "errors": [change["error"]] if change.get("error") else checked.get("errors", []),
+                              "current_warning": checked.get("current_warning", "")})
+    return {"items": items, "rows": imported_rows,
+            "changes": [{k: c[k] for k in ("id", "expected_current", "target_base", "target_price", "first_price")} for c in good if c["id"] in accepted], "skipped": skipped}
 
 
 # ---------------------------------------------------------------- остатки FBS

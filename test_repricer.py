@@ -1,6 +1,9 @@
 import io
+import base64
 import json
 import os
+import re
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -135,14 +138,14 @@ class RepricerTests(unittest.TestCase):
 
     def test_steps_preserve_discount_and_require_confirmation(self):
         steps = self.r.price_steps(100000, 10000, 50)
-        self.assertEqual([s["new_price"] for s in steps], [20000, 8000, 5000])
+        self.assertEqual([s["new_price"] for s in steps], [26316, 13851, 7290, 5000])
         before = 50000
         for step in steps:
-            self.assertLessEqual(before / step["new_price"], 2.5)
+            self.assertLessEqual(before / step["new_price"], 1.9)
             before = step["new_price"]
         # Граничные суммы также округляются в сторону меньшего снижения.
-        self.assertEqual(self.r.price_steps(101, 10, 0)[0]["new_base"], 41)
-        self.assertEqual([s["new_base"] for s in self.r.price_steps(2800, 1000, 0)], [1120, 1000])
+        self.assertEqual(self.r.price_steps(101, 10, 0)[0]["new_base"], 54)
+        self.assertEqual([s["new_base"] for s in self.r.price_steps(2800, 1000, 0)], [1474, 1000])
         for goods in self.r.cache["wb1"]["goods"]:
             if goods["nmID"] == 111:
                 for size in goods["sizes"]:
@@ -155,10 +158,10 @@ class RepricerTests(unittest.TestCase):
             self.r.apply([{"id": "wb1:111", "new_price": 5000}], False)
         op = self.wait_op(self.r.apply([{"id": "wb1:111", "new_price": 5000}], True))
         self.assertEqual((op["status"], op["ok"]), ("Выполнено", 1))
-        self.assertEqual([u["data"][0]["price"] for u in self.fake.uploads], [40000, 16000, 10000])
+        self.assertEqual([u["data"][0]["price"] for u in self.fake.uploads], [52632, 27702, 14580, 10000])
         self.assertTrue(all(u["data"][0]["discount"] == 50 for u in self.fake.uploads))
         self.assertEqual(self.row(111)["price_before_spp"], 5000)
-        self.assertEqual([h["new_price"] for h in self.r.item_history("wb1:111")], [20000, 8000, 5000])
+        self.assertEqual([h["new_price"] for h in self.r.item_history("wb1:111")], [26316, 13851, 7290, 5000])
 
     def test_chain_stops_at_error_and_keeps_applied_intermediate_price(self):
         uploads = []
@@ -169,11 +172,11 @@ class RepricerTests(unittest.TestCase):
 
         with mock.patch.object(self.r, "_upload", upload):
             op = self.wait_op(self.r.apply([{"id": "wb1:111", "new_price": 500}], True))
-        self.assertEqual(uploads, [2000, 800])
+        self.assertEqual(uploads, [2632, 1385.5])
         self.assertEqual((op["status"], op["ok"]), ("Ошибка", 0))
         self.assertIn("Товар в карантине", op["items"]["wb1:111"])
-        self.assertEqual(self.row(111)["price_before_spp"], 2000)
-        self.assertEqual([h["new_price"] for h in self.r.item_history("wb1:111") if h["status"] == "ok"], [2000])
+        self.assertEqual(self.row(111)["price_before_spp"], 2632)
+        self.assertEqual([h["new_price"] for h in self.r.item_history("wb1:111") if h["status"] == "ok"], [2632])
 
     def test_timeout_and_missing_or_unknown_details_never_succeed(self):
         cab = self.r._cabinet("wb1")
@@ -204,9 +207,10 @@ class RepricerTests(unittest.TestCase):
         self.assertLess(abs(item["new_price"] - 9706), 0.5)
         before = 50000
         for step in item["steps"]:
-            self.assertLessEqual(before / step["new_price"], 2.5)
+            self.assertLessEqual(before / step["new_price"], 1.9)
             before = step["new_price"]
         self.assertEqual(item["steps"][-1]["new_price"], 9705.8)
+        self.assertGreaterEqual(len(item["steps"]), 3)
         self.assertFalse(item["errors"], item)
         with self.assertRaises(RepricerError):
             self.r.apply([change], False)
@@ -214,6 +218,10 @@ class RepricerTests(unittest.TestCase):
         self.assertEqual(operation["status"], "Выполнено")
         self.assertEqual(self.fake.uploads[-1]["data"][0], {"nmID": 111, "price": 14932, "discount": 35})
         self.assertEqual(self.row(111)["price_before_spp"], 9705.8)
+        self.r.ops.clear()
+        persisted = self.r.op(operation["id"])
+        self.assertEqual(persisted["prices"]["wb1:111"], 9705.8)
+        self.assertEqual(persisted["items"]["wb1:111"], "ok")
 
     def test_first_price_bypasses_daily_limit_for_nonstaged_change_only_when_flagged(self):
         goods = self.fake.goods[0]
@@ -271,6 +279,10 @@ class RepricerApiTests(unittest.TestCase):
         self.assertEqual(res["items"][0]["new_price"], 9706)
         self.assertEqual(res["changes"], [{"id": "wb1:111", "expected_current": 50000, "target_base": 15000, "target_price": 9706, "first_price": True}])
         self.assertEqual(res["items"][1]["errors"], ["артикул не найден"])
+        self.assertEqual([{key: row[key] for key in ("article", "expected_current", "target_base", "target_price")} for row in res["rows"]],
+                         [{"article": "111", "expected_current": 50000, "target_base": 15000, "target_price": 9706},
+                          {"article": "999", "expected_current": 50000, "target_base": 15000, "target_price": 9706}])
+        self.assertEqual(res["rows"][1]["errors"], ["артикул не найден"])
 
     def import_csv(self, text, rows):
         from fastapi.testclient import TestClient
@@ -309,23 +321,94 @@ class RepricerApiTests(unittest.TestCase):
         from fastapi.testclient import TestClient
         import openpyxl
         client = TestClient(self.m.app)
-        response = client.get("/api/repricer/template")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers["content-type"], "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        self.assertIn('filename="shablon_cen_wb.xlsx"', response.headers["content-disposition"])
-        self.assertTrue(response.content.startswith(b"PK"))
-        workbook = openpyxl.load_workbook(io.BytesIO(response.content), read_only=True)
-        self.assertEqual(list(next(workbook.active.iter_rows(values_only=True))), ["Артикул", "Цена сейчас", "Цена до скидки", "Цена после скидки"])
+        for endpoint in ("/api/repricer/template.xlsx", "/api/repricer/template"):
+            response = client.get(endpoint)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["content-type"], "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.assertIn('filename="shablon_cen_wb.xlsx"', response.headers["content-disposition"])
+            self.assertTrue(response.content.startswith(b"PK"))
+            workbook = openpyxl.load_workbook(io.BytesIO(response.content), read_only=True)
+            self.assertEqual(list(next(workbook.active.iter_rows(values_only=True))), ["Артикул", "Цена сейчас", "Цена до скидки", "Цена после скидки"])
         response = client.get("/repricer")
         self.assertEqual(response.status_code, 200)
         self.assertIn('<span>Цены</span>', response.text)
         javascript = (Path(__file__).parent / "app/static/repricer.js").read_text(encoding="utf-8")
-        for name in ("article", "expected_current", "target_base", "target_price"):
-            self.assertIn(f'name="{name}"', javascript)
-        for text in ("Артикул", "Цена сейчас", "Цена до скидки", "Цена после скидки", "Запустить изменение", "shablon_cen_wb.xlsx"):
+        for text in ("Артикул", "Цена сейчас", "Цена до скидки", "Цена после скидки", "Добавить строку", "Запустить все готовые", "shablon_cen_wb.xlsx"):
             self.assertIn(text, javascript)
         for text in ("Маржа", "СПП", "ступен", "role=\"tab\""):
             self.assertNotIn(text, javascript)
+        fallback = base64.b64decode(re.search(r"const TEMPLATE_BASE64 = '([^']+)'", javascript).group(1))
+        self.assertTrue(fallback.startswith(b"PK"))
+        workbook = openpyxl.load_workbook(io.BytesIO(fallback), read_only=True)
+        self.assertEqual(list(next(workbook.active.iter_rows(values_only=True))), ["Артикул", "Цена сейчас", "Цена до скидки", "Цена после скидки"])
+
+    def test_multirow_table_preview_errors_persistence_poll_and_template_fallback(self):
+        script = r"""
+const assert = require('node:assert/strict'), fs = require('node:fs'), vm = require('node:vm');
+const source = fs.readFileSync('app/static/repricer.js', 'utf8');
+const storage = new Map(), elements = new Map();
+for (const name of ['data-table-body', 'data-articles', 'data-note', 'data-start', 'data-import', 'data-add', 'data-template']) elements.set('[' + name + ']', {});
+const root = {querySelector: selector => elements.get(selector) || null};
+const row = (uid, id, article) => ({uid, id, article, expected_current: 50000, target_base: 15000, target_price: 9706, state: 'ready', status: 'Готов к запуску'});
+storage.set('wbops.prices.table.v1', JSON.stringify({rows: [row('r1', 'wb1:111', 'A'), row('r2', 'wb1:222', 'B')], job: null}));
+global.localStorage = {getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value)};
+global.window = {confirm: () => true};
+global.setTimeout = () => 1; global.clearTimeout = () => {};
+let capturedBlob, downloaded, previews = 0, applies = 0, polls = 0;
+URL.createObjectURL = blob => { capturedBlob = blob; return 'blob:test'; }; URL.revokeObjectURL = () => {};
+global.document = {body: {append() {}}, createElement: () => ({click() { downloaded = this.download; }, remove() {}})};
+global.FormData = class {append() {}};
+const catalog = [{id: 'wb1:111', vendor: 'A', cabinet: 'ИП', nm_id: 111, price_before_spp: 50000}, {id: 'wb1:222', vendor: 'B', cabinet: 'ИП', nm_id: 222, price_before_spp: 50000}];
+const response = (data, code = 200) => ({ok: code === 200, status: code, json: async () => data});
+global.fetch = async (url, opt = {}) => {
+  if (url.startsWith('/api/repricer/template')) return response({detail: 'Not Found'}, 404);
+  if (url.startsWith('/api/repricer?') || url === '/api/repricer') return response({rows: catalog, cabinets: [{id: 'wb1'}]});
+  if (url === '/api/repricer/preview') {
+    previews++;
+    const {changes} = JSON.parse(opt.body); assert.equal(changes.length, 2);
+    assert.ok(changes.every(change => change.new_price === change.target_price && change.first_price));
+    return response({items: changes.map((change, n) => ({id: change.id, errors: previews === 1 && n === 1 ? ['Ошибка цены WB'] : []}))});
+  }
+  if (url === '/api/repricer/apply') { applies++; return response({id: 21}); }
+  if (url === '/api/repricer/ops/21') {
+    polls++;
+    return response(polls === 1 ? {status: 'running'} : {status: 'Выполнено частично', items: {'wb1:111': 'ok', 'wb1:222': 'Товар в карантине'}, prices: {'wb1:111': 9705.8}, errors: 1});
+  }
+  if (url === '/api/repricer/import') return response({rows: [
+    {id: 'wb1:111', article: 'A', expected_current: 50000, target_base: 15000, target_price: 9706, errors: []},
+    {id: '', article: 'unknown', expected_current: 20000, target_base: 10000, target_price: 9000, errors: ['артикул не найден']}
+  ]});
+  throw new Error('Unexpected URL: ' + url);
+};
+(async () => {
+  vm.runInThisContext(source); await window.WBOPSRepricer.render(root);
+  let body = elements.get('[data-table-body]');
+  assert.equal((body.innerHTML.match(/data-row=/g) || []).length, 2);
+  assert.match(body.innerHTML, /name="article"/); assert.match(root.innerHTML, /<th>Статус<\/th>/);
+  await elements.get('[data-start]').onclick();
+  assert.equal(applies, 0); assert.match(body.innerHTML, /Ошибка цены WB/);
+  body.oninput({target: {dataset: {field: 'target_price'}, value: '9706', closest: () => ({dataset: {row: 'r2'}, querySelector: () => ({})})}});
+  await elements.get('[data-start]').onclick(); await new Promise(setImmediate);
+  assert.equal(applies, 1);
+  let saved = JSON.parse(storage.get('wbops.prices.table.v1'));
+  assert.equal(saved.job.id, 21); assert.ok(saved.rows.every(item => item.state === 'running'));
+  vm.runInThisContext(source); await window.WBOPSRepricer.render(root); await new Promise(setImmediate);
+  saved = JSON.parse(storage.get('wbops.prices.table.v1'));
+  assert.equal(saved.job, null); assert.match(saved.rows[0].status, /Готово · фактическая цена/);
+  assert.equal(saved.rows[0].expected_current, 9705.8); assert.equal(saved.rows[1].status, 'Товар в карантине');
+  elements.get('[data-add]').onclick(); assert.equal((body.innerHTML.match(/data-row=/g) || []).length, 3);
+  await elements.get('[data-import]').onchange({target: {files: [{}], value: 'prices.xlsx'}});
+  saved = JSON.parse(storage.get('wbops.prices.table.v1'));
+  assert.equal(saved.rows.length, 4); assert.equal(saved.rows[3].target_price, 9000);
+  assert.equal(saved.rows[3].status, 'артикул не найден');
+  await elements.get('[data-template]').onclick({currentTarget: elements.get('[data-template]')});
+  assert.equal(downloaded, 'shablon_cen_wb.xlsx');
+  const bytes = new Uint8Array(await capturedBlob.arrayBuffer()); assert.equal(bytes[0], 80); assert.equal(bytes[1], 75);
+  assert.match(elements.get('[data-note]').textContent, /Backend ещё не перезапущен/);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        result = subprocess.run(["node", "-e", script], cwd=Path(__file__).parent, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
