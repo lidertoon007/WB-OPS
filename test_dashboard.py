@@ -99,7 +99,10 @@ class DashboardTests(unittest.TestCase):
             if cabinet and cabinet != CAB:
                 return None
             return {"by_day": {"2026-10-01": 800}, "bonus_by_day": {"2026-10-01": 300},
-                    "bonus_balance": 466_517, "promo_packages": [{"account": CAB, "sum": 466_517,
+                    "bonus_balance": 466_517, "promo_grant_balance": 466_517,
+                    "promo_granted_total": 2_000_000,
+                    "promo_spent_total": 1_138_379, "promo_campaign_reserve": 395_104,
+                    "promo_packages": [{"account": CAB, "sum": 466_517,
                                                                       "percent": 50, "expiration_date": "2026-12-31"}],
                     "promo_updated_at": "2026-10-03T12:00:00+03:00", "promo_inflow": 100_000,
                     "promo_source": "api", "by_article": {("2026-10-01", "A-1"): 500}}
@@ -108,6 +111,9 @@ class DashboardTests(unittest.TestCase):
         c = self.db.summary(date(2026, 10, 1), date(2026, 10, 2))["current"]
         self.assertEqual((c["ads_gross"], c["promo_bonus"], c["ads"]), (-800, 300, -500))
         self.assertEqual(c["promo_balance"], 466_517)
+        self.assertEqual(c["promo_grant_balance"], 466_517)
+        self.assertEqual((c["promo_granted_total"], c["promo_spent_total"], c["promo_campaign_reserve"]),
+                         (2_000_000, 1_138_379, 395_104))
         self.assertEqual((c["promo_packages"][0]["percent"], c["promo_inflow"], c["promo_source"]),
                          (50, 100_000, "api"))
         self.assertAlmostEqual(c["profit"], base["profit"] + 500)
@@ -119,6 +125,7 @@ class DashboardTests(unittest.TestCase):
         product = self.db.summary(date(2026, 10, 1), date(2026, 10, 2), brand="Бренд A")["current"]
         self.assertEqual((product["ads"], product["promo_bonus"]), (-500, 0))
         self.assertEqual(product["promo_balance"], 466_517)
+        self.assertEqual(product["promo_campaign_reserve"], 395_104)
         self.assertEqual(self.db.summary(date(2026, 9, 30), date(2026, 9, 30))["current"]["promo_balance"], 466_517)
 
     def test_november_cashback_amount_is_not_full_credit(self):
@@ -130,7 +137,7 @@ class DashboardTests(unittest.TestCase):
                          (-4_762_789, 1_406_636, -3_356_153))
         self.assertEqual(used["profit"] - gross["profit"], 1_406_636)
         with_balance = self.db.derive({"revenue_sales": 36_181_357.34, "ads_spend": -4_762_789,
-                                       "promo_balance": 466_517})
+                                       "promo_balance": 466_517, "promo_campaign_reserve": 395_104})
         self.assertEqual(with_balance["profit"], gross["profit"])
 
     def test_buyout_from_wb_funnel(self):

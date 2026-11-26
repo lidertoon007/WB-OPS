@@ -22,6 +22,7 @@ window.WBOPSDashboard = (() => {
     {id: 'ads_gross', title: 'Реклама до бонусов', v: 'ads_gross', money: true, good: 'down', hint: 'Все рекламные списания из истории затрат WB до вычета кэшбэка. С фильтром по товарам — расходы кампаний по артикулам.'},
     {id: 'promo_bonus', title: 'Промо-бонусы WB', v: 'promo_bonus', pct: 'promo_bonus_pct', good: 'up', hint: 'Фактически использованный кэшбэк WB по истории рекламных списаний за выбранные дни. Начисленный, но ещё не потраченный остаток не увеличивает прибыль. Бонусы не распределяются по товарам.'},
     {id: 'promo_balance', title: 'Остаток промо-бонусов', v: 'promo_balance', fixed: true, hint: 'Последний баланс промо-бонусов из API WB, обновляется при синхронизации рекламы. Пакеты имеют срок действия. Если API ещё не вернул бонусы, используется подтверждённый резервный расчёт для ИП Нгуен. Остаток не зависит от выбранного периода и не увеличивает прибыль.'},
+    {id: 'promo_campaign_reserve', title: 'Промо-бонусы в кампаниях (расчёт)', v: 'promo_campaign_reserve', fixed: true, hint: 'Расчётный остаток: подтверждённые начисления минус фактически использованный кэшбэк и бонусы на счёте WB. Может включать бонусы в бюджетах кампаний, истёкшие суммы и корректировки. API общего бюджета кампании не раскрывает долю промо-бонусов. На прибыль не влияет.'},
     {id: 'cost_per_order', title: 'Стоимость за заказ', v: 'cost_per_order', digits: 2, good: 'down', hint: 'Чистые расходы на рекламу после бонусов, делённые на количество заказов за тот же период (все заказы, включая будущие отмены). Сравнение — с прошлым периодом: зелёный — заказ стал дешевле, красный — дороже.'},
     {id: 'net_to_pay', title: 'К перечислению от WB', v: 'net_to_pay', good: 'up', hint: 'Выручка минус все удержания WB плюс компенсации — сколько WB перечислит за период.'},
     {id: 'logistics', title: 'Логистика', v: 'logistics', pct: 'logistics_pct', money: true, good: 'down', by: 'pct', hint: 'Доставка к покупателю, обратная логистика при отменах и возвратах.'},
@@ -70,7 +71,7 @@ window.WBOPSDashboard = (() => {
     cap_cost: {hint: 'Остатки на складах сейчас × себестоимость.'}, cap_retail: {hint: 'Остатки на складах сейчас × текущая цена продавца.'},
   };
   const MP = {wb: {title: 'WB', key: 'wbops.dashboard'}, ozon: {title: 'Ozon', key: 'wbops.dashboard.ozon'}};
-  const tiles = () => mp === 'ozon' ? TILES.filter(t => !['acceptance', 'ads_gross', 'promo_bonus', 'promo_balance'].includes(t.id)).map(t => ({...t, ...(OZON[t.id] || {}), hint: (OZON[t.id] || {}).hint || t.hint.replace(/\bWB\b/g, 'Ozon')})) : TILES;
+  const tiles = () => mp === 'ozon' ? TILES.filter(t => !['acceptance', 'ads_gross', 'promo_bonus', 'promo_balance', 'promo_campaign_reserve'].includes(t.id)).map(t => ({...t, ...(OZON[t.id] || {}), hint: (OZON[t.id] || {}).hint || t.hint.replace(/\bWB\b/g, 'Ozon')})) : TILES;
   let mp = 'wb', st = null, root = null, hidden = new Set();
   function restore() {
     st = {preset: 'week:1', from: '', to: '', cabinet: '', brand: '', category: '', article: '', data: null, poll: null};
@@ -229,8 +230,10 @@ window.WBOPSDashboard = (() => {
     }
     const packages = t.id === 'promo_balance' ? (c.promo_packages || []) : [];
     const detail = packages.length ? ` Пакеты: ${packages.map(p => `${p.account}: ${fmt(p.sum)} ₽${p.percent != null ? `, до ${fmt(p.percent)}% пополнения` : ''}${p.expiration_date ? `, до ${ru(String(p.expiration_date).slice(0, 10))}` : ''}`).join('; ')}.` : '';
-    const hint = t.id === 'promo_balance' ? `${t.hint}${detail}${c.promo_inflow ? ` Последнее обнаруженное начисление: ${fmt(c.promo_inflow)} ₽.` : ''}` : t.hint;
-    const fixedLabel = t.id === 'promo_balance' ? (c.promo_source === 'bootstrap' ? 'резервный расчёт' : c.promo_updated_at ? `по данным на ${ru(c.promo_updated_at.slice(0, 10))} ${c.promo_updated_at.slice(11, 16)}` : 'нет снимка API') : 'на сегодня';
+    const hint = t.id === 'promo_balance' ? `${t.hint}${detail}${c.promo_inflow ? ` Последнее обнаруженное начисление: ${fmt(c.promo_inflow)} ₽.` : ''}`
+      : t.id === 'promo_campaign_reserve' ? `${t.hint} По кабинетам с подтверждённым начислением: начислено ${fmt(c.promo_granted_total)} ₽; потрачено ${fmt(c.promo_spent_total)} ₽; на счёте ${fmt(c.promo_grant_balance)} ₽.` : t.hint;
+    const fixedLabel = t.id === 'promo_balance' ? (c.promo_source === 'bootstrap' ? 'резервный расчёт' : c.promo_updated_at ? `по данным на ${ru(c.promo_updated_at.slice(0, 10))} ${c.promo_updated_at.slice(11, 16)}` : 'нет снимка API')
+      : t.id === 'promo_campaign_reserve' ? 'в кампаниях или корректировках' : 'на сегодня';
     return `<article class="db-tile ${cls}" data-tile="${t.id}"><div class="db-title">${esc(t.title)} <span class="db-i" tabindex="0" role="note" title="${esc(hint)}" aria-label="${esc(hint)}">i</span></div>
       <div class="db-value ${main.replace(/<[^>]+>/g, '').length > 17 ? 'long' : main.replace(/<[^>]+>/g, '').length > 14 ? 'mid' : ''}">${main}</div>${t.fixed ? `<div class="db-fixed">${esc(fixedLabel)}</div>` : `<div class="db-change">${delta}</div>`}</article>`;
   }

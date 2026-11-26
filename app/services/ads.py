@@ -36,10 +36,16 @@ CLUSTER_DAYS = 30        # поисковые кластеры — за 30 дн�
 KEEP_DAYS = 400
 STATUS = {4: "Готова к запуску", 7: "Завершена", 8: "Отклонена", 9: "Активна", 11: "На паузе", -1: "Удаляется"}
 APPS = {1: "Сайт", 32: "Android", 64: "iOS"}
-# Резерв для старого ответа WB без bonus/cashbacks: подтверждённое владельцем начисление.
-# 27.08 — первая доступная операция «Кэшбэк», а не дата начисления.
+# Подтверждённое владельцем начисление; резервный остаток для старого ответа WB без bonus/cashbacks.
+# 13.11 — начало расходования этого начисления по выгрузке «История затрат».
 # После первого полного ответа /adv/v1/balance остаток берётся только из API.
-PROMO_BONUS_LEDGER = ({"account": "ИП Нгуен", "total": 2_000_000.0, "since": "2026-08-27"},)
+PROMO_BONUS_LEDGER = ({"account": "ИП Нгуен", "total": 2_000_000.0, "since": "2026-11-13"},)
+# Выгрузка «История затрат», 23.11.2026, строки 244 и 246: эти списания отсутствовали
+# в ответе /adv/v1/upd. Применять только пока API не вернёт идентичную операцию.
+PROMO_SPEND_ADJUSTMENTS = (
+    {"account": "ИП Нгуен", "advert_id": 41411549, "at": "2026-11-23T01:08", "amount": 166.0, "source": "Кэшбэк"},
+    {"account": "ИП Нгуен", "advert_id": 40436780, "at": "2026-11-23T00:54", "amount": 302.0, "source": "Кэшбэк"},
+)
 
 
 def _r(v) -> str:
@@ -337,12 +343,26 @@ class AdsAnalytics:
         return active
 
     @staticmethod
-    def _cashback_total(c, account: str, since: str | None = None) -> float:
+    def _missing_promo_adjustments(c, account: str, start: str | None = None, end: str | None = None) -> list[dict]:
+        missing = []
+        for entry in PROMO_SPEND_ADJUSTMENTS:
+            if entry["account"] != account or (start and entry["at"][:10] < start) or (end and entry["at"][:10] > end):
+                continue
+            found = c.execute("SELECT 1 FROM ads_upd WHERE account=? AND advert_id=? AND substr(upd_time,1,16)=? "
+                              "AND amount=? AND source=? LIMIT 1",
+                              (account, entry["advert_id"], entry["at"], entry["amount"], entry["source"])).fetchone()
+            if not found:
+                missing.append(entry)
+        return missing
+
+    @classmethod
+    def _cashback_total(cls, c, account: str, since: str | None = None) -> float:
         # Та же идентичность списания, что в spend(): повторный ключ продавца не удваивает расход.
         where = " AND substr(upd_time,1,10)>=?" if since else ""
         args = [account, since] if since else [account]
-        return float(c.execute("SELECT COALESCE(SUM(amount),0) FROM (SELECT DISTINCT advert_id, upd_time, upd_num, amount "
-                               f"FROM ads_upd WHERE account=? AND source='Кэшбэк'{where})", args).fetchone()[0] or 0)
+        actual = float(c.execute("SELECT COALESCE(SUM(amount),0) FROM (SELECT DISTINCT advert_id, upd_time, upd_num, amount "
+                                 f"FROM ads_upd WHERE account=? AND source='Кэшбэк'{where})", args).fetchone()[0] or 0)
+        return actual + sum(entry["amount"] for entry in cls._missing_promo_adjustments(c, account, since))
 
     @staticmethod
     def _promo_credit(account: str) -> dict | None:
@@ -362,6 +382,10 @@ class AdsAnalytics:
         credit = self._promo_credit(account)
         with self.store._connect() as c:
             spent = self._cashback_total(c, account, credit["since"] if credit else None)
+            # Две исторические операции из выгрузки не являются новым расходом между снимками.
+            # Их появление в /adv/v1/upd также не должно выглядеть как новое начисление.
+            spent -= sum(entry["amount"] for entry in PROMO_SPEND_ADJUSTMENTS
+                         if entry["account"] == account and (not credit or entry["at"][:10] >= credit["since"]))
             previous = c.execute("SELECT balance, cashback_spend_total, packages_json, source FROM ads_promo_snapshots "
                                  "WHERE account=? AND balance IS NOT NULL ORDER BY at DESC LIMIT 1", (account,)).fetchone()
             if packages:
@@ -387,18 +411,25 @@ class AdsAnalytics:
         row = c.execute("SELECT at, balance, packages_json, inflow, source FROM ads_promo_snapshots "
                         "WHERE account=? AND balance IS NOT NULL ORDER BY at DESC LIMIT 1", (account,)).fetchone()
         credit = self._promo_credit(account)
+        spent_total = self._cashback_total(c, account, credit["since"]) if credit else 0.0
+        inflow_total = float(c.execute("SELECT COALESCE(SUM(inflow),0) FROM ads_promo_snapshots "
+                                       "WHERE account=? AND source IN ('cashbacks','bonus')", (account,)).fetchone()[0] or 0)
+        granted_total = credit["total"] + inflow_total if credit else None
         if row:
             at, balance, raw_packages, inflow, source = row
             packages = self._active_packages(json.loads(raw_packages), now) if source == "cashbacks" else []
             if source == "cashbacks":
                 balance = sum(p["sum"] for p in packages)
             elif source == "bootstrap" and credit:
-                balance = max(0.0, credit["total"] - self._cashback_total(c, account, credit["since"]))
+                balance = max(0.0, credit["total"] - spent_total)
             return {"balance": balance, "packages": [{**p, "account": account} for p in packages],
-                    "updated_at": at, "inflow": inflow, "source": source}
-        balance = max(0.0, credit["total"] - self._cashback_total(c, account, credit["since"])) if credit else 0.0
+                    "updated_at": at, "inflow": inflow, "source": source,
+                    "granted_total": granted_total, "spent_total": spent_total,
+                    "campaign_reserve": max(0.0, granted_total - spent_total - balance) if credit else None}
+        balance = max(0.0, credit["total"] - spent_total) if credit else 0.0
         return {"balance": balance, "packages": [], "updated_at": None, "inflow": 0.0,
-                "source": "bootstrap" if credit else "unavailable"}
+                "source": "bootstrap" if credit else "unavailable", "granted_total": granted_total,
+                "spent_total": spent_total, "campaign_reserve": max(0.0, granted_total - spent_total - balance) if credit else None}
 
     def spend(self, start: str, end: str, account: str | None = None) -> dict | None:
         """Затраты на рекламу для дашборда: {"by_day": {день: ₽ по истории затрат WB}, "by_article": {(день, артикул): ₽
@@ -412,6 +443,10 @@ class AdsAnalytics:
                                                 {row[0] for row in c.execute("SELECT DISTINCT account FROM ads_promo_snapshots")}))
             states = [self._promo_state(c, name, datetime.now(MSK)) for name in names]
             promo = {"bonus_balance": sum(s["balance"] for s in states),
+                     "promo_grant_balance": sum(s["balance"] for s in states if s["granted_total"] is not None),
+                     "promo_granted_total": sum(s["granted_total"] or 0 for s in states),
+                     "promo_spent_total": sum(s["spent_total"] for s in states),
+                     "promo_campaign_reserve": sum(s["campaign_reserve"] or 0 for s in states),
                      "promo_packages": [p for s in states for p in s["packages"]],
                      "promo_updated_at": max((s["updated_at"] for s in states if s["updated_at"]), default=None),
                      "promo_inflow": sum(s["inflow"] for s in states),
@@ -426,6 +461,7 @@ class AdsAnalytics:
             rows = c.execute("SELECT substr(upd_time,1,10), amount, MAX(CASE WHEN source='Кэшбэк' THEN 1 ELSE 0 END) "
                              f"FROM ads_upd WHERE substr(upd_time,1,10) BETWEEN ? AND ?{where} "
                              "GROUP BY advert_id, upd_time, upd_num, amount", [start, end, *args]).fetchall()
+            adjustments = [entry for name in names for entry in self._missing_promo_adjustments(c, name, start, end)]
             stats = c.execute("SELECT s.day, s.nm_id, SUM(s.spend) FROM ads_stats s LEFT JOIN ads_campaigns k ON k.id=s.advert_id "
                               f"WHERE s.day BETWEEN ? AND ?{where.replace('account', 'k.account')} GROUP BY 1, 2", [start, end, *args]).fetchall()
         by_day, bonus_by_day = defaultdict(float), defaultdict(float)
@@ -433,6 +469,10 @@ class AdsAnalytics:
             by_day[day] += amount or 0
             if cashback:
                 bonus_by_day[day] += amount or 0
+        for entry in adjustments:
+            day, amount = entry["at"][:10], entry["amount"]
+            by_day[day] += amount
+            bonus_by_day[day] += amount
         meta, by_article = self._meta(), defaultdict(float)
         for day, nm, value in stats:
             by_article[(day, art_key((meta.get(nm) or {}).get("article") or f"nmId {nm}"))] += value or 0

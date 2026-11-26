@@ -154,17 +154,17 @@ class AdsTests(unittest.TestCase):
             c.execute("INSERT INTO ads_upd VALUES (?,?,?,?,?,?,?)",
                       ("ИП Нгуен", 10, "2026-08-26T12:00:00+03:00", 1, "Реклама", 100, "Кэшбэк"))
             c.execute("INSERT INTO ads_upd VALUES (?,?,?,?,?,?,?)",
-                      ("ИП Нгуен", 10, D1 + "T12:00:00+03:00", 2, "Реклама", 1_533_483, "Кэшбэк"))
+                      ("ИП Нгуен", 10, D1 + "T12:00:00+03:00", 2, "Реклама", 1_407_218, "Кэшбэк"))
         current = self.ads.spend(D1, D2, "ИП Нгуен")
-        self.assertEqual(current["bonus_balance"], 466_517)
-        self.assertEqual(self.ads.spend(D1, D2)["bonus_balance"], 466_567)
+        self.assertEqual(current["bonus_balance"], 592_314)
+        self.assertEqual(self.ads.spend(D1, D2)["bonus_balance"], 592_364)
         self.assertEqual(self.ads.spend(D1, D2, "ИП")["bonus_balance"], 50)
         old = self.ads.spend("2026-01-01", "2026-01-02", "ИП Нгуен")
         self.assertFalse(old["available"])
-        self.assertEqual(old["bonus_balance"], 466_517)
+        self.assertEqual(old["bonus_balance"], 592_314)
         with self.store._connect() as c:
             c.execute("INSERT INTO ads_upd VALUES (?,?,?,?,?,?,?)",
-                      ("ИП Нгуен", 10, D2 + "T12:00:00+03:00", 3, "Реклама", 500_000, "Кэшбэк"))
+                      ("ИП Нгуен", 10, D2 + "T12:00:00+03:00", 3, "Реклама", 600_000, "Кэшбэк"))
         self.assertEqual(self.ads.spend(D1, D2, "ИП Нгуен")["bonus_balance"], 0)
 
     def test_api_snapshots_detect_new_credit_once_and_keep_packages(self):
@@ -205,10 +205,10 @@ class AdsTests(unittest.TestCase):
     def test_bootstrap_switches_to_api_and_multiple_accounts_sum(self):
         owner = AdsAnalytics(self.store, lambda: [("ИП Нгуен", "owner", "owner")])
         self.fake.balance_by_token["owner"] = {"bonus": None, "cashbacks": [], "net": 9_000_000}
-        self.fake.cashback_by_token["owner"] = 1_533_483
+        self.fake.cashback_by_token["owner"] = 1_407_218
         self.assertEqual(owner.sync()["status"], "done")
         bootstrap = owner.spend(D1, D2, "ИП Нгуен")
-        self.assertEqual((bootstrap["bonus_balance"], bootstrap["promo_source"]), (466_517, "bootstrap"))
+        self.assertEqual((bootstrap["bonus_balance"], bootstrap["promo_source"]), (592_314, "bootstrap"))
         self.fake.balance_by_token["owner"] = {"bonus": 700_000, "cashbacks": None, "net": 9_000_000}
         self.assertEqual(owner.sync()["status"], "done")
         self.assertEqual((owner.spend(D1, D2, "ИП Нгуен")["bonus_balance"],
@@ -226,6 +226,54 @@ class AdsTests(unittest.TestCase):
         state = newcomer.spend(D1, D2, "Новый ИП")
         self.assertFalse(state["available"])
         self.assertEqual((state["bonus_balance"], state["promo_inflow"]), (42_000, 0))
+
+    def test_promo_residual_reconciles_excel_and_future_grant_once(self):
+        """2 млн = API-остаток + использованный кэшбэк + расчётный остаток в кампаниях/корректировках."""
+        with self.store._connect() as c:
+            c.execute("INSERT INTO ads_upd VALUES (?,?,?,?,?,?,?)",
+                      ("ИП Нгуен", 10, "2026-11-13T23:59:00+03:00", 1, "Реклама", 0, "Баланс"))
+            c.execute("INSERT INTO ads_upd VALUES (?,?,?,?,?,?,?)",
+                      ("ИП Нгуен", 10, D1 + "T12:00:00+03:00", 2, "Реклама", 1_407_218, "Кэшбэк"))
+        future = "2026-12-13T21:00:00Z"
+        self.ads._record_promo_snapshot("ИП Нгуен", {"cashbacks": [{"sum": 197_210, "expiration_date": future}]})
+        current = self.ads.spend("2026-11-13", "2026-11-26", "ИП Нгуен")
+        self.assertEqual((current["promo_granted_total"], current["promo_spent_total"],
+                          current["bonus_balance"], current["promo_campaign_reserve"]),
+                         (2_000_000, 1_407_686, 197_210, 395_104))
+        self.assertEqual(current["bonus_by_day"]["2026-11-23"], 468)
+        self.assertEqual(current["by_day"]["2026-11-23"], 468)
+        self.ads._record_promo_snapshot("Другой", {"bonus": 50})
+        self.assertEqual(self.ads.spend("2026-11-13", "2026-11-26", "Другой")["promo_campaign_reserve"], 0)
+        all_accounts = self.ads.spend("2026-11-13", "2026-11-26")
+        self.assertEqual((all_accounts["bonus_balance"], all_accounts["promo_grant_balance"],
+                          all_accounts["promo_campaign_reserve"]), (197_260, 197_210, 395_104))
+        self.ads._record_promo_snapshot("ИП Нгуен", {"cashbacks": [{"sum": 1_197_210, "expiration_date": future}]})
+        added = self.ads.spend("2026-11-13", "2026-11-26", "ИП Нгуен")
+        self.assertEqual((added["promo_inflow"], added["promo_granted_total"], added["promo_campaign_reserve"]),
+                         (1_000_000, 3_000_000, 395_104))
+        self.ads._record_promo_snapshot("ИП Нгуен", {"cashbacks": [{"sum": 1_197_210, "expiration_date": future}]})
+        repeated = self.ads.spend("2026-11-13", "2026-11-26", "ИП Нгуен")
+        self.assertEqual((repeated["promo_inflow"], repeated["promo_granted_total"],
+                          repeated["promo_campaign_reserve"]), (0, 3_000_000, 395_104))
+
+    def test_excel_adjustments_turn_off_when_matching_api_rows_arrive(self):
+        with self.store._connect() as c:
+            c.execute("INSERT INTO ads_upd VALUES (?,?,?,?,?,?,?)",
+                      ("ИП Нгуен", 10, "2026-11-13T23:59:00+03:00", 1, "Реклама", 0, "Баланс"))
+        self.ads._record_promo_snapshot("ИП Нгуен", {"bonus": 197_210})
+        before = self.ads.spend("2026-11-13", "2026-11-26", "ИП Нгуен")
+        self.assertEqual((before["by_day"]["2026-11-23"], before["bonus_by_day"]["2026-11-23"],
+                          before["promo_spent_total"]), (468, 468, 468))
+        for entry in am.PROMO_SPEND_ADJUSTMENTS:
+            with self.store._connect() as c:
+                c.execute("INSERT INTO ads_upd VALUES (?,?,?,?,?,?,?)",
+                          (entry["account"], entry["advert_id"], entry["at"] + ":00+03:00", 1,
+                           "Реклама", entry["amount"], entry["source"]))
+            self.ads._record_promo_snapshot("ИП Нгуен", {"bonus": 197_210})
+            during = self.ads.spend("2026-11-13", "2026-11-26", "ИП Нгуен")
+            self.assertEqual((during["by_day"]["2026-11-23"], during["bonus_by_day"]["2026-11-23"],
+                              during["promo_spent_total"]), (468, 468, 468))
+            self.assertEqual((during["promo_inflow"], during["promo_granted_total"]), (0, 2_000_000))
 
 
 if __name__ == "__main__":

@@ -341,6 +341,10 @@ class Dashboard:
         spend = self.ad_spend(start.isoformat(), end.isoformat(), cabinet) if with_ads and self.mp == "wb" else None
         if spend is not None:
             t["promo_balance"] = spend.get("bonus_balance", 0)
+            t["promo_grant_balance"] = spend.get("promo_grant_balance", 0)
+            t["promo_granted_total"] = spend.get("promo_granted_total", 0)
+            t["promo_spent_total"] = spend.get("promo_spent_total", 0)
+            t["promo_campaign_reserve"] = spend.get("promo_campaign_reserve", 0)
             t["promo_packages"] = spend.get("promo_packages", [])
             t["promo_updated_at"] = spend.get("promo_updated_at")
             t["promo_inflow"] = spend.get("promo_inflow", 0)
@@ -431,6 +435,10 @@ class Dashboard:
             "paid": t.get("paid", 0),
             "ads": ads, "ads_gross": promo, "promo_bonus": bonus,
             "promo_balance": t.get("promo_balance", 0),
+            "promo_grant_balance": t.get("promo_grant_balance", 0),
+            "promo_granted_total": t.get("promo_granted_total", 0),
+            "promo_spent_total": t.get("promo_spent_total", 0),
+            "promo_campaign_reserve": t.get("promo_campaign_reserve", 0),
             "promo_packages": t.get("promo_packages", []), "promo_updated_at": t.get("promo_updated_at"),
             "promo_inflow": t.get("promo_inflow", 0), "promo_source": t.get("promo_source"),
             "promo_bonus_pct": pct(bonus, revenue),
