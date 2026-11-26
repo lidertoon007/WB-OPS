@@ -247,6 +247,26 @@ class RepricerTests(unittest.TestCase):
         item = self.r.preview([{**change, "expected_current": 4000}])[0]
         self.assertIn("current_warning", item)
 
+    def test_first_price_already_done_skips_upload_and_preserves_legacy_error(self):
+        change = {"id": "wb1:111", "first_price": True, "target_base": 10000, "target_price": 5000}
+        item = self.r.preview([change])[0]
+        self.assertTrue(item["already_done"])
+        self.assertFalse(item["errors"])
+        self.assertFalse(item["confirm"])
+        legacy = self.r.preview([{"id": "wb1:111", "new_price": 5000}])[0]
+        self.assertIn("цена не меняется", legacy["errors"])
+        operation = self.r.apply([change], False)
+        self.assertIsNone(operation["id"])
+        self.assertEqual(operation["already_done"], ["wb1:111"])
+        self.assertFalse(self.fake.uploads)
+        with self.store._connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM repricer_ops").fetchone()[0], 0)
+        # В смешанном пакете на WB уходит только действительно изменяемый товар.
+        operation = self.wait_op(self.r.apply([change, {"id": "wb1:222", "new_price": 3300}], False))
+        self.assertEqual(operation["ok"], 2)
+        self.assertEqual(self.fake.uploads, [{"data": [{"nmID": 222, "price": 3300, "discount": 0}]}])
+        self.assertEqual(operation["prices"]["wb1:111"], 5000)
+
 
 class RepricerApiTests(unittest.TestCase):
     @classmethod
@@ -373,7 +393,7 @@ storage.set('wbops.prices.table.v1', JSON.stringify({rows: [row('r1', 'wb1:111',
 global.localStorage = {getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value)};
 global.window = {confirm: () => true};
 global.setTimeout = () => 1; global.clearTimeout = () => {};
-let capturedBlob, downloaded, previews = 0, applies = 0, polls = 0, catalogReads = 0;
+let capturedBlob, downloaded, previews = 0, applies = 0, polls = 0, catalogReads = 0, alreadyDone = 0, lastApplied = [];
 URL.createObjectURL = blob => { capturedBlob = blob; return 'blob:test'; }; URL.revokeObjectURL = () => {};
 global.document = {body: {append() {}}, createElement: () => ({click() { downloaded = this.download; }, remove() {}})};
 global.FormData = class {append() {}};
@@ -387,9 +407,9 @@ global.fetch = async (url, opt = {}) => {
     const {changes} = JSON.parse(opt.body); assert.equal(changes.length, 2);
     assert.ok(changes.every(change => change.new_price === change.target_price && change.first_price));
     assert.ok(changes.every(change => change.expected_current === 50000));
-    return response({items: changes.map((change, n) => ({id: change.id, errors: previews === 1 && n === 1 ? ['Ошибка цены WB'] : []}))});
+    return response({items: changes.map((change, n) => ({id: change.id, already_done: n < alreadyDone, new_price: 9796, errors: previews === 1 && n === 1 ? ['Ошибка цены WB'] : []}))});
   }
-  if (url === '/api/repricer/apply') { applies++; return response({id: 21}); }
+  if (url === '/api/repricer/apply') { applies++; lastApplied = JSON.parse(opt.body).changes; return response({id: 21}); }
   if (url === '/api/repricer/ops/21') {
     polls++;
     return response(polls === 1 ? {status: 'running'} : {status: 'Выполнено частично', items: {'wb1:111': 'ok', 'wb1:222': 'Товар в карантине'}, prices: {'wb1:111': 9705.8}, errors: 1});
@@ -430,6 +450,21 @@ global.fetch = async (url, opt = {}) => {
   assert.equal(downloaded, 'shablon_cen_wb.xlsx');
   const bytes = new Uint8Array(await capturedBlob.arrayBuffer()); assert.equal(bytes[0], 80); assert.equal(bytes[1], 75);
   assert.match(elements.get('[data-note]').textContent, /Backend ещё не перезапущен/);
+  alreadyDone = 1;
+  storage.set('wbops.prices.table.v1', JSON.stringify({rows: [row('r1', 'wb1:111', 'A'), row('r2', 'wb1:222', 'B')], job: null}));
+  vm.runInThisContext(source); await window.WBOPSRepricer.render(root);
+  await elements.get('[data-start]').onclick(); await new Promise(setImmediate);
+  assert.equal(applies, 2); assert.deepEqual(lastApplied.map(item => item.id), ['wb1:222']);
+  saved = JSON.parse(storage.get('wbops.prices.table.v1'));
+  assert.equal(saved.rows[0].state, 'done'); assert.match(saved.rows[0].status, /Готово · цена уже установлена/);
+  alreadyDone = 2;
+  storage.set('wbops.prices.table.v1', JSON.stringify({rows: [row('r1', 'wb1:111', 'A'), row('r2', 'wb1:222', 'B')], job: null}));
+  vm.runInThisContext(source); await window.WBOPSRepricer.render(root);
+  await elements.get('[data-start]').onclick(); await new Promise(setImmediate);
+  saved = JSON.parse(storage.get('wbops.prices.table.v1'));
+  assert.equal(applies, 2); assert.equal(saved.job, null);
+  assert.ok(saved.rows.every(item => item.state === 'done'));
+  assert.match(elements.get('[data-note]').textContent, /Все цены уже установлены/);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
         result = subprocess.run(["node", "-e", script], cwd=Path(__file__).parent, capture_output=True, text=True, timeout=20)

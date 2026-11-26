@@ -379,6 +379,9 @@ class Repricer:
         change = abs(new_before - old) / old * 100 if old else 0
         res["change_pct"] = round((new_before - old) / old * 100, 2) if old else None
         if old and abs(new_before - old) < 0.005 and r["price"] == base and r["discount"] == d:
+            if first_price:
+                res.update({"already_done": True, "confirm": False, "errors": [], "warnings": []})
+                return res
             res["errors"].append("цена не меняется")
         if cfg.get("max_change_pct") and change > cfg["max_change_pct"]:
             res["confirm"] = True
@@ -440,6 +443,12 @@ class Repricer:
                 raise RepricerError("За раз — не больше 1000 цен")
             if len({c["id"] for c in checked}) != len(checked):
                 raise RepricerError("Товар указан несколько раз — оставьте одну цену")
+            if all(item.get("already_done") for item in checked):
+                completed = {"id": None, "status": "Выполнено", "count": len(checked), "ok": len(checked), "errors": 0,
+                             "already_done": [item["id"] for item in checked], "items": {item["id"]: "ok" for item in checked},
+                             "prices": {item["id"]: item["new_price"] for item in checked}}
+                self._send_lock.release()
+                return completed
             with self.store._connect() as c:
                 op_id = c.execute("INSERT INTO repricer_ops(created_at, author, action, count, ok, errors, status, details) VALUES(?,?,?,?,0,0,'running','')",
                                   (datetime.now(timezone.utc).isoformat(), author, action, len(checked))).lastrowid
@@ -465,9 +474,13 @@ class Repricer:
 
     def _send_checked(self, op, checked, author):
         by_cab = {}
+        results = {item["id"]: "" for item in checked if item.get("already_done")}
+        applied_prices = {item["id"]: item["new_price"] for item in checked if item.get("already_done")}
         for c in checked:
+            if c.get("already_done"):
+                continue
             by_cab.setdefault(c["id"].split(":", 1)[0], []).append(c)
-        results, attempted, applied_prices = {}, {}, {}
+        attempted = {}
         for cid, items in by_cab.items():
             try:
                 cab = self._cabinet(cid)
@@ -504,6 +517,8 @@ class Repricer:
         ok = sum(1 for v in results.values() if v == "")
         with self.store._connect() as c:
             for it in checked:
+                if it.get("already_done"):
+                    continue
                 it = attempted.get(it["id"], it)
                 err = results.get(it["id"], "нет ответа WB")
                 c.execute("INSERT INTO repricer_log(op_id, at, cabinet_id, nm_id, vendor, old_price, new_price, old_client, new_client, author, status, error) "

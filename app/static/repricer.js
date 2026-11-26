@@ -221,19 +221,31 @@ window.WBOPSRepricer = (() => {
         const item = checked.get(row.id);
         const errors = item?.errors || (item ? [] : ['WB не вернул результат проверки товара']);
         row.current_warning = item?.current_warning || '';
-        status(row, errors.length ? 'error' : 'ready', errors.join('; ') || 'Готов к запуску');
+        if (!errors.length && item.already_done) {
+          row.expected_current = item.new_price ?? item.old_price ?? row.expected_current;
+          status(row, 'done', 'Готово · цена уже установлена ' + money(row.expected_current));
+        } else status(row, errors.length ? 'error' : 'ready', errors.join('; ') || 'Готов к запуску');
       }
       save(); drawTable();
       if (rows.some(row => row.state === 'error')) { note('Пакет не запущен. Исправьте ошибки в таблице.', true); return; }
-      const warnings = rows.filter(row => row.current_warning);
+      const pending = rows.filter(row => row.state !== 'done');
+      if (!pending.length) { note('Все цены уже установлены. Отправка не требуется.'); return; }
+      const warnings = pending.filter(row => row.current_warning);
       const warning = warnings.length ? `У ${warnings.length} товаров контрольная цена отличается от WB. Будет использована актуальная цена WB.\n` + warnings.slice(0, 5).map(row => row.current_warning).join('\n') + '\n\n' : '';
-      if (!window.confirm(warning + `Запустить изменение цен для ${rows.length} товаров?`)) { note('Запуск отменён.'); return; }
-      const operation = await api('/api/repricer/apply', {method: 'POST', body: {changes, confirm: true, action: 'Установка первых цен'}});
+      if (!window.confirm(warning + `Запустить изменение цен для ${pending.length} товаров?`)) { note('Запуск отменён.'); return; }
+      const operation = await api('/api/repricer/apply', {method: 'POST', body: {changes: pending.map(change), confirm: true, action: 'Установка первых цен'}});
+      if (!operation.id && operation.already_done?.length === pending.length) {
+        pending.forEach(row => {
+          row.expected_current = operation.prices?.[row.id] ?? row.expected_current;
+          status(row, 'done', 'Готово · цена уже установлена ' + money(row.expected_current));
+        });
+        save(); drawTable(); note('Все цены уже установлены. Отправка не требуется.'); return;
+      }
       if (!operation.id) throw new Error('Backend не вернул номер операции; проверьте результат в WB перед повторным запуском');
-      st.job = {id: operation.id, entries: rows.map(row => ({uid: row.uid, id: row.id}))};
-      rows.forEach(row => status(row, 'running', 'В процессе')); save(); drawTable(); note('Изменение цен выполняется.'); poll();
+      st.job = {id: operation.id, entries: pending.map(row => ({uid: row.uid, id: row.id}))};
+      pending.forEach(row => status(row, 'running', 'В процессе')); save(); drawTable(); note('Изменение цен выполняется.'); poll();
     } catch (error) {
-      rows.forEach(row => status(row, 'error', error.message)); save(); drawTable(); note('Пакет не запущен: ' + error.message, true);
+      rows.filter(row => row.state !== 'done').forEach(row => status(row, 'error', error.message)); save(); drawTable(); note('Пакет не запущен: ' + error.message, true);
     } finally { st.checking = false; drawTable(); }
   }
   async function poll() {
