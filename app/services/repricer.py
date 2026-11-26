@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -35,6 +36,7 @@ class Repricer:
         self.cache: dict[str, dict] = {}  # cabinet_id -> {"at", "goods", "showcase", "error"}
         self.ops: dict[int, dict] = {}
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
         with store._connect() as c:
             c.execute("CREATE TABLE IF NOT EXISTS repricer_items (cabinet_id TEXT, nm_id INTEGER, included INTEGER DEFAULT 0, "
                       "min_price REAL, max_price REAL, PRIMARY KEY(cabinet_id, nm_id))")
@@ -306,7 +308,13 @@ class Repricer:
         except (TypeError, ValueError):
             res["errors"].append("не указана новая цена")
             return res
+        if not math.isfinite(target) or target <= 0:
+            res["errors"].append("цена должна быть конечным числом больше нуля")
+            return res
         d = r["discount"] or 0
+        if not 0 <= d < 100:
+            res["errors"].append("некорректная скидка продавца — обновите данные WB")
+            return res
         base = int(round(target / (1 - d / 100))) if d < 100 else int(round(target))
         new_before = round(base * (1 - d / 100), 2)
         res.update({"new_base": base, "new_price": new_before,
@@ -314,6 +322,7 @@ class Repricer:
         res.update({"new_" + k: v for k, v in self.unit(r, new_before, econ).items() if k in ("profit", "margin")})
         if base < 1:
             res["errors"].append("цена должна быть больше нуля")
+            return res
         lo = r["min_price"] if r.get("min_price") is not None else cfg.get("min_price")
         hi = r["max_price"] if r.get("max_price") is not None else cfg.get("max_price")
         scope = "артикула" if r.get("min_price") is not None or r.get("max_price") is not None else "общего диапазона"
@@ -322,6 +331,13 @@ class Repricer:
         if hi and new_before > hi:
             res["errors"].append(f"выше максимума {scope}: {hi:,.0f} ₽".replace(",", " "))
         old = r["price_before_spp"] or 0
+        steps = self.price_steps(r["price"], base, d)
+        res["steps"] = steps
+        staged = len(steps) > 1
+        if staged:
+            res["confirm"] = True
+            res["warnings"].append("Ступенчатое снижение после подтверждения: " + " → ".join(f"{s['new_price']:g} ₽" for s in steps)
+                                   + ". Дневной лимит для этой цепочки не применяется. Ошибка или карантин WB остановят следующие шаги.")
         change = abs(new_before - old) / old * 100 if old else 0
         res["change_pct"] = round((new_before - old) / old * 100, 2) if old else None
         if old and abs(new_before - old) < 0.5:
@@ -330,7 +346,7 @@ class Repricer:
             res["confirm"] = True
             res["warnings"].append(f"изменение {change:.1f}% больше лимита {cfg['max_change_pct']:g}% за операцию — нужно подтверждение")
         start = self._day_start_price(r)
-        if cfg.get("daily_limit_pct") and start:
+        if cfg.get("daily_limit_pct") and start and not staged:
             day_change = abs(new_before - start) / start * 100
             if day_change > cfg["daily_limit_pct"]:
                 res["errors"].append(f"за сутки цена изменится на {day_change:.1f}% — больше дневного лимита {cfg['daily_limit_pct']:g}%")
@@ -347,6 +363,18 @@ class Repricer:
             res["warnings"].append("цена меняется для всех размеров")
         return res
 
+    @staticmethod
+    def price_steps(old_base, new_base, discount) -> list:
+        """Эвристика для больших снижений: шаги не более 2.5× с запасом на округление."""
+        current = int(old_base or 0)
+        bases = []
+        while current * 2 > new_base * 5:
+            current = max(new_base, (current * 2 + 4) // 5)
+            bases.append(current)
+        if not bases or bases[-1] != new_base:
+            bases.append(new_base)
+        return [{"new_base": base, "new_price": round(base * (1 - discount / 100), 2)} for base in bases]
+
     def _day_start_price(self, r):
         since = datetime.now(timezone.utc) - timedelta(hours=24)
         with self.store._connect() as c:
@@ -356,39 +384,85 @@ class Repricer:
 
     # ------------------------------------------------------------------ отправка на WB
     def apply(self, changes: list, confirmed_large: bool, author: str = "", action: str = "Изменение цены") -> dict:
-        checked = self.preview(changes=changes)
-        bad = [c for c in checked if c["errors"]]
-        if bad:
-            raise RepricerError(f"Есть ошибки у {len(bad)} товаров — исправьте или уберите их из списка")
-        if any(c["confirm"] for c in checked) and not confirmed_large:
-            raise RepricerError("Есть изменения больше лимита за операцию — подтвердите их")
-        if not checked:
-            raise RepricerError("Нет изменений")
-        if len(checked) > 1000:
-            raise RepricerError("За раз — не больше 1000 цен")
-        with self.store._connect() as c:
-            op_id = c.execute("INSERT INTO repricer_ops(created_at, author, action, count, ok, errors, status, details) VALUES(?,?,?,?,0,0,'running','')",
-                              (datetime.now(timezone.utc).isoformat(), author, action, len(checked))).lastrowid
-        op = {"id": op_id, "status": "running", "count": len(checked), "ok": 0, "errors": 0, "items": {c["id"]: "sending" for c in checked}}
-        self.ops[op_id] = op
-        threading.Thread(target=self._send, args=(op, checked, author), daemon=True).start()
+        if not self._send_lock.acquire(blocking=False):
+            raise RepricerError("Дождитесь завершения текущей отправки цен")
+        try:
+            checked = self.preview(changes=changes)
+            bad = [c for c in checked if c["errors"]]
+            if bad:
+                raise RepricerError(f"Есть ошибки у {len(bad)} товаров — исправьте или уберите их из списка")
+            if any(c["confirm"] for c in checked) and not confirmed_large:
+                raise RepricerError("Есть изменения больше лимита за операцию — подтвердите их")
+            if not checked:
+                raise RepricerError("Нет изменений")
+            if len(checked) > 1000:
+                raise RepricerError("За раз — не больше 1000 цен")
+            if len({c["id"] for c in checked}) != len(checked):
+                raise RepricerError("Товар указан несколько раз — оставьте одну цену")
+            with self.store._connect() as c:
+                op_id = c.execute("INSERT INTO repricer_ops(created_at, author, action, count, ok, errors, status, details) VALUES(?,?,?,?,0,0,'running','')",
+                                  (datetime.now(timezone.utc).isoformat(), author, action, len(checked))).lastrowid
+            op = {"id": op_id, "status": "running", "count": len(checked), "ok": 0, "errors": 0, "items": {c["id"]: "sending" for c in checked}}
+            self.ops[op_id] = op
+            threading.Thread(target=self._send, args=(op, checked, author), daemon=True).start()
+        except Exception:
+            self._send_lock.release()
+            raise
         return op
 
     def _send(self, op, checked, author):
+        try:
+            self._send_checked(op, checked, author)
+        except Exception as exc:
+            errors = {item["id"]: f"Отправка прервана: {exc}" for item in checked}
+            op.update({"status": "Ошибка", "ok": 0, "errors": len(checked), "items": errors})
+            with self.store._connect() as c:
+                c.execute("UPDATE repricer_ops SET ok=0, errors=?, status='Ошибка', details=? WHERE id=?",
+                          (len(checked), json.dumps(errors, ensure_ascii=False), op["id"]))
+        finally:
+            self._send_lock.release()
+
+    def _send_checked(self, op, checked, author):
         by_cab = {}
         for c in checked:
             by_cab.setdefault(c["id"].split(":", 1)[0], []).append(c)
-        results = {}
+        results, attempted = {}, {}
         for cid, items in by_cab.items():
             try:
                 cab = self._cabinet(cid)
-                results.update(self._upload(cab, items))
-            except RepricerError as exc:
-                results.update({c["id"]: str(exc) for c in items})
+                # Обычные цены отправляем пачкой; большие снижения — последовательными раундами.
+                active = list(items)
+                step_no = 0
+                while active:
+                    batch = [{**it, **it["steps"][step_no]} for it in active]
+                    for step in batch:
+                        if step.get("old_client") is not None and step["old_price"]:
+                            step["new_client"] = round(step["old_client"] * step["new_price"] / step["old_price"], 2)
+                        attempted[step["id"]] = step
+                    sent = self._upload(cab, batch)
+                    remaining = []
+                    for original, step in zip(active, batch):
+                        error = sent.get(step["id"], "WB не подтвердил применение цены")
+                        if error:
+                            results[step["id"]] = f"Шаг {step_no + 1}: {error}" if len(original["steps"]) > 1 else error
+                            continue
+                        self._cache_price(step)
+                        # Промежуточный успех сохраняется: после сбоя видна последняя принятая цена.
+                        if step_no + 1 < len(original["steps"]):
+                            self._log_step(op["id"], step, author)
+                            remaining.append({**original, "old_price": step["new_price"], "old_client": step.get("new_client")})
+                        else:
+                            results[step["id"]] = ""
+                    active = remaining
+                    step_no += 1
+            except (RepricerError, httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                for item in items:
+                    results.setdefault(item["id"], str(exc))
         now = datetime.now(timezone.utc).isoformat()
         ok = sum(1 for v in results.values() if v == "")
         with self.store._connect() as c:
             for it in checked:
+                it = attempted.get(it["id"], it)
                 err = results.get(it["id"], "нет ответа WB")
                 c.execute("INSERT INTO repricer_log(op_id, at, cabinet_id, nm_id, vendor, old_price, new_price, old_client, new_client, author, status, error) "
                           "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (op["id"], now, it["id"].split(":", 1)[0], it["nm_id"], it["vendor"], it["old_price"],
@@ -396,19 +470,25 @@ class Repricer:
             status = "Выполнено" if ok == len(checked) else ("Ошибка" if ok == 0 else "Выполнено частично")
             c.execute("UPDATE repricer_ops SET ok=?, errors=?, status=?, details=? WHERE id=?",
                       (ok, len(checked) - ok, status, json.dumps({k: v for k, v in results.items() if v}, ensure_ascii=False), op["id"]))
-        for it in checked:                         # обновить кэш, чтобы таблица сразу показала новую цену
-            if results.get(it["id"]) == "":
-                cache = self.cache.get(it["id"].split(":", 1)[0]) or {}
-                for g in cache.get("goods") or []:
-                    if g["nmID"] == it["nm_id"]:
-                        g["discount"] = it["discount"]
-                        old_client = cache.get("showcase", {}).get(it["nm_id"])
-                        if old_client and it["old_price"]:      # СПП прежняя, пока витрина не обновится
-                            cache["showcase"][it["nm_id"]] = round(it["new_price"] * old_client / it["old_price"], 2)
-                        for s in g.get("sizes") or []:
-                            s["price"], s["discountedPrice"] = it["new_base"], it["new_price"]
         op.update({"status": status, "ok": ok, "errors": len(checked) - ok,
                    "items": {k: ("ok" if v == "" else v) for k, v in results.items()}})
+
+    def _log_step(self, op_id, step, author):
+        with self.store._connect() as c:
+            c.execute("INSERT INTO repricer_log(op_id, at, cabinet_id, nm_id, vendor, old_price, new_price, old_client, new_client, author, status, error) "
+                      "VALUES(?,?,?,?,?,?,?,?,?,?,'ok','')", (op_id, datetime.now(timezone.utc).isoformat(), step["id"].split(":", 1)[0], step["nm_id"],
+                                                            step["vendor"], step["old_price"], step["new_price"], step["old_client"], step.get("new_client"), author))
+
+    def _cache_price(self, item):
+        cache = self.cache.get(item["id"].split(":", 1)[0]) or {}
+        for goods in cache.get("goods") or []:
+            if goods["nmID"] == item["nm_id"]:
+                goods["discount"] = item["discount"]
+                old_client = cache.get("showcase", {}).get(item["nm_id"])
+                if old_client and item["old_price"]:
+                    cache["showcase"][item["nm_id"]] = round(item["new_price"] * old_client / item["old_price"], 2)
+                for size in goods.get("sizes") or []:
+                    size["price"], size["discountedPrice"] = item["new_base"], item["new_price"]
 
     def _upload(self, cab, items) -> dict:
         data = [{"nmID": it["nm_id"], "price": it["new_base"], "discount": int(it["discount"] or 0)} for it in items]
@@ -421,6 +501,8 @@ class Repricer:
             if r.status_code >= 400 or body.get("error"):
                 raise RepricerError(body.get("errorText") or f"WB ответил {r.status_code}")
             upload_id = (body.get("data") or {}).get("id")
+            if not upload_id:
+                raise RepricerError("WB не вернул номер загрузки — применение цены не подтверждено")
             status = None
             for _ in range(20):
                 time.sleep(3)
@@ -428,18 +510,25 @@ class Repricer:
                 status = ((h.json() if h.status_code == 200 else {}).get("data") or {}).get("status")
                 if status in (3, 4, 5, 6):
                     break
-            if status == 3:
-                return {it["id"]: "" for it in items}
-            if status in (5, 6):
+            if status in (3, 5, 6):
                 g = client.get(PRICES + "/api/v2/history/goods/task", params={"uploadID": upload_id, "limit": 1000}, headers={"Authorization": cab.token})
-                errs = {x["nmID"]: x.get("errorText") or "ошибка WB" for x in ((g.json() if g.status_code == 200 else {}).get("data") or {}).get("historyGoods") or []
-                        if x.get("status") == 3}
+                if g.status_code != 200:
+                    raise RepricerError(f"WB ответил {g.status_code} при проверке товаров — применение цены не подтверждено")
+                details = {x["nmID"]: x for x in (g.json().get("data") or {}).get("historyGoods") or []}
                 for it in items:
-                    out[it["id"]] = errs.get(it["nm_id"], "")
+                    detail = details.get(it["nm_id"])
+                    if not detail:
+                        out[it["id"]] = "WB не вернул результат товара — применение цены не подтверждено"
+                    elif detail.get("errorText") or detail.get("status") == 3:
+                        out[it["id"]] = detail.get("errorText") or "ошибка WB"
+                    elif detail.get("status") == 2:
+                        out[it["id"]] = ""
+                    else:
+                        out[it["id"]] = f"WB не подтвердил применение цены (статус товара {detail.get('status')})"
                 return out
             if status == 4:
                 return {it["id"]: "загрузка отменена WB" for it in items}
-            return {it["id"]: "" for it in items}      # WB ещё обрабатывает — цена применится в течение нескольких минут
+            return {it["id"]: f"WB ещё обрабатывает загрузку {upload_id} (статус {status}); применение цены не подтверждено, цепочка остановлена" for it in items}
 
     # ------------------------------------------------------------------ история
     def history(self, author: str = "", status: str = "", since: str = "") -> list:

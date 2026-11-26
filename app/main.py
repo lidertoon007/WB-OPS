@@ -3020,8 +3020,8 @@ def repricer_item_history(item_id: str, days: int = 30) -> list[dict[str, object
 def repricer_export(body: dict):
     rows = {r["id"]: r for r in repricer.rows()}
     ids = body.get("ids") or list(rows)
-    table = [["Магазин", "Артикул МП", "Артикул продавца", "Название", "Бренд", "Цена до скидки", "Скидка, %", "Цена до СПП", "СПП, %",
-              "Цена для клиента", "Маржа, %", "Нет в наличии", "Новая цена до СПП", "Новая цена для клиента"]]
+    table = [["Магазин", "Артикул МП", "Артикул продавца", "Название", "Бренд", "Цена до скидки", "Скидка, %", "Цена после скидки продавца", "СПП, %",
+              "Цена для клиента", "Маржа, %", "Нет в наличии", "Новая цена после скидки продавца", "Новая цена для клиента"]]
     for rid in ids:
         r = rows.get(rid)
         if r:
@@ -3029,6 +3029,11 @@ def repricer_export(body: dict):
                           round(r["spp"], 1) if r["spp"] is not None else "", r["client_wallet"] or "", r.get("margin") if r.get("margin") is not None else "",
                           "" if r["in_stock"] else "да", "", ""])
     return _table_download({"Цены": table}, "xlsx", f"prices_wb_{datetime.now():%Y-%m-%d}")
+
+
+@app.get("/api/repricer/template")
+def repricer_template():
+    return _table_download({"Цены": [["Артикул", "Цена"]]}, "xlsx", "prices_wb_template")
 
 
 @app.post("/api/repricer/import")
@@ -3052,41 +3057,78 @@ async def repricer_import(file: UploadFile = File(...)) -> dict[str, object]:
         raise HTTPException(400, f"Не удалось прочитать файл: {exc}")
     if not table:
         raise HTTPException(400, "Файл пустой")
-    head = [str(h or "").strip().lower() for h in table[0]]
-    col = lambda name: head.index(name) if name in head else None        # noqa: E731
-    i_shop, i_nm, i_before, i_client = col("магазин"), col("артикул мп"), col("новая цена до спп"), col("новая цена для клиента")
-    if i_nm is None or (i_before is None and i_client is None):
-        raise HTTPException(400, "Нужны колонки «Магазин», «Артикул МП», «Новая цена до СПП» и/или «Новая цена для клиента»")
-    names = {c.name.strip().lower(): c.id for c in repricer.wb_cabinets()}
+    def norm(value):
+        return "".join(str(value or "").casefold().split()).replace("ё", "е")
+
+    head = [norm(h) for h in table[0]]
+
+    def col(*names):
+        return next((head.index(norm(name)) for name in names if norm(name) in head), None)
+
+    i_shop = col("магазин", "кабинет", "cabinet")
+    i_nm = col("артикул мп", "артикул wb", "nmID", "WB ID")
+    i_vendor = col("артикул продавца", "vendorCode", "vendor code", "offer_id")
+    i_article = col("артикул", "article")
+    i_before = col("новая цена после скидки продавца", "новая цена до СПП", "цена", "новая цена", "цена после скидки продавца", "price")
+    i_client = col("новая цена для клиента")
+    if all(i is None for i in (i_nm, i_vendor, i_article)) or (i_before is None and i_client is None):
+        raise HTTPException(400, "Нужны колонки «Артикул» и «Цена» (после скидки продавца). Для выбора кабинета добавьте «Магазин».")
     rows = repricer.rows()
     changes, skipped = [], 0
-    for line in table[1:]:
+
+    def article(value):
+        # Excel хранит числовой nmID как int или float; точки в vendorCode сохраняем.
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value or "").strip()
+
+    for line_no, line in enumerate(table[1:], start=2):
         cell = lambda i: (line[i] if i is not None and i < len(line) else None)        # noqa: E731,B023
-        nm = str(cell(i_nm) or "").strip().split(".")[0]
+        nm, vendor, generic = article(cell(i_nm)), article(cell(i_vendor)), article(cell(i_article))
+        label = nm or vendor or generic
         before, client = cell(i_before), cell(i_client)
-        if not nm or (before in (None, "") and client in (None, "")):
+        if not label or (before in (None, "") and client in (None, "")):
             skipped += 1
             continue
-        shop = str(cell(i_shop) or "").strip().lower()
-        cid = names.get(shop)
-        match = [r for r in rows if str(r["nm_id"]) == nm and (cid is None or r["cabinet_id"] == cid)]
-        if not match:
-            changes.append({"id": f"?:{nm}", "error": "артикул не найден"})
+        shop = norm(cell(i_shop))
+        scoped = [r for r in rows if not shop or shop in (norm(r["cabinet_id"]), norm(r["cabinet"]))]
+        info = {"id": f"?:{label}", "vendor": label, "line": line_no}
+        if shop and not scoped:
+            changes.append({**info, "error": "магазин не найден или в нём нет загруженных товаров"})
             continue
-        num = lambda v: float(str(v).replace(" ", "").replace(",", ".")) if v not in (None, "") else None   # noqa: E731
+        match = [r for r in scoped if (not nm or str(r["nm_id"]) == nm)
+                 and (not vendor or norm(r.get("vendor")) == norm(vendor))
+                 and (not generic or str(r["nm_id"]) == generic or norm(r.get("vendor")) == norm(generic))]
+        if not match:
+            changes.append({**info, "error": "артикул не найден"})
+            continue
+        if len(match) != 1:
+            changes.append({**info, "error": "найдено несколько товаров — укажите «Магазин» и/или «Артикул МП»"})
+            continue
         try:
-            ch = {"id": match[0]["id"]}
+            price = float("".join(str(before if before not in (None, "") else client).split()).replace(",", "."))
+            if not (0 < price < float("inf")):
+                raise ValueError
+            ch = {**info, "id": match[0]["id"]}
             if before not in (None, ""):
-                ch["new_price"] = num(before)
+                ch["new_price"] = price
             else:
-                ch["new_client"] = num(client)
+                ch["new_client"] = price
             changes.append(ch)
-        except ValueError:
-            changes.append({"id": match[0]["id"], "error": "цена — не число"})
+        except (ValueError, OverflowError):
+            changes.append({**info, "error": "цена должна быть конечным числом больше нуля"})
     if len(changes) > 1000:
         raise HTTPException(400, "За раз можно загрузить до 1000 цен")
+    counts = {}
+    for change in changes:
+        if not change.get("error"):
+            counts[change["id"]] = counts.get(change["id"], 0) + 1
+    for change in changes:
+        if counts.get(change["id"], 0) > 1:
+            change["error"] = "товар указан в файле несколько раз — оставьте одну цену"
     good = [c for c in changes if not c.get("error")]
-    items = _repricer_call(repricer.preview, good) + [{"id": c["id"], "errors": [c["error"]], "warnings": [], "nm_id": c["id"].split(":")[-1]}
+    items = _repricer_call(repricer.preview, good) + [{"id": c["id"], "errors": [c["error"]], "warnings": [], "nm_id": c["id"].split(":")[-1],
+                                                     "vendor": c["vendor"], "name": f"Строка {c['line']}"}
                                                       for c in changes if c.get("error")]
     return {"items": items, "skipped": skipped}
 

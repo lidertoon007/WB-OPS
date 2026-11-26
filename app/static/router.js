@@ -21,7 +21,7 @@
     ads:             {path: '/ads',             title: 'Аналитика рекламы', sub: 'Расходы, ДРР, кампании, артикулы, поисковые запросы и списания WB за рекламу', show: ['adsPage']},
     penalties:       {path: '/penalties',       title: 'Аналитика штрафов', sub: 'Штрафы Wildberries из отчётов реализации: динамика, причины, артикулы, задания FBS и прочие удержания', show: ['penaltiesPage']},
     stocks:          {path: '/stocks',          title: 'Остатки FBS', sub: 'Быстрое пополнение остатков по размерам и оповещения в Telegram, пока товар не закончился', show: ['stocksPage']},
-    repricer:        {path: '/repricer',        title: 'Репрайсер', sub: 'Управление ценами Wildberries с прогнозом маржи и лимитами безопасности', show: ['repricerPage']},
+    repricer:        {path: '/repricer',        title: 'Цены', sub: 'Первая цена после скидки продавца: Excel, ручное редактирование и ступенчатое снижение через API Wildberries', show: ['repricerPage']},
     rnp:             {path: '/rnp',             title: 'РНП', sub: 'Рука на пульсе: заказы, реклама, остатки и прогноз прибыли по дням и артикулам', show: ['rnpPage']},
     products:        {path: '/products',        title: 'Товары', sub: 'Модели, таблицы замеров и факты для ответов на вопросы', show: ['productTabs', 'modelsPanel', 'productKnowledgePanel']},
     nomenclature:    {path: '/nomenclature',    title: 'Товары', sub: 'Вся номенклатура: себестоимость и подготовка для ОПиУ', show: ['productTabs', 'nomenclature'], nav: 'products'},

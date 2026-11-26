@@ -26,6 +26,7 @@ CATALOG = {"DE-90": {"name": "Джинсы", "brand": "Deemivis", "category": "�
 class Fake:
     def __init__(self):
         self.uploads, self.status = [], 3
+        self.goods_status, self.with_details = 2, True
 
     def __call__(self, request):
         p = request.url.path
@@ -39,7 +40,9 @@ class Fake:
         if p == "/api/v2/history/tasks":
             return httpx.Response(200, json={"data": {"uploadID": 55, "status": self.status}})
         if p == "/api/v2/history/goods/task":
-            return httpx.Response(200, json={"data": {"historyGoods": [{"nmID": 111, "status": 3, "errorText": "Товар в акции"}]}})
+            details = [{"nmID": row["nmID"], "status": 3 if self.status == 5 else self.goods_status,
+                        "errorText": "Товар в акции" if self.status == 5 else ""} for row in self.uploads[-1]["data"]]
+            return httpx.Response(200, json={"data": {"historyGoods": details if self.with_details else []}})
         return httpx.Response(404)
 
 
@@ -123,6 +126,63 @@ class RepricerTests(unittest.TestCase):
             self.r.refresh(force=True)
         self.assertEqual(self.r.refresh(), {"wb1": "свежие"})
 
+    def test_steps_preserve_discount_and_require_confirmation(self):
+        steps = self.r.price_steps(100000, 10000, 50)
+        self.assertEqual([s["new_price"] for s in steps], [20000, 8000, 5000])
+        before = 50000
+        for step in steps:
+            self.assertLessEqual(before / step["new_price"], 2.5)
+            before = step["new_price"]
+        # Граничные суммы также округляются в сторону меньшего снижения.
+        self.assertEqual(self.r.price_steps(101, 10, 0)[0]["new_base"], 41)
+        self.assertEqual([s["new_base"] for s in self.r.price_steps(2800, 1000, 0)], [1120, 1000])
+        for goods in self.r.cache["wb1"]["goods"]:
+            if goods["nmID"] == 111:
+                for size in goods["sizes"]:
+                    size.update(price=100000, discountedPrice=50000)
+        preview = self.r.preview(changes=[{"id": "wb1:111", "new_price": 5000}])[0]
+        self.assertFalse(preview["errors"], preview)
+        self.assertTrue(preview["confirm"])
+        self.assertEqual(preview["steps"], steps)
+        with self.assertRaises(RepricerError):
+            self.r.apply([{"id": "wb1:111", "new_price": 5000}], False)
+        op = self.wait_op(self.r.apply([{"id": "wb1:111", "new_price": 5000}], True))
+        self.assertEqual((op["status"], op["ok"]), ("Выполнено", 1))
+        self.assertEqual([u["data"][0]["price"] for u in self.fake.uploads], [40000, 16000, 10000])
+        self.assertTrue(all(u["data"][0]["discount"] == 50 for u in self.fake.uploads))
+        self.assertEqual(self.row(111)["price_before_spp"], 5000)
+        self.assertEqual([h["new_price"] for h in self.r.item_history("wb1:111")], [20000, 8000, 5000])
+
+    def test_chain_stops_at_error_and_keeps_applied_intermediate_price(self):
+        uploads = []
+
+        def upload(cab, items):
+            uploads.append(items[0]["new_price"])
+            return {items[0]["id"]: "" if len(uploads) == 1 else "Товар в карантине"}
+
+        with mock.patch.object(self.r, "_upload", upload):
+            op = self.wait_op(self.r.apply([{"id": "wb1:111", "new_price": 500}], True))
+        self.assertEqual(uploads, [2000, 800])
+        self.assertEqual((op["status"], op["ok"]), ("Ошибка", 0))
+        self.assertIn("Товар в карантине", op["items"]["wb1:111"])
+        self.assertEqual(self.row(111)["price_before_spp"], 2000)
+        self.assertEqual([h["new_price"] for h in self.r.item_history("wb1:111") if h["status"] == "ok"], [2000])
+
+    def test_timeout_and_missing_or_unknown_details_never_succeed(self):
+        cab = self.r._cabinet("wb1")
+        items = [{"id": "wb1:111", "nm_id": 111, "new_base": 11000, "discount": 50}]
+        self.fake.status = 1
+        self.assertIn("не подтверждено", self.r._upload(cab, items)["wb1:111"])
+        self.fake.status, self.fake.with_details = 3, False
+        self.assertIn("не подтверждено", self.r._upload(cab, items)["wb1:111"])
+        self.fake.with_details, self.fake.goods_status = True, 4
+        self.assertIn("не подтвердил", self.r._upload(cab, items)["wb1:111"])
+
+    def test_nonfinite_or_nonpositive_price_rejected(self):
+        for price in (float("nan"), float("inf"), 0, -1, 0.01):
+            preview = self.r.preview(changes=[{"id": "wb1:111", "new_price": price}])[0]
+            self.assertTrue(preview["errors"])
+
 
 class RepricerApiTests(unittest.TestCase):
     @classmethod
@@ -163,6 +223,53 @@ class RepricerApiTests(unittest.TestCase):
         self.assertEqual([i["id"] for i in res["items"]], ["wb1:111", "?:999"])
         self.assertEqual(res["items"][0]["new_price"], 5200)
         self.assertEqual(res["items"][1]["errors"], ["артикул не найден"])
+
+    def import_csv(self, text, rows):
+        from fastapi.testclient import TestClient
+        with mock.patch.object(self.m.repricer, "rows", lambda: rows), \
+                mock.patch.object(self.m.repricer, "preview", lambda changes=None, mass=None, ids=None: [
+                    {"id": c["id"], "new_price": c.get("new_price"), "errors": []} for c in changes]):
+            response = TestClient(self.m.app).post("/api/repricer/import", files={"file": ("prices.csv", text.encode("utf-8-sig"))})
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_simple_import_vendor_or_nmid(self):
+        rows = [{"id": "wb1:111", "cabinet_id": "wb1", "cabinet": "ИП", "nm_id": 111, "vendor": "de.90"},
+                {"id": "wb1:222", "cabinet_id": "wb1", "cabinet": "ИП", "nm_id": 222, "vendor": "B012"}]
+        result = self.import_csv("Артикул;Цена\n DE.90 ;5 200,50\n222;3000\n", rows)
+        self.assertEqual([(i["id"], i["new_price"]) for i in result["items"]], [("wb1:111", 5200.5), ("wb1:222", 3000)])
+
+    def test_ambiguous_unknown_shop_and_duplicate_rows_rejected(self):
+        rows = [{"id": "wb1:111", "cabinet_id": "wb1", "cabinet": "ИП 1", "nm_id": 111, "vendor": "de-90"},
+                {"id": "wb2:222", "cabinet_id": "wb2", "cabinet": "ИП 2", "nm_id": 222, "vendor": "de-90"}]
+        result = self.import_csv("Артикул;Цена\nde-90;5200\n", rows)
+        self.assertIn("несколько товаров", result["items"][0]["errors"][0])
+        result = self.import_csv("Артикул;Цена;Магазин\nde-90;5200;ИП 2\n", rows)
+        self.assertEqual(result["items"][0]["id"], "wb2:222")
+        result = self.import_csv("Артикул;Цена;Магазин\nde-90;5200;Неизвестный\n", rows)
+        self.assertIn("магазин не найден", result["items"][0]["errors"][0])
+        result = self.import_csv("Артикул;Цена\n111;5200\n111;5300\n", rows)
+        self.assertEqual(len(result["items"]), 2)
+        self.assertTrue(all("несколько раз" in i["errors"][0] for i in result["items"]))
+
+    def test_invalid_prices_rejected(self):
+        row = {"id": "wb1:111", "cabinet_id": "wb1", "cabinet": "ИП", "nm_id": 111, "vendor": "de-90"}
+        for price in ("nan", "inf", "-10", "0", "abc"):
+            result = self.import_csv(f"Артикул;Цена\nde-90;{price}\n", [row])
+            self.assertTrue(result["items"][0]["errors"])
+
+    def test_template_and_prices_page(self):
+        from fastapi.testclient import TestClient
+        import openpyxl
+        client = TestClient(self.m.app)
+        response = client.get("/api/repricer/template")
+        self.assertEqual(response.status_code, 200)
+        workbook = openpyxl.load_workbook(io.BytesIO(response.content), read_only=True)
+        self.assertEqual(list(next(workbook.active.iter_rows(values_only=True))), ["Артикул", "Цена"])
+        response = client.get("/repricer")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('<span>Цены</span>', response.text)
+        self.assertIn("Цена после скидки продавца", response.text)
 
 
 if __name__ == "__main__":

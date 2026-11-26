@@ -1,10 +1,10 @@
-/* WB OPS: «Репрайсер» — ручное управление ценами Wildberries с прогнозом маржи до отправки и лимитами безопасности. */
+/* WB OPS: «Цены» — первая цена после скидки продавца через API Wildberries. */
 window.WBOPSRepricer = (() => {
   const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
   const num = (v, d = 0) => v == null || v === '' || isNaN(v) ? '—' : Number(v).toLocaleString('ru-RU', {minimumFractionDigits: d, maximumFractionDigits: d});
   const pct = v => v == null ? '—' : num(v, 1) + '%';
   const dt = s => s ? new Date(s).toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'}) : '—';
-  const st = {data: null, tab: 'prices', f: {cabinet: '', brand: '', category: '', q: '', inStock: true, onlyAdded: true}, sel: new Set(), sending: new Set(),
+  const st = {data: null, tab: 'prices', f: {cabinet: '', brand: '', category: '', q: '', inStock: false, onlyAdded: false}, sel: new Set(), sending: new Set(),
     edit: null, open: null, openHist: null, histDays: 7, modal: null, ops: [], hf: {days: 30, author: '', status: ''}, lastRefresh: 0, tick: null, setQ: '', setOnly: false};
   let root = null;
   try { Object.assign(st.f, JSON.parse(localStorage.getItem('wbops.repricer.f') || '{}')); } catch (e) { /* без хранилища */ }
@@ -23,7 +23,8 @@ window.WBOPSRepricer = (() => {
   async function render(section) {
     root = section;
     root.className = 'panel rv-page rp-page';
-    root.innerHTML = `<div class="db-head"><h2>Репрайсер Wildberries</h2><span class="muted db-fresh">Цена уходит на WB только после вашего подтверждения</span></div>
+    root.innerHTML = `<div class="db-head"><h2>Цены Wildberries</h2><span class="muted db-fresh">Цена уходит на WB только после вашего подтверждения</span></div>
+      <p class="muted">Задайте первую цену после скидки продавца — до скидок WB, СПП и Кошелька. Загрузите Excel «Артикул — Цена» или нажмите ✎ в таблице. Резкое снижение (например, с 50 000 ₽) сервис выполнит ступенями после подтверждения: это снижает риск карантина, но не гарантирует его отсутствие. Ошибка или карантин WB остановят цепочку; автоматическое снятие карантина недоступно.</p>
       <div class="rnp-tabs rp-tabs" role="tablist">${[['prices', 'Управление ценами'], ['history', 'История действий'], ['settings', 'Настройки']].map(([k, t]) =>
         `<button type="button" role="tab" data-tab="${k}">${t}</button>`).join('')}</div>
       <div data-body><p class="muted">Загружаю цены с WB…</p></div><div data-modal></div>`;
@@ -65,7 +66,7 @@ window.WBOPSRepricer = (() => {
     ['stock', 'Остаток', 'num', r => r.in_stock ? r.stock : 0],
     ['price', 'Цена до скидки', 'num', r => r.price],
     ['discount', 'Скидка, %', 'num', r => r.discount],
-    ['price_before_spp', 'Цена до СПП', 'num', r => r.price_before_spp],
+    ['price_before_spp', 'Цена после скидки продавца', 'num', r => r.price_before_spp],
     ['spp', 'СПП', 'num', r => r.in_stock ? r.spp : null],
     ['client_wallet', 'Цена для клиента', 'num', r => r.in_stock ? r.client_wallet : null],
     ['margin', 'Маржа', 'num', r => r.margin],
@@ -136,10 +137,11 @@ window.WBOPSRepricer = (() => {
         <label class="rp-check"><input type="checkbox" data-f="onlyAdded" ${st.f.onlyAdded ? 'checked' : ''}> Только добавленные</label>
         <span class="rp-tools"><span data-clock></span><button type="button" class="db-ghost" data-refresh title="Обновить цены с WB (раз в минуту)">↻ Обновить</button>
           <button type="button" class="db-ghost" data-export>⇩ Выгрузить в файл</button>
-          <label class="db-ghost rp-upload">⇧ Загрузить файл<input type="file" accept=".xlsx,.csv" data-import hidden></label></span>
+          <a class="db-ghost" href="/api/repricer/template" download>⇩ Шаблон Excel</a>
+          <label class="db-ghost rp-upload">⇧ Загрузить Excel/CSV<input type="file" accept=".xlsx,.csv" data-import hidden></label></span>
       </div>
       ${errs.map(e => `<div class="db-note">${esc(e)}</div>`).join('')}
-      ${!added && st.f.onlyAdded ? `<div class="db-note">В репрайсер ещё не добавлены артикулы. Отметьте нужные в «Настройки → Артикулы» или снимите галочку «Только добавленные». <button type="button" class="rv-link" data-add-all>Добавить все артикулы</button></div>` : ''}
+      ${!added && st.f.onlyAdded ? `<div class="db-note">В подборку ещё не добавлены артикулы. Отметьте нужные в «Настройки → Артикулы» или снимите галочку «Только добавленные». <button type="button" class="rv-link" data-add-all>Добавить все артикулы</button></div>` : ''}
       <div class="rnp-scroll rp-scroll"><table class="rnp-table rp-table"><thead><tr>
         <th class="rnp-sticky rp-c"><input type="checkbox" data-all aria-label="Выбрать все на экране" ${rows.length && rows.every(r => st.sel.has(r.id)) ? 'checked' : ''}></th>
         ${COLS.filter(c => c[0] !== 'discount').map(([k, t]) => `<th class="${k === 'vendor' ? 'rp-name' : ''}" aria-sort="${st.f.sort === k ? (st.f.desc ? 'descending' : 'ascending') : 'none'}">
@@ -151,7 +153,7 @@ window.WBOPSRepricer = (() => {
               ${type === 'num' ? 'title="Например: 5000-6000, >5000, <10, 5000; «-» — нет значения" inputmode="text"' : ''}>`}</th>`).join('')}</tr></thead>
       <tbody>${rows.slice(0, 500).map(rowHtml).join('') || '<tr><td colspan="10" class="muted">Ничего не найдено.</td></tr>'}</tbody></table></div>
       ${rows.length > 500 ? `<p class="muted">Показаны первые 500 из ${rows.length}. Уточните фильтр.</p>` : ''}
-      <p class="muted rp-note">Маржа — прогноз на проданную штуку: цена до СПП минус комиссия, эквайринг, логистика, реклама и налог (по отчёту WB за 60 дней), себестоимость и подготовка. Цена для клиента — с учётом СПП и скидки WB Кошелька из настроек.</p>
+      <p class="muted rp-note">В шаблоне укажите артикул продавца или WB ID и цену после скидки продавца. Если артикул есть в нескольких кабинетах, добавьте колонку «Магазин». Перед отправкой сервис покажет расчёт и ступени снижения; результат официального API WB доступен в истории. Маржа — прогноз по отчёту WB за 60 дней. Цена для клиента учитывает СПП и Кошелёк.</p>
       ${st.sel.size ? `<div class="rp-bar"><b>Выбрано: ${st.sel.size}</b><button type="button" class="rv-link" data-sel-filter>Выбрать все по фильтрам (${rows.length})</button>
         <button type="button" class="rv-link" data-sel-clear>Снять выбор</button><button type="button" class="btn" data-mass>Изменить цену</button></div>` : ''}`;
     bindPrices(rows);
@@ -162,7 +164,7 @@ window.WBOPSRepricer = (() => {
     const editing = st.edit && st.edit.id === r.id, sending = st.sending.has(r.id);
     const cell = (kind, value) => editing && st.edit.kind === kind
       ? `<form class="rp-edit" data-edit-form><input name="v" type="number" min="1" step="1" value="${Math.round(value || 0)}" aria-label="Новая цена" autofocus><button class="btn" type="submit">ОК</button><button type="button" class="rv-link" data-edit-cancel>×</button></form>`
-      : `${num(value)} ₽ <button type="button" class="rp-pen" data-edit="${esc(r.id)}" data-kind="${kind}" aria-label="Изменить ${kind === 'before' ? 'цену до СПП' : 'цену для клиента'}" ${kind === 'client' && r.client_wallet == null ? 'disabled title="Нет данных о цене для клиента — задайте цену до СПП"' : ''}>✎</button>`;
+      : `${num(value)} ₽ <button type="button" class="rp-pen" data-edit="${esc(r.id)}" data-kind="${kind}" aria-label="Изменить ${kind === 'before' ? 'цену после скидки продавца' : 'цену для клиента'}" ${kind === 'client' && r.client_wallet == null ? 'disabled title="Нет данных о цене для клиента — задайте цену после скидки продавца"' : ''}>✎</button>`;
     return `<tr class="${sending ? 'rp-sending' : ''}" data-row="${esc(r.id)}">
       <td class="rnp-sticky rp-c"><input type="checkbox" data-sel="${esc(r.id)}" ${st.sel.has(r.id) ? 'checked' : ''} aria-label="Выбрать ${esc(r.vendor)}"></td>
       <td class="rp-name"><button type="button" class="rp-link" data-hist="${esc(r.id)}">${esc(r.vendor)}</button>${r.included ? '' : ' <span class="rp-tag">не в контуре</span>'}
@@ -211,6 +213,7 @@ window.WBOPSRepricer = (() => {
       } catch (e) { alert(e.message); }
     };
     body.querySelector('[data-import]').onchange = async e => {
+      if (!e.target.files.length) return;
       const fd = new FormData(); fd.append('file', e.target.files[0]); e.target.value = '';
       try { const res = await api('/api/repricer/import', {method: 'POST', body: fd}); openModal({items: res.items, title: 'Цены из файла', note: res.skipped ? `Строк без новой цены пропущено: ${res.skipped}` : ''}); }
       catch (err) { alert(err.message); }
@@ -250,17 +253,17 @@ window.WBOPSRepricer = (() => {
     const switcher = `<div class="rp-hist-head"><b>История цен ${esc(r.vendor)}</b>${[[1, 'День'], [7, 'Неделя'], [30, 'Месяц']].map(([d, t]) => `<button type="button" class="${st.histDays === d ? 'on' : ''}" data-hdays="${d}">${t}</button>`).join('')}</div>`;
     if (h == null) return switcher + '<p class="muted">Загрузка…</p>';
     const ok = h.filter(x => x.status === 'ok');
-    if (!ok.length) return switcher + '<p class="muted">За период цену через репрайсер не меняли.</p>';
+    if (!ok.length) return switcher + '<p class="muted">За период цену через сервис не меняли.</p>';
     const pts = [{at: ok[0].at, b: ok[0].old_price, c: ok[0].old_client}, ...ok.map(x => ({at: x.at, b: x.new_price, c: x.new_client})), {at: new Date().toISOString(), b: r.price_before_spp, c: r.client_wallet}];
     const W = 640, H = 160, P = 34, xs = pts.map(p => +new Date(p.at)), ys = pts.flatMap(p => [p.b, p.c]).filter(v => v != null);
     const x0 = Math.min(...xs), x1 = Math.max(...xs) || x0 + 1, y0 = Math.min(...ys) * 0.97, y1 = Math.max(...ys) * 1.03;
     const X = t => P + (t - x0) / Math.max(1, x1 - x0) * (W - 2 * P), Y = v => H - 22 - (v - y0) / Math.max(1, y1 - y0) * (H - 40);
     const step = key => pts.filter(p => p[key] != null).map((p, i, a) => `${i ? `L${X(+new Date(p.at))},${Y(a[i - 1][key])} ` : 'M'}${X(+new Date(p.at))},${Y(p[key])}`).join(' ');
     const dots = key => pts.filter(p => p[key] != null).map(p => `<circle cx="${X(+new Date(p.at))}" cy="${Y(p[key])}" r="4"><title>${dt(p.at)} · ${num(p[key])} ₽</title></circle>`).join('');
-    return `${switcher}<svg class="rp-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="График цены до СПП и цены для клиента">
+    return `${switcher}<svg class="rp-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="График цены после скидки продавца и цены для клиента">
         <text x="${P}" y="12" class="rp-ax">${num(y1)} ₽</text><text x="${P}" y="${H - 6}" class="rp-ax">${num(y0)} ₽</text>
         <path d="${step('b')}" class="rp-l1"/><g class="rp-d1">${dots('b')}</g><path d="${step('c')}" class="rp-l2"/><g class="rp-d2">${dots('c')}</g></svg>
-      <div class="rp-legend"><span><i class="rp-k1"></i>Цена до СПП</span><span><i class="rp-k2"></i>Цена для клиента</span></div>
+      <div class="rp-legend"><span><i class="rp-k1"></i>Цена после скидки продавца</span><span><i class="rp-k2"></i>Цена для клиента</span></div>
       <table class="tr-table"><thead><tr><th>Когда</th><th>Кто</th><th class="r">Было</th><th class="r">Стало</th><th>Статус</th></tr></thead><tbody>
       ${h.slice().reverse().map(x => `<tr><td>${dt(x.at)}</td><td>${esc(x.author)}</td><td class="r">${num(x.old_price)}</td><td class="r">${num(x.new_price)}</td>
         <td>${x.status === 'ok' ? '<span class="tr-chip ok">Выполнено</span>' : `<span class="tr-chip bad" title="${esc(x.error)}">Ошибка</span> ${esc(x.error)}`}</td></tr>`).join('')}</tbody></table>`;
@@ -284,13 +287,13 @@ window.WBOPSRepricer = (() => {
     host.innerHTML = `<div class="rp-overlay" data-close-bg><div class="rp-modal" role="dialog" aria-modal="true" aria-label="${esc(m.title)}">
       <header><h3>${esc(m.title)}</h3><button type="button" class="rnp-del" data-close aria-label="Закрыть">×</button></header>
       ${m.mass ? `<form class="rp-mass" data-mass-form>
-        <label>Цена<select name="kind"><option value="before" ${m.mass.kind === 'before' ? 'selected' : ''}>до СПП</option><option value="client" ${m.mass.kind === 'client' ? 'selected' : ''}>для клиента</option></select></label>
+        <label>Цена<select name="kind"><option value="before" ${m.mass.kind === 'before' ? 'selected' : ''}>после скидки продавца</option><option value="client" ${m.mass.kind === 'client' ? 'selected' : ''}>для клиента</option></select></label>
         <label>Действие<select name="action"><option value="set" ${m.mass.action === 'set' ? 'selected' : ''}>задать</option><option value="up" ${m.mass.action === 'up' ? 'selected' : ''}>увеличить на</option><option value="down" ${m.mass.action === 'down' ? 'selected' : ''}>уменьшить на</option></select></label>
         <label>Значение<input name="value" type="number" step="0.1" min="0" required value="${esc(m.mass.value)}"></label>
         <label>В чём<select name="unit"><option value="pct" ${m.mass.unit === 'pct' ? 'selected' : ''}>%</option><option value="rub" ${m.mass.unit === 'rub' ? 'selected' : ''}>₽</option></select></label>
         <button class="btn secondary" type="submit">Рассчитать для всех</button></form>` : ''}
       ${m.note ? `<p class="muted">${esc(m.note)}</p>` : ''}
-      ${items.length ? `<div class="rp-modal-table"><table class="tr-table"><thead><tr><th>Товар</th><th class="r">Было до СПП</th><th class="r">Станет до СПП</th><th class="r">Для клиента</th><th class="r">Маржа</th><th class="r">Прибыль, ₽/шт</th><th>Проверка</th><th></th></tr></thead><tbody>
+      ${items.length ? `<p class="muted">«Было» и «Станет» — цена после скидки продавца.</p><div class="rp-modal-table"><table class="tr-table"><thead><tr><th>Товар</th><th class="r">Было</th><th class="r">Станет</th><th class="r">Для клиента</th><th class="r">Маржа</th><th class="r">Прибыль, ₽/шт</th><th>Проверка</th><th></th></tr></thead><tbody>
         ${items.map((i, n) => `<tr class="${(i.errors || []).length ? 'rp-bad' : i.confirm ? 'rp-warn' : ''}">
           <td><b>${esc(i.vendor || i.nm_id)}</b><small>${esc(i.name || '')}</small></td>
           <td class="r">${num(i.old_price)}</td>
@@ -378,13 +381,13 @@ window.WBOPSRepricer = (() => {
     const rows = d.rows.filter(r => (!st.setOnly || r.included) && (!q || `${r.vendor} ${r.nm_id} ${r.name} ${r.brand}`.toLowerCase().includes(q)));
     body.innerHTML = `<section class="tr-box"><h3>Безопасность</h3>
       <form class="tr-set-grid" data-safety>
-        <label>Общий диапазон: мин. цена до СПП, ₽<input name="min_price" type="number" min="0" step="1" value="${s.min_price ?? ''}" placeholder="не задана"></label>
-        <label>Общий диапазон: макс. цена до СПП, ₽<input name="max_price" type="number" min="0" step="1" value="${s.max_price ?? ''}" placeholder="не задана"></label>
+        <label>Мин. цена после скидки продавца, ₽<input name="min_price" type="number" min="0" step="1" value="${s.min_price ?? ''}" placeholder="не задана"></label>
+        <label>Макс. цена после скидки продавца, ₽<input name="max_price" type="number" min="0" step="1" value="${s.max_price ?? ''}" placeholder="не задана"></label>
         <label>Макс. изменение за операцию, %<input name="max_change_pct" type="number" min="0" step="0.5" value="${s.max_change_pct ?? ''}"></label>
         <label>Дневной лимит, %<input name="daily_limit_pct" type="number" min="0" step="0.5" value="${s.daily_limit_pct ?? ''}"></label>
         <label>Менять цену артикула не чаще, ч<input name="min_interval_hours" type="number" min="0" step="0.5" value="${s.min_interval_hours ?? ''}"></label>
         <div class="wide tr-actions"><button class="btn" type="submit">Сохранить</button><span class="muted" data-state></span></div></form>
-      <p class="muted rp-note">Индивидуальный диапазон артикула (ниже) главнее общего. Изменение больше лимита за операцию требует отдельного подтверждения; дневной лимит и частота блокируют отправку.</p></section>
+      <p class="muted rp-note">Индивидуальный диапазон артикула (ниже) главнее общего. Крупное изменение требует подтверждения; дневной лимит блокирует обычные изменения, но не подтверждённую цепочку ступенчатого снижения. Ограничение частоты сохраняется.</p></section>
       <section class="tr-box"><h3>WB Кошелёк</h3><p class="muted rp-note">WB не отдаёт скидку Кошелька по API — укажите её для каждого магазина, чтобы цена для клиента считалась верно.</p>
       <form class="tr-set-grid" data-wallet>${d.cabinets.map(c => `<label>${esc(c.name)}, %<input name="${esc(c.id)}" type="number" min="0" max="49" step="0.1" value="${s.wallet[c.id] ?? 0}"></label>`).join('')}
         <div class="wide tr-actions"><button class="btn" type="submit">Сохранить</button><span class="muted" data-state></span></div></form></section>
@@ -392,9 +395,9 @@ window.WBOPSRepricer = (() => {
       <div class="db-filters"><input type="search" data-set-q placeholder="Поиск" value="${esc(st.setQ)}" aria-label="Поиск артикула">
         <label class="rp-check"><input type="checkbox" data-set-only ${st.setOnly ? 'checked' : ''}> Только добавленные</label>
         <button type="button" class="db-ghost" data-add-all>Добавить все артикулы</button><button type="button" class="db-ghost" data-remove-all>Убрать все</button></div>
-      <div class="rnp-scroll"><table class="rnp-table rp-table"><thead><tr><th class="rnp-sticky">Артикул</th><th>Цена до СПП</th><th>В репрайсере</th><th>Мин. цена, ₽</th><th>Макс. цена, ₽</th></tr></thead><tbody>
+      <div class="rnp-scroll"><table class="rnp-table rp-table"><thead><tr><th class="rnp-sticky">Артикул</th><th>Цена после скидки продавца</th><th>В подборке</th><th>Мин. цена, ₽</th><th>Макс. цена, ₽</th></tr></thead><tbody>
       ${rows.slice(0, 500).map(r => `<tr><td class="rnp-sticky rp-name"><b>${esc(r.vendor)}</b><small>${esc(r.name || '')} · ${r.nm_id}</small></td><td>${num(r.price_before_spp)}</td>
-        <td><button type="button" class="st-switch ${r.included ? 'on' : ''}" role="switch" aria-checked="${r.included}" data-inc="${esc(r.id)}" aria-label="В репрайсере ${esc(r.vendor)}"><i></i></button></td>
+        <td><button type="button" class="st-switch ${r.included ? 'on' : ''}" role="switch" aria-checked="${r.included}" data-inc="${esc(r.id)}" aria-label="В подборке ${esc(r.vendor)}"><i></i></button></td>
         <td><input class="rp-lim" type="number" min="0" step="1" data-lim="min_price" data-id="${esc(r.id)}" value="${r.min_price ?? ''}" placeholder="общий"></td>
         <td><input class="rp-lim" type="number" min="0" step="1" data-lim="max_price" data-id="${esc(r.id)}" value="${r.max_price ?? ''}" placeholder="общий"></td></tr>`).join('')}</tbody></table></div></section>`;
     const sf = body.querySelector('[data-safety]');
@@ -413,7 +416,7 @@ window.WBOPSRepricer = (() => {
     sq.oninput = () => { st.setQ = sq.value; const pos = sq.selectionStart; drawSettings(); const n = root.querySelector('[data-set-q]'); n.focus(); n.setSelectionRange(pos, pos); };
     body.querySelector('[data-set-only]').onchange = e => { st.setOnly = e.target.checked; drawSettings(); };
     body.querySelector('[data-add-all]').onclick = async () => { await api('/api/repricer/items', {method: 'PUT', body: {ids: rows.map(r => r.id), included: true}}); await load(); };
-    body.querySelector('[data-remove-all]').onclick = async () => { if (confirm('Убрать все артикулы из репрайсера?')) { await api('/api/repricer/items', {method: 'PUT', body: {ids: rows.map(r => r.id), included: false}}); await load(); } };
+    body.querySelector('[data-remove-all]').onclick = async () => { if (confirm('Убрать все артикулы из подборки?')) { await api('/api/repricer/items', {method: 'PUT', body: {ids: rows.map(r => r.id), included: false}}); await load(); } };
     body.querySelectorAll('[data-inc]').forEach(b => b.onclick = async () => {
       const on = b.getAttribute('aria-checked') !== 'true';
       await api('/api/repricer/items', {method: 'PUT', body: {ids: [b.dataset.inc], included: on}});
