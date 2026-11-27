@@ -1,0 +1,20 @@
+[Unit]
+Description=Private D-Bus for Netdata systemd status
+
+[Service]
+Type=simple
+User=netdata
+Group=netdata
+RuntimeDirectory=wb-ops-netdata-dbus
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
+ExecStart=/usr/bin/dbus-daemon --config-file=/etc/wb-ops-netdata/netdata-dbus-bus.conf --nofork --nopidfile
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

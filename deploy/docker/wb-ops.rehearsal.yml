@@ -1,0 +1,68 @@
+name: wbops-rehearsal
+
+services:
+  wb-ops:
+    build:
+      context: ${WBOPS_BUILD_CONTEXT:?Provide an allowlisted clean build context}
+      dockerfile: ${WBOPS_DOCKERFILE:?Provide the absolute wb-ops.Dockerfile path}
+    image: ${WBOPS_IMAGE:?Provide a locally built image tag}
+    pull_policy: build
+    user: "999:988"
+    working_dir: /app
+    network_mode: none
+    restart: "no"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    env_file:
+      - ${WBOPS_REHEARSAL_ENV_FILE:?Provide a fixture-only env file path}
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    tmpfs:
+      - /tmp:rw,nosuid,noexec,size=64m,mode=1777
+    volumes:
+      - type: bind
+        source: ${WBOPS_REHEARSAL_RELEASE_DIR:?Provide an isolated exact-code release path}
+        target: /app
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_REHEARSAL_DATA_DIR:?Provide existing isolated data path}
+        target: /app/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_REHEARSAL_APP_DATA_DIR:?Provide existing isolated app/data path}
+        target: /app/app/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_REHEARSAL_EXPORTS_DIR:?Provide existing isolated exports path}
+        target: /app/exports
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_REHEARSAL_FBS_REPORTS_DIR:?Provide existing isolated fbs_reports path}
+        target: /app/fbs_reports
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_REHEARSAL_OPIU_DIR:?Provide existing isolated opiu path}
+        target: /app/opiu
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_REHEARSAL_KNOWLEDGE_DIR:?Provide existing isolated knowledge path}
+        target: /app/app/knowledge
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

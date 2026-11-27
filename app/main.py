@@ -72,6 +72,7 @@ settings = get_settings()
 STATIC_DIR = Path(__file__).parent / "static"
 DASHBOARD_FILE = STATIC_DIR / "dashboard.html"
 DASHBOARD_PAGES = ("workspace", "abc", "products", "cabinets", "knowledge", "analytics", "reviews", "templates", "recommendations", "settings", "ai", "import", "questions", "chats", "messengers", "profile", "finances", "unit-economics", "notifications", "team", "complaints", "nomenclature", "dashboard", "dashboard-ozon", "rnp", "transfer", "repricer", "stocks", "fbs-analytics", "penalties", "ads", "planfact", "ab", "card-comparisons")
+DASHBOARD_PAGES = (*DASHBOARD_PAGES, "wb-merges")
 DASHBOARD_PATHS = {"/", *(f"/{page}" for page in DASHBOARD_PAGES)}
 app = FastAPI(
     title=settings.app_name,
@@ -356,34 +357,79 @@ LOCAL_HOSTS = ("127.0.0.1", "::1", "localhost", "testclient")
 OWNER_ONLY = ("/api/team", "/api/admin", "/api/notifications", "/api/finance", "/api/home", "/api/abc", "/api/nomenclature", "/api/dashboard", "/api/rnp", "/api/transfer", "/api/repricer", "/api/penalties", "/api/ads", "/api/planfact", "/api/ab", "/api/card-comparisons", "/api/settings/modules/telegram", "/docs", "/openapi.json",
               "/api/complaint-browser", "/api/unit-economics")
 OWNER_ONLY_WRITE = ("/api/cabinets", "/api/ai/settings", "/api/account", "/api/settings/auto-sync")
-MEMBER_OPEN = ("/api/team/me", "/api/team/logout")
+MEMBER_OPEN = ("/api/team/me", "/api/team/logout", "/api/team/password")
 
 
 def is_owner_only(path: str, method: str) -> bool:
     if path.startswith(MEMBER_OPEN):
         return False
-    if path.startswith(OWNER_ONLY) or path in ("/finances", "/unit-economics", "/nomenclature", "/dashboard", "/dashboard-ozon", "/abc", "/rnp", "/transfer", "/repricer", "/penalties", "/ads", "/planfact", "/ab", "/card-comparisons"):
+    if path.startswith(OWNER_ONLY) or path in ("/finances", "/unit-economics", "/nomenclature", "/wb-merges", "/dashboard", "/dashboard-ozon", "/abc", "/rnp", "/transfer", "/repricer", "/penalties", "/ads", "/planfact", "/ab", "/card-comparisons"):
         return True
     return method not in ("GET", "HEAD") and path.startswith(OWNER_ONLY_WRITE)
+
+
+def external_request_scheme(request: Request) -> str:
+    """Only a loopback proxy may report the browser's original scheme."""
+    scheme = request.url.scheme
+    if request.client is not None and request.client.host in ("127.0.0.1", "::1"):
+        forwarded = request.headers.get("forwarded", "").rsplit(",", 1)[-1]
+        match = re.search(r'(?:^|;)\s*proto\s*=\s*"?(https?)"?\s*(?:;|$)', forwarded, re.IGNORECASE)
+        proto = match.group(1).lower() if match else request.headers.get("x-forwarded-proto", "").rsplit(",", 1)[-1].strip().lower()
+        if proto in ("http", "https"):
+            scheme = proto
+    return scheme
+
+
+def same_request_origin(request: Request, origin: str) -> bool:
+    """Compare browser origin to Host, with the standard loopback SSH tunnel.
+
+    Forwarded host values never replace Host, and proxy headers never grant roles.
+    """
+    scheme = external_request_scheme(request)
+    try:
+        expected = urlsplit(f"{scheme}://{request.headers.get('host', '')}")
+        actual = urlsplit(origin)
+        if actual.scheme not in ("http", "https") or not actual.hostname or actual.username is not None or actual.password is not None:
+            return False
+        if actual.path not in ("", "/") or actual.query or actual.fragment:
+            return False
+        # The bundled nginx uses $host, dropping :8080 from the SSH tunnel's Host.
+        # This exception is limited to the documented local tunnel, never public hosts.
+        if (request.client is not None and request.client.host in ("127.0.0.1", "::1")
+                and scheme == actual.scheme == "http"
+                and actual.hostname == expected.hostname
+                and actual.hostname in ("127.0.0.1", "localhost", "::1")
+                and actual.port == 8080 and expected.port in (None, 80)):
+            return True
+        default_ports = {"http": 80, "https": 443}
+        return (actual.scheme, actual.hostname, actual.port if actual.port is not None else default_ports[actual.scheme]) == (
+            expected.scheme, expected.hostname, expected.port if expected.port is not None else default_ports[expected.scheme])
+    except ValueError:
+        return False
 
 
 @app.middleware("http")
 async def guard_complaint_browser_origin(request: Request, call_next):
     path = request.url.path
-    local = request.client is None or request.client.host in LOCAL_HOSTS
-    member = None
-    if not local and not settings.allow_remote:
-        member = team.by_token(request.cookies.get(TEAM_COOKIE))
+    # A production loopback peer can be a reverse proxy: never grant it owner rights.
+    forwarded = any(name in request.headers for name in ("forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"))
+    local = (settings.environment != "production" and not settings.require_login and not forwarded
+             and request.client is not None and request.client.host in LOCAL_HOSTS)
+    member = team.by_token(request.cookies.get(TEAM_COOKIE))
+    if not local or member is not None:
         if member is None:
-            if path not in ("/join", "/api/team/join"):
+            if path not in ("/health", "/join", "/api/team/join", "/api/team/login"):
                 if path.startswith("/api/"):
-                    return JSONResponse({"detail": "Нужен вход: откройте ссылку-приглашение от владельца панели"}, status_code=401)
+                    return JSONResponse({"detail": "Войдите по логину и паролю"}, status_code=401)
                 return RedirectResponse("/join", status_code=303)
-        elif is_owner_only(path, request.method):
+        elif member.get("role") != "owner" and is_owner_only(path, request.method):
             if path.startswith("/api/"):
                 return JSONResponse({"detail": "Доступно только владельцу панели"}, status_code=403)
             return RedirectResponse("/", status_code=303)
     request.state.member = member
+    if request.method not in ("GET", "HEAD", "OPTIONS") and request.headers.get("origin"):
+        if not same_request_origin(request, request.headers["origin"]):
+            return JSONResponse({"detail": "Недопустимый источник запроса"}, status_code=403)
     if request.method == "POST" and path.startswith("/api/complaint-browser/"):
         origin = request.headers.get("origin")
         if origin:
@@ -765,12 +811,55 @@ def team_network(request: Request) -> dict[str, object]:
 @app.get("/api/team/me")
 def team_me(request: Request) -> dict[str, object]:
     member = getattr(request.state, "member", None)
-    return {"role": "member", "member": member} if member else {"role": "owner", "name": owner_label()}
+    return {"role": member.get("role", "member"), "member": member, "name": member["name"]} if member else {"role": "owner", "name": owner_label()}
 
 
 @app.get("/api/team")
 def team_overview(request: Request) -> dict[str, object]:
     return {"invites": team.invites(), "members": team.members(), "network": team_network(request)}
+
+
+@app.post("/api/team/users")
+def team_create_user(value: dict) -> dict[str, object]:
+    try:
+        member = team.create_user(value.get("login"), value.get("password"), value.get("name"), value.get("role", "member"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    draft_store.audit("team_user_created", details=member["login"])
+    return member
+
+
+def team_session_response(request: Request, member: dict, token: str) -> JSONResponse:
+    response = JSONResponse({"member": member})
+    local_http = (external_request_scheme(request) == "http"
+                  and request.client is not None and request.client.host in ("127.0.0.1", "::1")
+                  and request.url.hostname in ("127.0.0.1", "localhost", "::1"))
+    response.set_cookie(TEAM_COOKIE, token, max_age=COOKIE_DAYS * 86400, httponly=True,
+                        secure=external_request_scheme(request) == "https" or (settings.environment == "production" and not local_http), samesite="lax")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/api/team/login")
+def team_login(request: Request, value: dict) -> JSONResponse:
+    try:
+        member, token = team.login(value.get("login"), value.get("password"))
+    except ValueError as exc:
+        raise HTTPException(401, str(exc))
+    draft_store.audit("team_login", details=member["login"])
+    return team_session_response(request, member, token)
+
+
+@app.post("/api/team/password")
+def team_password(request: Request, value: dict) -> dict[str, bool]:
+    member = getattr(request.state, "member", None)
+    if not member or not member.get("login"):
+        raise HTTPException(400, "Войдите по логину и паролю")
+    try:
+        team.change_password(member["id"], value.get("current_password"), value.get("password"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True}
 
 
 @app.post("/api/team/invites")
@@ -795,6 +884,8 @@ def team_update_member(member_id: int, value: dict) -> dict[str, object]:
         member = team.set_active(member_id, bool(value.get("active")))
     except KeyError:
         raise HTTPException(404, "Сотрудник не найден")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     draft_store.audit("team_member_" + ("enabled" if member["active"] else "disabled"), details=member["name"])
     return member
 
@@ -802,26 +893,29 @@ def team_update_member(member_id: int, value: dict) -> dict[str, object]:
 @app.delete("/api/team/members/{member_id}")
 def team_delete_member(member_id: int) -> dict[str, object]:
     member = team.member(member_id)
-    if not member or not team.delete_member(member_id):
+    try:
+        deleted = member and team.delete_member(member_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if not deleted:
         raise HTTPException(404, "Сотрудник не найден")
     draft_store.audit("team_member_deleted", details=member["name"])
     return {"deleted": member_id}
 
 
 @app.post("/api/team/join")
-def team_join(value: dict) -> JSONResponse:
+def team_join(request: Request, value: dict) -> JSONResponse:
     try:
         member, token = team.join(value.get("code"), value.get("name"), value.get("email", ""))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     draft_store.audit("team_member_joined", details=member["name"])
-    response = JSONResponse({"member": member})
-    response.set_cookie(TEAM_COOKIE, token, max_age=COOKIE_DAYS * 86400, httponly=True, samesite="lax")
-    return response
+    return team_session_response(request, member, token)
 
 
 @app.post("/api/team/logout")
-def team_logout() -> JSONResponse:
+def team_logout(request: Request) -> JSONResponse:
+    team.logout(request.cookies.get(TEAM_COOKIE))
     response = JSONResponse({"ok": True})
     response.delete_cookie(TEAM_COOKIE)
     return response
@@ -2196,6 +2290,60 @@ nomenclature = Nomenclature(lambda: finance_project(), cabinets=lambda: configur
 def _nomenclature_guard():
     if finance_runner.status().get("status") == "running":
         raise HTTPException(409, "Сейчас пересобирается ОПиУ — дождитесь окончания и повторите")
+
+
+@app.get("/api/nomenclature/wb-merges")
+def wb_merge_cards_list() -> dict[str, object]:
+    return nomenclature.cards()
+
+
+@app.get("/api/nomenclature/wb-merges/export")
+def wb_merge_excel_export():
+    return Response(nomenclature.export_merge_excel(),
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="wb_merges.xlsx"'})
+
+
+@app.post("/api/nomenclature/wb-merges/preview")
+async def wb_merge_excel_preview(file: UploadFile = File(...)) -> dict[str, object]:
+    content = await file.read(20 * 1024 * 1024 + 1)
+    try:
+        result = await asyncio.to_thread(nomenclature.preview_merge_excel, file.filename or "", content)
+    except NomenclatureError as exc:
+        draft_store.audit("wb_cards_merge_preview_rejected", details=str(exc))
+        raise HTTPException(400, str(exc)) from exc
+    for group in result["groups"]:
+        draft_store.audit("wb_cards_merge_preview_" + ("accepted" if group["valid"] else "rejected"),
+                          group.get("cabinet_id") or "",
+                          json.dumps({k: group.get(k) for k in ("number", "nm_ids", "target_imt", "error")}, ensure_ascii=False))
+    return result
+
+
+@app.post("/api/nomenclature/wb-merges/batch")
+async def wb_merge_excel_batch(value: dict) -> dict[str, object]:
+    if value.get("confirmed") is not True:
+        raise HTTPException(400, "Подтвердите выполнение групп из предварительного просмотра")
+    try:
+        return await asyncio.to_thread(nomenclature.merge_batch, value.get("preview_id"),
+                                       _opiu_wb_tokens(), draft_store.audit)
+    except NomenclatureError as exc:
+        draft_store.audit("wb_cards_merge_batch_rejected", details=str(exc))
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/nomenclature/wb-merges")
+async def wb_merge_cards(value: dict) -> dict[str, object]:
+    if value.get("confirmed") is not True:
+        raise HTTPException(400, "Подтвердите склейку карточек")
+    try:
+        result = await asyncio.to_thread(nomenclature.merge_cards, value.get("cabinet_id"),
+                                        value.get("nm_ids"), value.get("target_imt"), _opiu_wb_tokens())
+    except NomenclatureError as exc:
+        draft_store.audit("wb_cards_merge_rejected", details=str(exc))
+        raise HTTPException(400, str(exc)) from exc
+    draft_store.audit("wb_cards_merged", result["cabinet_id"],
+                      f"targetIMT={result['target_imt']};nmIDs={','.join(map(str, result['nm_ids']))};accepted=1")
+    return result
 
 
 def _price_args(value: dict) -> dict:
@@ -4015,22 +4163,14 @@ def delete_recommendation(recommendation_id: str) -> dict[str, bool]:
 
 @app.get("/api/reports/export")
 @app.get("/api/fbs-reports/export")
-async def export_reports() -> FileResponse:
+async def export_reports() -> Response:
+    from app.services.fbs_workbook import build_fbs_workbook
+
     importer = ReportImporter(settings.fbs_report_root)
-    reports = importer.scan()
-    rows = importer.rows()
+    reports, rows = await asyncio.to_thread(lambda: (importer.scan(), importer.rows()))
     report_names = {report.report_id: report.filename for report in reports}
-    payload = {"reports": [report.model_dump() for report in reports], "rows": [dict(row.model_dump(), pdf=report_names.get(row.report_id, "")) for row in rows]}
-    data_dir = Path("data")
-    export_dir = Path("exports")
-    data_dir.mkdir(exist_ok=True)
-    export_dir.mkdir(exist_ok=True)
-    payload_path = data_dir / "fbs_supply_payload.json"
-    output_path = export_dir / "fbs_supply_report.xlsx"
-    payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    script_path = Path("scripts") / "export_fbs_supply.mjs"
-    process = await asyncio.to_thread(subprocess.run, [settings.node_path, str(script_path), str(payload_path), str(output_path)], capture_output=True, text=True)
-    if process.returncode != 0 or not output_path.exists():
-        raise HTTPException(status_code=500, detail=f"Не удалось собрать Excel: {process.stderr[-500:]}")
+    export_rows = [dict(row.model_dump(), pdf=report_names.get(row.report_id, "")) for row in rows]
+    content = await asyncio.to_thread(build_fbs_workbook, reports, export_rows)
     draft_store.audit("report_exported", details=f"rows={len(rows)}")
-    return FileResponse(output_path, filename="fbs_supply_report.xlsx", media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    return Response(content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="fbs_supply_report.xlsx"'})

@@ -1,0 +1,16 @@
+[Unit]
+Description=WB Ops Docker application
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker compose --env-file /opt/wb-ops/deploy/docker/wb-ops.project.env -f /opt/wb-ops/deploy/docker/wb-ops.compose.yml -p wbops up -d --no-build --pull never --wait --wait-timeout 55 wb-ops
+ExecStop=/usr/bin/docker compose --env-file /opt/wb-ops/deploy/docker/wb-ops.project.env -f /opt/wb-ops/deploy/docker/wb-ops.compose.yml -p wbops stop --timeout 30 wb-ops
+TimeoutStartSec=75
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

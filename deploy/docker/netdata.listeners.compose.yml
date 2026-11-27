@@ -1,0 +1,15 @@
+# Production-only opt-in. Set each host port explicitly to 8125/4317 after
+# confirming the old Netdata process has stopped and the copied listeners bind
+# to container interfaces. Never include this file in the rehearsal project.
+services:
+  netdata:
+    volumes:
+      - type: bind
+        source: ${NETDATA_ROOT:?set NETDATA_ROOT}/otel
+        target: /var/log/netdata/otel
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:${NETDATA_STATSD_HOST_PORT:?set NETDATA_STATSD_HOST_PORT}:8125/tcp"
+      - "127.0.0.1:${NETDATA_STATSD_HOST_PORT:?set NETDATA_STATSD_HOST_PORT}:8125/udp"
+      - "127.0.0.1:${NETDATA_OTLP_HOST_PORT:?set NETDATA_OTLP_HOST_PORT}:4317/tcp"

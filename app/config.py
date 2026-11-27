@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     environment: str = "development"
     dry_run: bool = True
     allow_remote: bool = False
+    require_login: bool = False
     # Папка именно для отчётов поставок FBS. Документы Честного знака сюда не подмешиваются.
     fbs_report_root: str = "fbs_reports"
     # Старый ключ оставлен для совместимости с существующим .env; в работе не используется.

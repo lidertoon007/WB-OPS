@@ -405,6 +405,15 @@ window.WBOPSSettings = (() => {
     teamState.page = Math.min(teamState.page, pages - 1);
     const shown = d.invites.slice(teamState.page * teamState.size, (teamState.page + 1) * teamState.size);
     section.innerHTML = `<h2>Моя команда</h2>
+      <section class="st-card"><h3>Создать логин и пароль</h3>
+        <p class="muted">Учётные данные подходят для входа на адрес панели. Администратор управляет командой и всеми разделами; сотруднику доступны рабочие очереди.</p>
+        <form data-create-user class="st-actions">
+          <label>Имя<input name="name" maxlength="80" required autocomplete="off"></label>
+          <label>Логин<input name="login" minlength="3" maxlength="64" required autocomplete="off" pattern="[a-zA-Z0-9][a-zA-Z0-9_.@-]{2,63}"></label>
+          <label>Пароль<input name="password" type="password" minlength="12" maxlength="256" required autocomplete="new-password"></label>
+          <label>Роль<select name="role"><option value="member">Сотрудник</option><option value="owner">Администратор</option></select></label>
+          <button type="submit" class="btn">Создать доступ</button><span role="status" data-user-state></span>
+        </form></section>
       <section class="st-card"><h3>Доступ по сети</h3>
         ${net.reachable ? `<p><span class="st-chip ok">✓ Сотрудники могут войти</span> Панель открыта в вашей сети по адресу <b>${esc(net.base_url)}</b>.</p>`
           : `<p><span class="st-chip warn">Только этот компьютер</span> Сейчас панель открывается только здесь. Чтобы сотрудники могли войти по приглашению, запускайте WB OPS файлом <b>start_wb_ops_team.bat</b> (при первом запуске Windows спросит разрешение для сети — разрешите для частных сетей).</p>`}
@@ -426,7 +435,7 @@ window.WBOPSSettings = (() => {
           : '<p class="muted">Приглашений пока нет.</p>'}</section>
       <section class="st-card"><h3>Сотрудники</h3>
         ${d.members.length ? `<div class="st-table-wrap"><table class="st-table"><thead><tr><th>Имя</th><th>Email</th><th>Добавлен</th><th>Последний вход</th><th class="c">Доступ</th><th></th></tr></thead><tbody>
-          ${d.members.map(m => `<tr><td><b>${esc(m.name)}</b></td><td>${esc(m.email || '—')}</td><td class="st-dt">${dateTime(m.created_at)}</td><td class="st-dt">${dateTime(m.last_seen)}</td>
+          ${d.members.map(m => `<tr><td><b>${esc(m.name)}</b><div class="muted">${esc(m.login || 'По приглашению')} · ${m.role === 'owner' ? 'Администратор' : 'Сотрудник'}</div></td><td>${esc(m.email || '—')}</td><td class="st-dt">${dateTime(m.created_at)}</td><td class="st-dt">${dateTime(m.last_seen)}</td>
             <td class="c">${toggle(`data-member="${m.id}"`, m.active, `Доступ ${m.name}`)}</td>
             <td class="r"><button type="button" class="st-icon" data-del-member="${m.id}" aria-label="Удалить сотрудника" title="Удалить">🗑</button></td></tr>`).join('')}
           </tbody></table></div><p class="muted st-note">Выключенный доступ срабатывает сразу. Действия сотрудников видны в журнале на главной.</p>`
@@ -436,6 +445,15 @@ window.WBOPSSettings = (() => {
   const linkBox = l => `<div class="st-linkbox"><input readonly value="${esc(l)}" aria-label="Ссылка-приглашение"><button type="button" class="btn" data-copy="${esc(l)}">Скопировать</button></div>`;
 
   function bindTeam(section) {
+    section.querySelector('[data-create-user]').onsubmit = async e => {
+      e.preventDefault();
+      const f = e.currentTarget, button = f.querySelector('button'), state = f.querySelector('[data-user-state]');
+      button.disabled = true;
+      try {
+        await api('/api/team/users', {method: 'POST', body: {name: f.elements.name.value, login: f.login.value, password: f.password.value, role: f.role.value}});
+        f.password.value = ''; await renderTeam(section); toast('Доступ создан. Передайте логин и пароль сотруднику.');
+      } catch (err) { state.textContent = err.message; button.disabled = false; }
+    };
     section.querySelector('[data-invite]').onclick = async e => {
       e.currentTarget.disabled = true;
       try { const r = await api('/api/team/invites', {method: 'POST', body: {}}); teamState.link = r.link; teamState.page = 0; await renderTeam(section); }
@@ -467,10 +485,23 @@ window.WBOPSSettings = (() => {
     if (me.role === 'member') {
       document.body.classList.add('wb-member');
       window.dispatchEvent(new PopStateEvent('popstate'));   // роутер покажет сотруднику рабочую очередь вместо сводки
+    }
+    if (me.member) {
       const foot = document.querySelector('.sidebar-footer');
       if (foot) {
-        foot.innerHTML = `<span>${esc(me.member.name)}</span> <button type="button" class="st-link" data-logout>Выйти</button>`;
+        foot.innerHTML = `<span>${esc(me.member.name)}</span> ${me.member.login ? '<button type="button" class="st-link" data-password>Сменить пароль</button>' : ''} <button type="button" class="st-link" data-logout>Выйти</button>`;
         foot.querySelector('[data-logout]').onclick = logout;
+        foot.querySelector('[data-password]')?.addEventListener('click', () => {
+          const dialog = document.createElement('dialog');
+          dialog.innerHTML = '<form class="st-card"><h3>Сменить пароль</h3><label>Текущий пароль<input name="current_password" type="password" autocomplete="current-password" required></label><label>Новый пароль<input name="password" type="password" minlength="12" maxlength="256" autocomplete="new-password" required></label><p role="alert"></p><button class="btn" type="submit">Сохранить и войти заново</button> <button class="btn secondary" type="button" data-cancel>Отмена</button></form>';
+          document.body.append(dialog); dialog.showModal();
+          dialog.querySelector('[data-cancel]').onclick = () => { dialog.close(); dialog.remove(); };
+          dialog.querySelector('form').onsubmit = async e => {
+            e.preventDefault(); const f = e.currentTarget;
+            try { await api('/api/team/password', {method: 'POST', body: {current_password: f.current_password.value, password: f.password.value}}); location.href = '/join'; }
+            catch (err) { f.querySelector('[role=alert]').textContent = err.message; }
+          };
+        });
       }
     }
     return me;

@@ -1,0 +1,76 @@
+name: wbops
+
+services:
+  wb-ops:
+    build:
+      context: ${WBOPS_BUILD_CONTEXT:?Provide an allowlisted clean build context}
+      dockerfile: ${WBOPS_DOCKERFILE:?Provide the absolute wb-ops.Dockerfile path}
+    image: ${WBOPS_IMAGE:?Provide a locally built image tag}
+    pull_policy: build
+    user: "999:988"
+    working_dir: /app
+    command: ["python", "-m", "uvicorn", "wbops_cutover_gate:app", "--host", "127.0.0.1", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1"]
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    env_file:
+      - path: ${WBOPS_ENV_FILE:?Provide the raw production env file path}
+        format: raw
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    tmpfs:
+      - /tmp:rw,nosuid,noexec,size=64m,mode=1777
+    volumes:
+      - type: bind
+        source: ${WBOPS_GATE_DIR:?Provide the root-controlled activation directory}
+        target: /run/wbops-cutover
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_RELEASE_DIR:?Provide the resolved exact release path}
+        target: /app
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_DATA_DIR:?Provide existing absolute data path}
+        target: /app/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_APP_DATA_DIR:?Provide existing absolute app/data path}
+        target: /app/app/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_EXPORTS_DIR:?Provide existing absolute exports path}
+        target: /app/exports
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_FBS_REPORTS_DIR:?Provide existing absolute fbs_reports path}
+        target: /app/fbs_reports
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_OPIU_DIR:?Provide existing absolute opiu path}
+        target: /app/opiu
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WBOPS_KNOWLEDGE_DIR:?Provide existing absolute app/knowledge path}
+        target: /app/app/knowledge
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

@@ -1,0 +1,49 @@
+# Always set NETDATA_ROOT and NETDATA_HOST_PORT explicitly. The only published
+# address is loopback; the rehearsal and production use separate Compose names.
+services:
+  netdata:
+    image: netdata/netdata:v2.13.0
+    user: "65534:65534"
+    group_add:
+      - ${NETDATA_DBUS_GID:?set NETDATA_DBUS_GID to the host Netdata group}
+    restart: unless-stopped
+    mem_limit: ${NETDATA_MEMORY_LIMIT:-512m}
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DISABLE_TELEMETRY: "1"
+      DBUS_SYSTEM_BUS_ADDRESS: unix:path=/run/dbus/system_bus_socket
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "3", "http://127.0.0.1:19999/api/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    ports:
+      - "127.0.0.1:${NETDATA_HOST_PORT:?set NETDATA_HOST_PORT}:19999"
+    networks:
+      - netdata
+    volumes:
+      - ${NETDATA_ROOT:?set NETDATA_ROOT}/etc:/etc/netdata
+      - ${NETDATA_ROOT:?set NETDATA_ROOT}/lib:/var/lib/netdata
+      - ${NETDATA_ROOT:?set NETDATA_ROOT}/cache:/var/cache/netdata
+      - ${NETDATA_ROOT}/rootfs:/host/root:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc/passwd:/host/etc/passwd:ro
+      - /etc/group:/host/etc/group:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/os-release:/host/etc/os-release:ro
+      - type: bind
+        source: /run/wb-ops-netdata-dbus
+        target: /run/dbus
+        read_only: true
+        bind:
+          create_host_path: false
+networks:
+  netdata:
+    external: true
+    name: ${NETDATA_NETWORK:?set NETDATA_NETWORK}

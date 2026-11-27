@@ -14,22 +14,35 @@ button{width:100%;height:44px;border:0;border-radius:10px;background:#6d28d9;col
 </style></head>
 <body><form class="card" id="join">
   <div class="brand"><div class="logo">WB</div><strong>WB OPS</strong></div>
-  <h1>Вход в команду</h1>
-  <p>Вас пригласили в рабочую панель продавца. Укажите имя — его увидят в журнале действий. Вход запомнится в этом браузере.</p>
-  <label>Код приглашения<input name="code" required value="{{code}}" autocomplete="off" spellcheck="false"></label>
-  <label>Ваше имя<input name="name" required minlength="2" maxlength="80" autocomplete="name"></label>
-  <label>Email <span style="font-weight:400;color:#6b7280">(необязательно)</span><input name="email" type="email" maxlength="120" autocomplete="email"></label>
+  <h1>Вход в WB OPS</h1>
+  <p>Введите логин и пароль, выданные администратором панели.</p>
+  <div id="credentials">
+    <label>Логин<input name="login" required maxlength="64" autocomplete="username" spellcheck="false"></label>
+    <label>Пароль<input name="password" type="password" required maxlength="256" autocomplete="current-password"></label>
+  </div>
+  <div id="invitation" hidden>
+    <label>Код приглашения<input name="code" value="{{code}}" autocomplete="off" spellcheck="false"></label>
+    <label>Ваше имя<input name="name" minlength="2" maxlength="80" autocomplete="name"></label>
+    <label>Email (необязательно)<input name="email" type="email" maxlength="120" autocomplete="email"></label>
+  </div>
   <button type="submit">Войти</button>
   <div class="err" role="alert" id="err"></div>
 </form>
 <script>
+const invited = !!document.querySelector('[name=code]').value;
+document.getElementById('credentials').hidden = invited;
+document.getElementById('invitation').hidden = !invited;
+document.querySelectorAll('#credentials input').forEach(i => { i.required = !invited; i.disabled = invited; });
+document.querySelectorAll('#invitation input').forEach(i => { i.disabled = !invited; });
+if (invited) document.querySelector('p').textContent = 'Введите имя для одноразового приглашения в команду.';
 document.getElementById('join').onsubmit = async e => {
   e.preventDefault();
   const f = e.currentTarget, b = f.querySelector('button'), err = document.getElementById('err');
   b.disabled = true; err.textContent = '';
   try {
-    const r = await fetch('/api/team/join', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({code: f.code.value.trim(), name: f.elements['name'].value.trim(), email: f.email.value.trim()})});
+    const payload = invited ? {code: f.code.value.trim(), name: f.elements['name'].value.trim(), email: f.email.value.trim()}
+      : {login: f.login.value.trim(), password: f.password.value};
+    const r = await fetch(invited ? '/api/team/join' : '/api/team/login', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
     const d = await r.json();
     if (!r.ok) { err.textContent = d.detail || 'Не удалось войти'; b.disabled = false; return; }
     location.href = '/';

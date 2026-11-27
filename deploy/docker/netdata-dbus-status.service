@@ -1,0 +1,20 @@
+[Unit]
+Description=Read-only systemd status mirror for Netdata
+Requires=netdata-dbus-bus.service
+After=netdata-dbus-bus.service
+
+[Service]
+Type=simple
+User=netdata
+Group=netdata
+ExecStart=/usr/bin/python3 /etc/wb-ops-netdata/netdata_dbus_status.py
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

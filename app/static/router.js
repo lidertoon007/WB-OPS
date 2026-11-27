@@ -25,6 +25,7 @@
     rnp:             {path: '/rnp',             title: 'РНП', sub: 'Рука на пульсе: заказы, реклама, остатки и прогноз прибыли по дням и артикулам', show: ['rnpPage']},
     products:        {path: '/products',        title: 'Товары', sub: 'Модели, таблицы замеров и факты для ответов на вопросы', show: ['productTabs', 'modelsPanel', 'productKnowledgePanel']},
     nomenclature:    {path: '/nomenclature',    title: 'Товары', sub: 'Вся номенклатура: себестоимость и подготовка для ОПиУ', show: ['productTabs', 'nomenclature'], nav: 'products'},
+    'wb-merges':     {path: '/wb-merges', title: 'Склейки WB', sub: 'Объединение карточек одного предмета в одном кабинете Wildberries', show: ['productTabs', 'wbMergesPage'], nav: 'products'},
     cabinets:        {path: '/cabinets',        title: 'Кабинеты маркетплейсов', sub: 'Подключение Wildberries, Ozon и Яндекс.Маркета', show: ['cabinets']},
     knowledge:       {path: '/knowledge',       title: 'База знаний', sub: 'Знания о товарах и магазине для ответов', show: ['knowledge', 'knowledgeHubPanel']},
     analytics:       {path: '/analytics',       title: 'Аналитика и отчёты', sub: 'Отзывы, вопросы и чаты: динамика, теги, тренды и отчёты по товарам', show: ['analytics']},
@@ -183,7 +184,7 @@
   // Вкладки раздела «Товары» (общие для двух страниц)
   if (!document.getElementById('productTabs')) {
     const t = document.createElement('section'); t.id = 'productTabs'; t.className = 'pt-tabs';
-    t.innerHTML = '<a href="/products" data-nav="products">Модели и ответы на вопросы</a><a href="/nomenclature" data-nav="nomenclature">Номенклатура и себестоимость</a>';
+    t.innerHTML = '<a href="/products" data-nav="products">Модели и ответы на вопросы</a><a href="/nomenclature" data-nav="nomenclature">Номенклатура и себестоимость</a><a href="/wb-merges" data-nav="wb-merges">Склейки WB</a>';
     main.append(t);
   }
   const nomenclaturePage = () => {
@@ -263,6 +264,11 @@
   };
   const rendered = {home: homePage, abc: abcPage, ab: abPage, 'card-comparisons': cardComparisonsPage, planfact: planfactPage, ads: adsPage, penalties: penaltiesPage, 'fbs-analytics': fbsPage, stocks: stocksPage, repricer: repricerPage, transfer: transferPage, rnp: rnpPage, dashboard: dashboardPage, 'dashboard-ozon': ozonDashboardPage, nomenclature: nomenclaturePage, complaints: complaintsPage, reviews: reviewsPage, questions: questionsPage, cabinets: settingsPage('cabinets', 'cabinets'), notifications: settingsPage('notificationsSettings', 'notifications'), team: settingsPage('team', 'team'), analytics: renderAnalytics, import: renderImport, profile: renderProfile, messengers: renderMessengers, finances: renderFinances,
     'unit-economics': renderUnitEconomics};
+  rendered['wb-merges'] = () => {
+    const s = section('wbMergesPage', '');
+    if (window.WBOPSMerges) window.WBOPSMerges.render(s);
+    else s.innerHTML = '<p class="muted">Не загрузился модуль склеек WB.</p>';
+  };
   const done = new Set();
   let applying = false;
   function apply() {

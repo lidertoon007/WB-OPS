@@ -368,3 +368,257 @@ window.WBOPSProducts = (() => {
 
   return {render};
 })();
+
+/* Separate state and actions for card merging; cost editing never uses this selection. */
+window.WBOPSMerges = (() => {
+  const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  let root, cards = [], selected = [], busy = false, loaded = false, preview = null, batchResult = null;
+  const widthKey = 'wbops.wb-merges.column-widths.v3';
+  const columns = [['Выбор',90],['Номер склейки',150],['nmID',115],['Артикул',130],['Название',420],['Бренд',125],['Предмет',200],['Кошки/Собаки',160],['Кабинет',190],['imtID',125],['Статус WB',185]];
+  let widths = columns.map(c => c[1]);
+  try {
+    const saved = JSON.parse(localStorage.getItem(widthKey));
+    if (Array.isArray(saved)) widths = widths.map((w, i) => Number.isFinite(saved[i]) ? Math.max(70, Math.min(1200, saved[i])) : w);
+  } catch (e) { /* Ширины остаются доступными и при отключённом localStorage. */ }
+  const filters = {q: '', brand: '', subject: '', cabinet_id: '', state: '', pet_kind: '', merge_label: ''};
+  const key = c => JSON.stringify([c.cabinet_id, c.nm]);
+  const picked = () => selected.map(k => cards.find(c => key(c) === k)).filter(Boolean);
+  async function api(url, body) {
+    let r;
+    try { r = await fetch(url, body === undefined ? {cache: 'no-store'} : body instanceof FormData ? {method: 'POST', body} : {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}); }
+    catch (e) { throw new Error('Не удалось связаться с сервером. Проверьте подключение и повторите.'); }
+    let d;
+    try { d = await r.json(); } catch (e) { /* Сервер или прокси может вернуть HTML. */ }
+    if (r.status === 404) throw new Error('Раздел склеек пока недоступен на сервере. Обновите страницу позже или обратитесь к администратору.');
+    if (!r.ok) throw new Error(typeof d?.detail === 'string' ? d.detail : `Сервер не смог обработать запрос (HTTP ${r.status}). Повторите позже.`);
+    if (!d || typeof d !== 'object') throw new Error('Сервер вернул некорректный ответ. Повторите позже.');
+    return d;
+  }
+  function message(s) { root.querySelector('[data-merge-message]').textContent = s; }
+  function applyWidths() {
+    const table = root.querySelector('.wm-card-table');
+    table.style.width = `${widths.reduce((sum, w) => sum + w, 0)}px`;
+    table.querySelectorAll('col').forEach((col, i) => { col.style.width = `${widths[i]}px`; });
+  }
+  function resizeColumns() {
+    applyWidths();
+    root.querySelectorAll('[data-merge-resize]').forEach(handle => {
+      const index = Number(handle.dataset.mergeResize);
+      const save = () => { try { localStorage.setItem(widthKey, JSON.stringify(widths)); } catch (e) { /* Недоступное хранилище не мешает работе. */ } };
+      handle.onpointerdown = ev => {
+        if (ev.button !== 0) return;
+        ev.preventDefault();
+        const startX = ev.clientX, initialWidth = widths[index];
+        handle.setPointerCapture(ev.pointerId);
+        handle.classList.add('wm-resizing');
+        handle.onpointermove = move => {
+          widths[index] = Math.max(70, Math.min(1200, initialWidth + move.clientX - startX));
+          applyWidths();
+        };
+        const finish = () => {
+          handle.onpointermove = null;
+          handle.classList.remove('wm-resizing');
+          save();
+        };
+        handle.onpointerup = finish;
+        handle.onpointercancel = finish;
+        handle.onlostpointercapture = finish;
+      };
+      handle.onkeydown = ev => {
+        if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+        ev.preventDefault();
+        widths[index] = Math.max(70, Math.min(1200, widths[index] + (ev.key === 'ArrowRight' ? 10 : -10)));
+        applyWidths(); save();
+      };
+    });
+  }
+  function previewPanel() {
+    const panel = root.querySelector('[data-merge-preview]');
+    panel.hidden = !preview && !batchResult;
+    const groups = preview?.groups || [];
+    const results = batchResult?.groups || [];
+    const summary = batchResult?.summary;
+    panel.innerHTML = `${preview ? `<h3>Проверка Excel</h3><p>Готово групп: ${esc(preview.valid_count)}. С ошибками: ${esc(preview.invalid_count)}. Первая строка каждой группы — целевая карточка.</p>
+      <div class="wm-preview-groups">${groups.map(g => `<div class="wm-preview-group ${g.valid ? '' : 'wm-preview-error'}"><strong>${g.kind === 'single' ? 'Очистка номера · одиночный товар' : `Склейка ${esc(g.number)}`} — ${g.valid ? 'готова' : 'ошибка'}</strong>
+        <p>Кабинет: ${esc(g.cabinet || g.cabinet_id || '—')}. Предмет: ${esc(g.subject || g.subject_id || '—')}. Цель: nmID ${esc(g.target_nm ?? g.nm_ids?.[0] ?? '—')}, imtID ${esc(g.target_imt || '—')}.</p>
+        <p>Желаемый состав: ${esc((g.desired_members || g.nm_ids || []).join(', '))}</p>
+        <p>Выйдут из склейки по отдельности: ${esc(g.exits?.join(', ') || 'нет')}. ${g.no_api ? 'Без API-действий — сохранить номер.' : g.join_needed ? 'После выхода лишних — объединить желаемый состав.' : 'Объединение не требуется.'}</p>${g.error ? `<p>${esc(g.error)}</p>` : ''}</div>`).join('')}</div>
+      <button type="button" class="rv-dark" data-merge-batch ${busy || !preview.preview_id || !preview.valid_count ? 'disabled' : ''}>Подтвердить состав ${esc(preview.valid_count)} групп</button>` : ''}
+      ${batchResult ? `<h3>Результат склеек</h3>${summary ? `<p>Всего: ${esc(summary.total)}. Принято WB: ${esc(summary.success)}. Ошибок: ${esc(summary.error)}. Неизвестный статус: ${esc(summary.unknown)}.</p>` : ''}
+      <div class="wm-preview-groups">${results.map(g => `<div class="wm-preview-group ${g.status === 'success' ? '' : 'wm-preview-error'}"><strong>${g.kind === 'single' ? 'Одиночный товар' : `Склейка ${esc(g.number)}`} — ${g.status === 'success' ? (g.no_api ? 'сохранена без API-действий' : 'запросы приняты WB') : g.status === 'unknown' ? 'статус неизвестен' : 'ошибка'}</strong>
+        ${(g.operations || []).map(op => `<p>${op.operation === 'detach' ? 'Отделение' : 'Объединение'} nmID ${esc(op.nm_ids.join(', '))}: ${op.status === 'success' ? 'принято WB' : op.status === 'unknown' ? 'статус неизвестен' : 'ошибка'}</p>`).join('')}
+        ${g.error ? `<p>${esc(g.error)}</p>` : ''}${g.warning ? `<p>${esc(g.warning)}</p>` : ''}</div>`).join('')}</div>` : ''}`;
+    const button = panel.querySelector('[data-merge-batch]');
+    if (button) button.onclick = submitBatch;
+  }
+  function invalidatePreview() { preview = null; batchResult = null; previewPanel(); }
+  function invalid(chosen) {
+    if (chosen.length < 2 || chosen.length > 30) return 'Выберите от 2 до 30 карточек.';
+    if (chosen.some(c => !c.cabinet_id || !c.imt_id || !c.subject_id)) return 'Для выбранных карточек не хватает данных. Обновите карточки WB.';
+    if (new Set(chosen.map(c => c.cabinet_id)).size !== 1) return 'Выберите карточки одного кабинета.';
+    if (new Set(chosen.map(c => c.subject_id)).size !== 1) return 'Выберите карточки одного предмета.';
+    if (chosen.every(c => c.imt_id === chosen[0].imt_id)) return 'Карточки уже находятся в одной склейке.';
+    return '';
+  }
+  function table() {
+    const rows = cards.filter(c => (!filters.brand || c.brand === filters.brand) && (!filters.subject || c.subject === filters.subject) &&
+      (!filters.pet_kind || c.pet_kind === filters.pet_kind) && (!filters.merge_label || c.merge_label === filters.merge_label) &&
+      (!filters.cabinet_id || c.cabinet_id === filters.cabinet_id) && (!filters.state || (filters.state === 'single' ? c.is_single === true : c.is_single === false)) && (!filters.q ||
+      [c.nm,c.vendor,c.title,c.brand,c.subject,c.cabinet,c.imt_id,c.merge_label].join(' ').toLocaleLowerCase('ru').includes(filters.q.toLocaleLowerCase('ru'))));
+    const chosen = picked(), first = chosen[0], error = invalid(chosen);
+    root.querySelector('[data-merge-target]').textContent = first
+      ? `Цель — первая выбранная: nmID ${first.nm}, ${first.vendor}, кабинет ${first.cabinet}, imtID ${first.imt_id || 'неизвестен'}. Выбрано: ${chosen.length}/30. ${error}`
+      : 'Первая выбранная карточка станет целевой. Выберите от 2 до 30 карточек одного кабинета и предмета.';
+    root.querySelector('[data-merge-submit]').disabled = busy || !!error;
+    root.querySelector('[data-merge-clear]').disabled = busy || !selected.length;
+    root.querySelector('[data-merge-refresh]').disabled = busy;
+    root.querySelector('[data-merge-import]').disabled = busy;
+    root.querySelector('.wm-excel-import').classList.toggle('wm-disabled', busy);
+    root.querySelector('.wm-excel-import').setAttribute('aria-disabled', String(busy));
+    root.querySelector('[data-merge-count]').textContent = `Показано: ${rows.length} из ${cards.length}. Выбор сохраняется при фильтрации.`;
+    root.querySelector('tbody').innerHTML = rows.map(c => `<tr${first && key(c) === key(first) ? ' style="background:#f3e8ff"' : ''}>
+      <td><input type="checkbox" data-merge-pick="${esc(key(c))}" aria-label="Выбрать nmID ${esc(c.nm)}" ${selected.includes(key(c)) ? 'checked' : ''} ${busy ? 'disabled' : ''}>${first && key(c) === key(first) ? ' Цель' : ''}</td>
+      <td>${esc(c.merge_label || '')}</td><td>${esc(c.nm)}</td><td>${esc(c.vendor)}</td><td>${esc(c.title)}</td><td>${esc(c.brand)}</td><td>${esc(c.subject)} (${esc(c.subject_id || '—')})</td><td>${esc(c.pet_kind || 'Не определено')}</td><td>${esc(c.cabinet)}</td><td>${esc(c.imt_id || '—')}</td><td>${c.is_single === true ? 'Одиночный · 1' : c.is_single === false ? `В склейке · ${esc(c.merge_size)}` : 'Неизвестен — обновите WB'}</td></tr>`).join('') || '<tr><td colspan="11">Карточки не найдены. При первом запуске обновите список WB.</td></tr>';
+    previewPanel();
+  }
+  function options() {
+    for (const [field, label] of [['brand','Все бренды'],['subject','Все предметы'],['cabinet_id','Все кабинеты'],['pet_kind','Кошки/Собаки: все'],['merge_label','Все номера склеек']]) {
+      const values = field === 'pet_kind' ? ['Кошки', 'Собаки', 'Кошки и собаки', 'Не определено'] : [...new Set(cards.map(c => c[field]).filter(Boolean))].sort();
+      root.querySelector(`[name=${field}]`).innerHTML = `<option value="">${label}</option>` + values.map(v =>
+        `<option value="${esc(v)}" ${filters[field] === v ? 'selected' : ''}>${esc(field === 'cabinet_id' ? `${cards.find(c => c.cabinet_id === v).cabinet} (${v})` : v)}</option>`).join('');
+    }
+  }
+  async function load() {
+    const d = await api('/api/nomenclature/wb-merges');
+    cards = d.cards || []; loaded = true;
+    selected = selected.filter(k => cards.some(c => key(c) === k));
+    options(); table();
+    root.querySelector('[data-merge-updated]').textContent = `Обновлено: ${d.updated_at || 'ещё не загружено'}${d.errors?.length ? '. Ошибки загрузки: ' + d.errors.join('; ') : ''}`;
+  }
+  async function submit() {
+    if (busy) return;
+    const chosen = picked(), error = invalid(chosen);
+    if (error) { message(error); return; }
+    const first = chosen[0];
+    if (!window.confirm(`Склеить ${chosen.length} карточек WB?\nКабинет: ${first.cabinet}. Предмет: ${first.subject}.\nЦель: nmID ${first.nm}, артикул ${first.vendor}, imtID ${first.imt_id}.\nКарточки: ${chosen.map(c => c.nm).join(', ')}.\nКарточки будут перенесены в склейку целевой карточки.`)) return;
+    invalidatePreview();
+    busy = true; table(); message('Проверяю карточки в кабинете WB и отправляю склейку…');
+    try {
+      const result = await api('/api/nomenclature/wb-merges', {confirmed: true, cabinet_id: first.cabinet_id,
+        target_imt: first.imt_id, nm_ids: chosen.map(c => c.nm)});
+      selected = [];
+      await load(); message(result.warning || 'Запрос склейки принят WB. Карточки обновлены.');
+    } catch (e) { message(e.message); }
+    finally { busy = false; table(); }
+  }
+  async function refresh() {
+    if (busy) return;
+    invalidatePreview();
+    busy = true; table(); message('Загружаю отдельные карточки WB по кабинетам…');
+    try { const d = await api('/api/nomenclature/refresh', {}); selected = []; await load(); message(`Загружено карточек: ${d.cards}. ${d.errors?.join('; ') || ''}`); }
+    catch (e) { message(e.message); }
+    finally { busy = false; table(); }
+  }
+  async function importExcel(file) {
+    if (busy || !file) return;
+    if (!/\.xlsx$/i.test(file.name)) { message('Выберите файл Excel .xlsx.'); return; }
+    invalidatePreview();
+    busy = true; table(); message('Проверяю группы Excel по актуальному кэшу. Изменения в WB ещё не отправляются…');
+    try {
+      const body = new FormData(); body.append('file', file);
+      preview = await api('/api/nomenclature/wb-merges/preview', body);
+      message('Проверьте группы и цели ниже. Для отправки в WB нажмите отдельную кнопку подтверждения.');
+    } catch (e) { message(e.message); }
+    finally { busy = false; table(); }
+  }
+  async function submitBatch() {
+    if (busy || !preview?.preview_id || !preview.valid_count) return;
+    const previewId = preview.preview_id;
+    // Одно подтверждение не отправляется повторно, даже если ответ сервера потерян.
+    preview.preview_id = null;
+    busy = true; table(); message('Проверяю свежие карточки WB и последовательно отправляю группы. Дождитесь итогов…');
+    try {
+      batchResult = await api('/api/nomenclature/wb-merges/batch', {confirmed: true, preview_id: previewId});
+      // Persisted successful outcomes can be shown immediately, even if list reload fails.
+      // Unknown/error joins never acquire a label; confirmed individual exits clear theirs.
+      for (const group of batchResult.groups || []) {
+        const detached = new Set((group.operations || []).filter(op => op.operation === 'detach' && op.status === 'success').flatMap(op => op.nm_ids));
+        for (const card of cards.filter(c => c.cabinet_id === group.cabinet_id)) {
+          if (detached.has(card.nm)) card.merge_label = '';
+          if (group.status === 'success' && group.nm_ids.includes(card.nm)) card.merge_label = group.number || '';
+        }
+      }
+      options(); table();
+      selected = [];
+      const summary = batchResult.summary || {};
+      let text = `Обработка завершена. Принято WB: ${summary.success || 0}, ошибок: ${summary.error || 0}, неизвестный статус: ${summary.unknown || 0}.`;
+      if (summary.unknown) text += ' Проверьте результат в WB перед новой операцией с этими карточками.';
+      try { await load(); } catch (e) { text += ` Список карточек не обновлён: ${e.message}`; }
+      message(text);
+    } catch (e) { message(`${e.message} Обновите карточки и проверьте результат в WB перед повторной загрузкой файла.`); }
+    finally { busy = false; table(); }
+  }
+  function render(s) {
+    root = s;
+    root.className = 'panel rv-page pr-page wm-page';
+    root.innerHTML = `<div class="wm-head"><div><h2>Склейки WB</h2><p class="muted">Каждая строка — отдельная карточка WB. Склейка объединяет карточки одного предмета внутри одного кабинета.</p></div>
+      <button type="button" class="rv-dark" data-merge-refresh>Обновить карточки WB</button></div>
+      <div class="wm-filters"><label class="rv-search"><span class="sr">Поиск по nmID, артикулу, названию или imtID</span><input type="search" name="q" placeholder="Поиск карточек…" aria-label="Поиск по nmID, артикулу, названию или imtID"><span aria-hidden="true">⌕</span></label>
+      <label class="rv-select"><span class="sr">Бренд</span><select name="brand" aria-label="Бренд"></select></label>
+      <label class="rv-select"><span class="sr">Предмет</span><select name="subject" aria-label="Предмет"></select></label>
+      <label class="rv-select"><span class="sr">Кошки/Собаки</span><select name="pet_kind" aria-label="Кошки/Собаки"></select></label>
+      <label class="rv-select"><span class="sr">Номер склейки</span><select name="merge_label" aria-label="Номер склейки"></select></label>
+      <label class="rv-select"><span class="sr">Кабинет</span><select name="cabinet_id" aria-label="Кабинет"></select></label>
+      <label class="rv-select"><span class="sr">Статус WB</span><select name="state" aria-label="Статус WB"><option value="">Все</option><option value="group">В склейке</option><option value="single">Одиночные</option></select></label></div>
+      <p class="muted" data-merge-updated></p><p data-merge-target></p><div class="wm-actions"><button type="button" class="rv-dark" data-merge-submit disabled>Склеить выбранные</button><button type="button" class="rv-dark wm-secondary" data-merge-clear>Снять выбор</button></div>
+      <div class="wm-actions"><a class="rv-dark" href="/api/nomenclature/wb-merges/export">Скачать Excel</a><label class="rv-dark wm-excel-import" role="button" tabindex="0">Загрузить Excel<input type="file" accept=".xlsx" data-merge-import hidden></label></div>
+      <p class="muted">В Excel одинаковый «Номер склейки» задаёт точный состав 2–30 карточек. Первая строка — цель. Лишние карточки её WB-группы выйдут по отдельности. Очистка ранее сохранённого номера делает товар одиночным; остальные пустые строки не меняют WB. Проверьте состав и подтвердите отправку.</p>
+      <p role="status" aria-live="polite" data-merge-message></p><p class="muted" data-merge-count></p>
+      <section class="wm-preview" data-merge-preview hidden></section>
+      <div class="table-wrap"><table class="wm-card-table"><colgroup>${columns.map(() => '<col>').join('')}</colgroup><thead><tr>${columns.map(([name], i) => `<th>${name}<span class="wm-resize" data-merge-resize="${i}" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Ширина столбца ${name}" title="Потяните для изменения ширины"></span></th>`).join('')}</tr></thead><tbody></tbody></table></div>`;
+    resizeColumns();
+    root.querySelector('[name=q]').value = filters.q;
+    root.querySelector('[name=state]').value = filters.state;
+    root.oninput = ev => { if (ev.target.name === 'q') { filters.q = ev.target.value; table(); } };
+    root.onchange = ev => {
+      const t = ev.target;
+      if (t.matches('[data-merge-import]')) {
+        const file = t.files?.[0]; t.value = ''; importExcel(file); return;
+      } else if (t.dataset.mergePick) {
+        if (busy) return;
+        if (t.checked && selected.length >= 30) { t.checked = false; message('Можно выбрать максимум 30 карточек.'); return; }
+        selected = t.checked ? [...selected, t.dataset.mergePick] : selected.filter(k => k !== t.dataset.mergePick);
+      } else if (Object.hasOwn(filters, t.name)) {
+        filters[t.name] = t.value;
+        t.closest('.rv-select')?.classList.toggle('set', !!t.value);
+      }
+      table();
+    };
+    root.querySelector('[data-merge-submit]').onclick = submit;
+    root.querySelector('[data-merge-refresh]').onclick = refresh;
+    root.querySelector('[data-merge-clear]').onclick = () => { if (!busy) { selected = []; table(); } };
+    root.querySelector('.wm-excel-import').onkeydown = ev => {
+      if ((ev.key === 'Enter' || ev.key === ' ') && !busy) { ev.preventDefault(); root.querySelector('[data-merge-import]').click(); }
+    };
+    previewPanel();
+    if (loaded) { options(); table(); }
+    else load().catch(e => message(e.message));
+  }
+  const style = document.createElement('style');
+  style.textContent = `.wb-member .pt-tabs a[data-nav="wb-merges"]{display:none}
+#wbMergesPage .wm-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:16px}
+#wbMergesPage .wm-head h2{margin:0 0 6px}#wbMergesPage .wm-head p{margin:0}
+#wbMergesPage .wm-filters{display:grid;grid-template-columns:minmax(220px,2fr) repeat(3,minmax(0,1fr));gap:10px;margin-bottom:14px}
+#wbMergesPage .wm-filters>*{min-width:0}#wbMergesPage .wm-filters .rv-search{grid-column:auto;display:block}
+#wbMergesPage .wm-filters input,#wbMergesPage .wm-filters select{min-width:0;width:100%}
+#wbMergesPage .wm-actions{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+#wbMergesPage .wm-secondary{background:#eef0f4;color:#1f2328}#wbMergesPage .wm-secondary:hover{background:#dfe2e8}
+#wbMergesPage .wm-card-table{table-layout:fixed;border-collapse:collapse}#wbMergesPage .wm-card-table th,#wbMergesPage .wm-card-table td{padding:10px;text-align:left;border-bottom:1px solid #e5e7eb;overflow-wrap:anywhere;box-sizing:border-box}#wbMergesPage .table-wrap{overflow:auto;max-width:100%;width:100%}
+#wbMergesPage .wm-card-table th{position:relative;padding-right:18px}#wbMergesPage .wm-resize{position:absolute;right:0;top:0;width:10px;height:100%;cursor:col-resize;touch-action:none;user-select:none}#wbMergesPage .wm-resize:hover,#wbMergesPage .wm-resize:focus-visible,#wbMergesPage .wm-resizing{background:#c4b5fd;outline:0}
+#wbMergesPage .wm-actions a,#wbMergesPage .wm-excel-import{display:inline-flex;align-items:center;text-decoration:none;cursor:pointer}#wbMergesPage .wm-disabled{opacity:.55;cursor:wait}
+#wbMergesPage .wm-preview{padding:14px;border:1px solid #c4b5fd;border-radius:10px;margin:14px 0}#wbMergesPage .wm-preview h3{margin:0 0 8px}#wbMergesPage .wm-preview p{margin:6px 0;overflow-wrap:anywhere}#wbMergesPage .wm-preview-groups{display:grid;gap:8px;margin:12px 0;max-height:440px;overflow:auto}#wbMergesPage .wm-preview-group{padding:10px;background:#f5f3ff;border-radius:6px}#wbMergesPage .wm-preview-error{background:#fff1f2;color:#881337}
+@media(max-width:900px){#wbMergesPage .wm-filters{grid-template-columns:repeat(3,minmax(0,1fr))}#wbMergesPage .wm-filters .rv-search{grid-column:1/-1}}
+@media(max-width:600px){#wbMergesPage .wm-head{flex-direction:column}#wbMergesPage .wm-filters{grid-template-columns:1fr}#wbMergesPage .wm-filters .rv-search{grid-column:auto}}`;
+  document.head.append(style);
+  return {render};
+})();
